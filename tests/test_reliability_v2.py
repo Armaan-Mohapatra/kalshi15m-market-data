@@ -93,6 +93,8 @@ class StorageReliabilityTests(unittest.TestCase):
             store = Storage(cfg)
             store.open()
             store.parquet_flush_rows = 1
+            # Initial flush reconciles any files added after Storage.open.
+            self.assertEqual(store.append_batch([event("seed", {"price": "0.39"})]), 1)
             store.persistence_audit_last_monotonic = 0
             with patch.object(
                 store, "_parquet_directory_size",
@@ -105,7 +107,7 @@ class StorageReliabilityTests(unittest.TestCase):
             exact_bytes = sum(p.stat().st_size for p in cfg.parquet_dir.rglob("*.parquet"))
             self.assertGreater(exact_bytes, 0)
             self.assertEqual(store.parquet_bytes, exact_bytes)
-            self.assertEqual(store.parquet_flush_count, 2)
+            self.assertEqual(store.parquet_flush_count, 3)
             store.close()
             reopened = Storage(cfg)
             reopened.open()
