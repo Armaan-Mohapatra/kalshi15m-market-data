@@ -162,7 +162,7 @@ impl Journal {
 
     /// Metadata-only capacity check for the isolated journal volume.
     pub fn capacity_snapshot(&self) -> Result<CapacitySnapshot> {
-        self.capacity_snapshot_with_probe(fs2::available_space)
+        self.capacity_snapshot_with_probe(|path| fs2::available_space(path))
     }
 
     fn capacity_snapshot_with_probe(
