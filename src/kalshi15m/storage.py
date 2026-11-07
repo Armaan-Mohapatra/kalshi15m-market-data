@@ -128,7 +128,10 @@ class Storage:
         self.parquet_last_flush_utc: str | None = None
         self.parquet_last_flush_rows = 0
         self.parquet_last_flush_reason: str | None = None
+        # Lifetime omission count remains immutable for audit. Outstanding
+        # omissions can return to zero only after a full successful replay.
         self.parquet_dropped_rows = self.previous_parquet_dropped_rows
+        self.parquet_unrecovered_rows = self.previous_parquet_dropped_rows
         self.parquet_recovery_state = "NOT_RUN"
         self.parquet_recovery_rows = 0
         self.corrupt_parquet_parts: list[str] = []
@@ -323,6 +326,7 @@ class Storage:
             "parquet_bytes": self.parquet_bytes,
             "events_key_conflict": self.events_key_conflict,
             "events_quarantined": self.events_quarantined,
+            "parquet_unrecovered_rows": self.parquet_unrecovered_rows,
             "events_spooled": self.events_spooled,
             "events_replayed": self.events_replayed,
             "spool_pending_batch_count": sum(
@@ -550,6 +554,8 @@ class Storage:
             self.parquet_recovery_state = "REPAIRED_WITH_CORRUPT_PARTS_STILL_PRESENT"
         elif self.parquet_recovery_state == "NOT_RUN":
             self.parquet_recovery_state = "RECOVERED_MISSING_ROWS" if recovered else "VERIFIED_NO_GAP"
+        if self.parquet_recovery_state in {"RECOVERED_MISSING_ROWS", "VERIFIED_NO_GAP"}:
+            self.parquet_unrecovered_rows = 0
         return recovered
 
     def resume_raw_capture_if_safe(self) -> bool:
@@ -642,9 +648,10 @@ class Storage:
         """
         if self.connection is None:
             return False
+        self.orphaned_partial_parts = sum(1 for _ in self.cfg.parquet_dir.rglob("*.partial"))
         if (
             self.parquet_buffer or not self.raw_capture_enabled
-            or self.parquet_dropped_rows > 0
+            or self.parquet_unrecovered_rows > 0
             or any(self.pending_spool_dir.glob("pending-*.json"))
             or self.corrupt_parquet_parts or self.orphaned_partial_parts > 0
         ):
@@ -698,6 +705,7 @@ class Storage:
         if not self.raw_capture_enabled:
             count = len(self.parquet_buffer)
             self.parquet_dropped_rows += count
+            self.parquet_unrecovered_rows += count
             self.parquet_buffer.clear()
             self.parquet_buffer_bytes_estimate = 0
             self.parquet_buffer_started_monotonic = None
@@ -1044,6 +1052,7 @@ class Storage:
             if self.parquet_bytes + incoming_estimate > self.cfg.raw_data_budget_bytes:
                 self.raw_capture_enabled = False
                 self.parquet_dropped_rows += len(new_parquet_rows)
+                self.parquet_unrecovered_rows += len(new_parquet_rows)
                 LOG.warning("raw Parquet budget reached; SQLite critical journal remains enabled")
             else:
                 if not self.parquet_buffer:
@@ -1054,6 +1063,7 @@ class Storage:
                     self.flush_parquet(reason="ROW_THRESHOLD")
         elif new_parquet_rows:
             self.parquet_dropped_rows += len(new_parquet_rows)
+            self.parquet_unrecovered_rows += len(new_parquet_rows)
         return inserted + inserted_versions
 
     def _write_partitioned_parquet(self, rows: list[dict[str, Any]]) -> None:
