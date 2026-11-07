@@ -128,7 +128,7 @@ class Storage:
         # Reconcile external file changes at bounded intervals, rather than
         # traversing every historical Parquet part on each archive flush.
         self.parquet_budget_reconcile_interval_seconds = 60.0
-        self.parquet_budget_last_reconcile_monotonic = 0.0
+        self.parquet_budget_last_reconcile_monotonic = float('-inf')
         self.parquet_flush_count = 0
         self.parquet_last_flush_utc: str | None = None
         self.parquet_last_flush_rows = 0
@@ -259,7 +259,7 @@ class Storage:
         ).fetchone()
         self.latest_market_event_received_utc = str(latest_event[0]) if latest_event else None
         self.parquet_bytes = self._parquet_directory_size()
-        self.parquet_budget_last_reconcile_monotonic = 0.0
+        self.parquet_budget_last_reconcile_monotonic = float('-inf')
         self.sqlite_bytes = self._sqlite_size()
         # A status.json label is not an archival commit marker. The previous
         # process must have durably verified its final archive before skip is
