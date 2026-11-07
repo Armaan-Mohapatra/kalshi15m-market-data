@@ -216,7 +216,7 @@ class BookReliabilityTests(unittest.TestCase):
         book = OrderBook()
         book.snapshot({"yes": [[55, 2]], "no": [[35, 3]]})
         self.assertEqual(book.quotes()["yes_bid"], "0.55")
-        self.assertEqual(book.quotes()["yes_ask"], "0.65")
+        self.assertEqual(Decimal(book.quotes()["yes_ask"]), Decimal("0.65"))
         book.delta({"side": "yes", "price": 55, "delta": -2})
         self.assertIsNone(book.quotes()["yes_bid"])
 
