@@ -944,4 +944,43 @@ mod tests {
         assert_eq!(missing, 1);
         journal.close().unwrap();
     }
+
+    #[tokio::test]
+    async fn queue_overflow_spools_entire_batch_and_restart_recovers_it() {
+        let home = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(home.path()).unwrap();
+        let mut runtime = ContinuousRuntime::default();
+        // A tiny internal capacity keeps this branch test bounded. RuntimeConfig
+        // separately enforces its production minimum based on page limits.
+        let mut health = RuntimeHealth::new(2);
+        let events = (0..3)
+            .map(|id| {
+                Event::new(
+                    "rest",
+                    "trade",
+                    Some("QUEUE-TEST"),
+                    json!({"id":id}),
+                    Some(format!("queue-overflow-{id}")),
+                )
+            })
+            .collect();
+
+        let error = runtime
+            .commit_bounded(&mut journal, &mut health, events)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("full batch durably spooled"));
+        assert_eq!(health.queue_saturation_count, 1);
+        assert_eq!(health.queue_depth, 2);
+        assert_eq!(health.sqlite_state, "DEGRADED_SPOOLED");
+        assert_eq!(journal.audit().unwrap()["canonical_events"], 0);
+        assert_eq!(journal.audit().unwrap()["pending_spool_entries"], 3);
+        drop(journal);
+
+        let recovered = Journal::open(home.path()).unwrap();
+        assert_eq!(recovered.audit().unwrap()["canonical_events"], 3);
+        assert_eq!(recovered.audit().unwrap()["pending_spool_entries"], 0);
+        assert_eq!(recovered.stats.spool_replayed, 3);
+        recovered.close().unwrap();
+    }
 }
