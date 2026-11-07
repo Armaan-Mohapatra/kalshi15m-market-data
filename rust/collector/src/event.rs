@@ -86,7 +86,7 @@ impl Event {
             // For deliberately supplied raw WS fixtures, retain the exact message
             // under payload, namespace with raw type and session. Real exchange
             // subscription semantics are parsed separately in websocket.rs.
-            let kind = value.get("type").and_then(Value::as_str).unwrap_or("unknown");
+            let kind = value.get("type").and_then(Value::as_str).unwrap_or("unknown").to_string();
             let ticker = value.get("msg")
                 .and_then(|m| m.get("market_ticker"))
                 .and_then(Value::as_str)
@@ -95,7 +95,7 @@ impl Event {
             let sid = value.get("sid").and_then(Value::as_i64).unwrap_or(-1);
             let seq = value.get("seq").and_then(Value::as_i64).unwrap_or(-1);
             let identity = format!("ws-fixture|{session}|{sid}|{seq}|{kind}");
-            let mut event = Event::new("websocket_raw_fixture", kind, ticker.as_deref(), value, Some(identity));
+            let mut event = Event::new("websocket_raw_fixture", &kind, ticker.as_deref(), value, Some(identity));
             event.exchange_ts = None;
             event.validate()?;
             Ok(event)
