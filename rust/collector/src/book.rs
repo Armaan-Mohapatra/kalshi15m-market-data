@@ -241,7 +241,7 @@ mod tests {
         book.snapshot(&json!({
             "market_ticker":"KXBTC15M-EMPTY",
             "market_id":"01a18940-bf3f-7807-84c7-9dfae6345547",
-            "clock":15679747546
+            "clock":15679747546_i64
         }))
         .unwrap();
         assert!(book.synchronized());

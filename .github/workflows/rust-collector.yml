@@ -1,7 +1,7 @@
 name: Rust collector isolated validation
 on:
   push:
-    branches: [collector/rust-v1, codex/rust-windows-integration]
+    branches: [collector/rust-v1]
   pull_request:
     branches: [main, collector/rust-v1]
   workflow_dispatch:

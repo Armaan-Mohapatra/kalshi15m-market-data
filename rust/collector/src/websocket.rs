@@ -861,7 +861,7 @@ mod tests {
             "msg":{
                 "market_ticker":"KXETH15M-26OCT300745-45",
                 "market_id":"01a18941-42b7-773e-8a93-f0be1b976825",
-                "clock":15679747546
+                "clock":15679747546_i64
             }
         }));
         assert!(!events.iter().any(|event| event.kind == "invalid_snapshot"));
