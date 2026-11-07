@@ -351,23 +351,26 @@ async def refresh_upcoming_series_markets(
     errors = 0
     for series in scan_rows:
         series_ticker = str(series["ticker"])
-        try:
-            rows = await api.pages(
-                "/markets",
-                "markets",
-                {
-                    "series_ticker": series_ticker,
-                    "status": "unopened",
-                    "limit": 200,
-                },
-                max_pages=1,
-            )
-        except PaginationLimitExceeded as exc:
-            rows = exc.rows
-        except Exception as exc:
-            errors += 1
-            LOG.info("upcoming market scan failed for a candidate series: %s", type(exc).__name__)
-            continue
+        rows: list[dict[str, Any]] = []
+        for market_status in ("unopened", "open"):
+            try:
+                rows.extend(await api.pages(
+                    "/markets",
+                    "markets",
+                    {
+                        "series_ticker": series_ticker,
+                        "status": market_status,
+                        "limit": 200,
+                    },
+                    max_pages=1,
+                ))
+            except PaginationLimitExceeded as exc:
+                rows.extend(exc.rows)
+                errors += 1  # Pagination boundary prevents exhaustive coverage.
+            except Exception as exc:
+                errors += 1
+                LOG.info("opening market scan failed for %s/%s: %s", series_ticker, market_status, type(exc).__name__)
+                continue
         for row in rows:
             ticker = str(row.get("ticker") or "")
             event_ticker = str(row.get("event_ticker") or "")
@@ -375,7 +378,7 @@ async def refresh_upcoming_series_markets(
             if not ticker or not event_ticker or opened is None:
                 continue
             seconds_until_open = (opened - now).total_seconds()
-            if not -120 <= seconds_until_open <= near_open_seconds:
+            if not -180 <= seconds_until_open <= near_open_seconds:
                 continue
             if closed is not None and closed <= now:
                 continue
@@ -471,7 +474,7 @@ async def refresh_upcoming_series_markets(
                 "series_ticker": series_ticker,
                 "event_ticker": event_ticker,
                 "event_title": event.get("title"),
-                "event_status_query": "unopened",
+                "event_status_query": "open_or_unopened",
                 "is_multivariate_event": False,
                 "market_status": str(market.get("status") or "unopened").lower(),
                 "market_api_reconciled": ticker in market_rows_by_ticker,
