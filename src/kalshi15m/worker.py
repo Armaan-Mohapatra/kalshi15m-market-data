@@ -69,6 +69,17 @@ def configure_logging(cfg: Settings) -> None:
     root.addHandler(handler)
 
 
+def classify_rest_reconciliation(*, interval_errors: int, coverage_state: str) -> tuple[str, str]:
+    # API error totals persist for the entire process lifetime, so a single
+    # transient DNS/429/5xx event must not permanently report REST as degraded.
+    # Partial discovery remains incomplete even if recent GETs succeeded.
+    if interval_errors > 0:
+        return ("DEGRADED", "CURRENT_RECONCILIATION_API_ERRORS")
+    if coverage_state != "COMPLETE_CURRENT_AND_NEAR_TERM":
+        return ("DEGRADED", "DISCOVERY_COVERAGE_NOT_CONFIRMED_COMPLETE")
+    return ("READY", "RECENT_RECONCILIATION_SUCCEEDED")
+
+
 class RuntimeStatus:
     def __init__(self, cfg: Settings) -> None:
         self.cfg = cfg
@@ -1191,7 +1202,14 @@ class Collector:
             rollover_open_utc = scheduled_open.isoformat() if scheduled_open else None
             self.status.update(
                 service_state="RUNNING",
-                rest_state="READY" if snapshot["api_errors"] == 0 else "DEGRADED",
+                rest_state=classify_rest_reconciliation(
+                    interval_errors=self.api.errors - errors_before,
+                    coverage_state=str(snapshot.get("discovery_coverage_state", "UNKNOWN")),
+                )[0],
+                rest_state_reason=classify_rest_reconciliation(
+                    interval_errors=self.api.errors - errors_before,
+                    coverage_state=str(snapshot.get("discovery_coverage_state", "UNKNOWN")),
+                )[1],
                 series_count=snapshot["fifteen_min_series"],
                 series_category_counts=series_category_counts,
                 series_api_rows=snapshot["series_api_rows"],
@@ -1360,6 +1378,7 @@ class Collector:
         except Exception as exc:
             self.status.update(
                 rest_state="DEGRADED",
+                rest_state_reason="DISCOVERY_EXCEPTION",
                 error_count=self.status.data.get("error_count", 0) + 1,
                 last_error=f"discovery failed: {type(exc).__name__}: {exc}",
             )
