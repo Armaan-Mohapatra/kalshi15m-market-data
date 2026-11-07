@@ -1,0 +1,6 @@
+{"channel":"rest_market","kind":"market_metadata","market_ticker":"KXBTC15M-SYNTH","dedupe_key":"synthetic-meta","payload":{"ticker":"KXBTC15M-SYNTH","status":"open","open_time":"2026-11-07T00:00:00Z","close_time":"2026-11-07T00:15:00Z","floor_strike":70000}}
+{"channel":"rest_market","kind":"market_metadata","market_ticker":"KXBTC15M-SYNTH","dedupe_key":"synthetic-meta","payload":{"ticker":"KXBTC15M-SYNTH","status":"open","open_time":"2026-11-07T00:00:00Z","close_time":"2026-11-07T00:15:00Z","floor_strike":70001}}
+{"type":"orderbook_snapshot","sid":4,"seq":2,"msg":{"market_ticker":"KXBTC15M-SYNTH","yes_dollars_fp":[["0.5100","3"]],"no_dollars_fp":[]}}
+{"type":"orderbook_delta","sid":4,"seq":4,"msg":{"market_ticker":"KXBTC15M-SYNTH","side":"yes","price_dollars":"0.51","delta_fp":"1"}}
+{"type":"orderbook_snapshot","sid":4,"seq":5,"msg":{"market_ticker":"KXBTC15M-SYNTH","yes_dollars_fp":[["0.5200","4"]],"no_dollars_fp":[]}}
+{"channel":"rest_public_trades","kind":"public_trade","market_ticker":"KXBTC15M-SYNTH","dedupe_key":"trade|synthetic-1","payload":{"trade_id":"synthetic-1","created_time":"2026-11-07T00:00:05Z","yes_price_dollars":"0.53","count_fp":"2"}}
