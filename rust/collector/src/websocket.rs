@@ -14,12 +14,13 @@ use sha2::Sha256;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, watch};
-use tokio_tungstenite::connect_async_with_config;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::{HeaderName, HeaderValue};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{connect_async_with_config, WebSocketStream};
 use uuid::Uuid;
 
 pub const KALSHI_WS_URL: &str = "wss://external-api-ws.kalshi.com/trade-api/ws/v2";
@@ -120,11 +121,35 @@ fn subscription_command(market_tickers: &[String]) -> Value {
     })
 }
 
+fn snapshot_recovery_command(id: u64, sid: i64, market_tickers: &[String]) -> Value {
+    json!({
+        "id":id,
+        "cmd":"update_subscription",
+        "params":{
+            "sids":[sid],
+            "market_tickers":market_tickers,
+            "action":"get_snapshot"
+        }
+    })
+}
+
+fn register_subscription_ack(
+    engine: &mut WebsocketEngine,
+    frame: &Value,
+    market_tickers: &[String],
+) {
+    if frame["type"] == "subscribed" && frame["msg"]["channel"] == "orderbook_delta" {
+        if let Some(sid) = frame["msg"]["sid"].as_i64() {
+            engine.register_orderbook_subscription(sid, market_tickers);
+        }
+    }
+}
+
 async fn process_text_frame(
     engine: &mut WebsocketEngine,
     raw: &str,
     events: &mpsc::Sender<Event>,
-) -> Result<()> {
+) -> Result<Vec<i64>> {
     let mut parsed: Value = match serde_json::from_str(raw) {
         Ok(value) => value,
         Err(error) => {
@@ -139,20 +164,27 @@ async fn process_text_frame(
     if let Some(object) = parsed.as_object_mut() {
         object.insert("_collector_received_utc".into(), json!(utc_now()));
     }
-    for event in engine.handle(parsed) {
+    let handled = engine.handle(parsed);
+    let recovery_sids = handled
+        .iter()
+        .filter(|event| event.kind == "sequence_gap")
+        .filter_map(|event| event.payload.get("sid").and_then(Value::as_i64))
+        .filter(|sid| engine.needs_recovery_request(*sid))
+        .collect::<Vec<_>>();
+    for event in handled {
         events
             .send(event)
             .await
             .map_err(|_| anyhow!("WebSocket event receiver closed"))?;
     }
-    Ok(())
+    Ok(recovery_sids)
 }
 
 async fn process_binary_frame(
     engine: &mut WebsocketEngine,
     raw: &[u8],
     events: &mpsc::Sender<Event>,
-) -> Result<()> {
+) -> Result<Vec<i64>> {
     let mut parsed: Value = match serde_json::from_slice(raw) {
         Ok(value) => value,
         Err(error) => {
@@ -167,9 +199,76 @@ async fn process_binary_frame(
     if let Some(object) = parsed.as_object_mut() {
         object.insert("_collector_received_utc".into(), json!(utc_now()));
     }
-    for event in engine.handle(parsed) {
+    let handled = engine.handle(parsed);
+    let recovery_sids = handled
+        .iter()
+        .filter(|event| event.kind == "sequence_gap")
+        .filter_map(|event| event.payload.get("sid").and_then(Value::as_i64))
+        .filter(|sid| engine.needs_recovery_request(*sid))
+        .collect::<Vec<_>>();
+    for event in handled {
         events
             .send(event)
+            .await
+            .map_err(|_| anyhow!("WebSocket event receiver closed"))?;
+    }
+    Ok(recovery_sids)
+}
+
+async fn recover_gapped_subscriptions<S>(
+    socket: &mut WebSocketStream<S>,
+    engine: &mut WebsocketEngine,
+    events: &mpsc::Sender<Event>,
+    recovery_sids: Vec<i64>,
+    next_command_id: &mut u64,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    for sid in recovery_sids {
+        let markets = engine.subscription_markets(sid);
+        if markets.is_empty() {
+            engine.mark_recovery_requested(sid);
+            events
+                .send(Event::new(
+                    "websocket_health",
+                    "sequence_gap_unrecoverable",
+                    None,
+                    json!({"sid":sid,"session_id":engine.session(),
+                        "reason":"no subscribed orderbook markets are known",
+                        "intermediate_deltas":"UNRECOVERED"}),
+                    Some(format!("ws-gap-unrecoverable|{}|{}", engine.session(), sid)),
+                ))
+                .await
+                .map_err(|_| anyhow!("WebSocket event receiver closed"))?;
+            continue;
+        }
+
+        let command_id = *next_command_id;
+        *next_command_id = command_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("WebSocket command ID exhausted"))?;
+        let request = snapshot_recovery_command(command_id, sid, &markets);
+        socket
+            .send(Message::Text(request.to_string().into()))
+            .await
+            .context("request fresh orderbook snapshots after sequence gap")?;
+        engine.mark_recovery_requested(sid);
+        events
+            .send(Event::new(
+                "websocket_health",
+                "snapshot_recovery_requested",
+                None,
+                json!({"sid":sid,"market_tickers":markets,
+                    "session_id":engine.session(),"request_id":command_id,
+                    "action":"get_snapshot"}),
+                Some(format!(
+                    "ws-snapshot-request|{}|{}|{}",
+                    engine.session(),
+                    sid,
+                    command_id
+                )),
+            ))
             .await
             .map_err(|_| anyhow!("WebSocket event receiver closed"))?;
     }
@@ -333,6 +432,7 @@ impl AuthenticatedWebSocket {
         socket
             .send(Message::Text(subscription.to_string().into()))
             .await?;
+        let mut next_command_id = 2_u64;
         loop {
             tokio::select! {
                 changed = shutdown.changed() => {
@@ -343,10 +443,40 @@ impl AuthenticatedWebSocket {
                 }
                 next = socket.next() => match next {
                     Some(Ok(Message::Text(raw))) => {
-                        process_text_frame(engine, &raw, events).await?;
+                        if let Ok(frame) = serde_json::from_str::<Value>(&raw) {
+                            register_subscription_ack(
+                                engine,
+                                &frame,
+                                &self.config.market_tickers,
+                            );
+                        }
+                        let recovery_sids = process_text_frame(engine, &raw, events).await?;
+                        recover_gapped_subscriptions(
+                            &mut socket,
+                            engine,
+                            events,
+                            recovery_sids,
+                            &mut next_command_id,
+                        )
+                        .await?;
                     }
                     Some(Ok(Message::Binary(raw))) => {
-                        process_binary_frame(engine, &raw, events).await?;
+                        if let Ok(frame) = serde_json::from_slice::<Value>(&raw) {
+                            register_subscription_ack(
+                                engine,
+                                &frame,
+                                &self.config.market_tickers,
+                            );
+                        }
+                        let recovery_sids = process_binary_frame(engine, &raw, events).await?;
+                        recover_gapped_subscriptions(
+                            &mut socket,
+                            engine,
+                            events,
+                            recovery_sids,
+                            &mut next_command_id,
+                        )
+                        .await?;
                     }
                     Some(Ok(Message::Ping(payload))) => socket.send(Message::Pong(payload)).await?,
                     Some(Ok(Message::Pong(_))) => {},
@@ -367,6 +497,8 @@ pub struct SubscriptionState {
     last_seq: Option<i64>,
     book_markets: Vec<String>,
     gap: Option<(i64, i64)>,
+    resync_pending: bool,
+    recovery_requested: bool,
 }
 
 #[derive(Debug)]
@@ -399,6 +531,35 @@ impl WebsocketEngine {
         self.subscriptions.clear();
         for book in self.books.values_mut() {
             book.invalidate("connection replaced");
+        }
+    }
+    pub fn register_orderbook_subscription(&mut self, sid: i64, markets: &[String]) {
+        let state = self.subscriptions.entry(sid).or_default();
+        for market in markets {
+            if !state.book_markets.contains(market) {
+                state.book_markets.push(market.clone());
+            }
+        }
+    }
+    pub fn subscription_markets(&self, sid: i64) -> Vec<String> {
+        self.subscriptions
+            .get(&sid)
+            .map(|state| state.book_markets.clone())
+            .unwrap_or_default()
+    }
+    fn recovery_pending(&self, sid: i64) -> bool {
+        self.subscriptions
+            .get(&sid)
+            .is_some_and(|state| state.resync_pending)
+    }
+    fn needs_recovery_request(&self, sid: i64) -> bool {
+        self.subscriptions
+            .get(&sid)
+            .is_some_and(|state| state.resync_pending && !state.recovery_requested)
+    }
+    fn mark_recovery_requested(&mut self, sid: i64) {
+        if let Some(state) = self.subscriptions.get_mut(&sid) {
+            state.recovery_requested = true;
         }
     }
     pub fn book(&self, ticker: &str) -> Option<&OrderBook> {
@@ -450,6 +611,10 @@ impl WebsocketEngine {
             if let Some(last) = state.last_seq {
                 if seq != last + 1 {
                     state.gap = Some((last, seq));
+                    if !state.resync_pending {
+                        state.resync_pending = true;
+                        state.recovery_requested = false;
+                    }
                     for market in &state.book_markets {
                         if let Some(book) = self.books.get_mut(market) {
                             book.invalidate("subscription sequence gap");
@@ -476,14 +641,36 @@ impl WebsocketEngine {
         }
         if let Some(ticker_name) = ticker {
             if kind == "orderbook_snapshot" {
-                let book = self.books.entry(ticker_name.clone()).or_default();
-                match book.snapshot(&msg) {
+                let snapshot_result = self
+                    .books
+                    .entry(ticker_name.clone())
+                    .or_default()
+                    .snapshot(&msg);
+                match snapshot_result {
                     Ok(()) => {
                         out.push(Event::new("websocket_health","book_synchronized",
                             Some(&ticker_name),
                             json!({"session_id":self.session,"sid":sid,"seq":seq,
                                 "state":"SYNCHRONIZED_AFTER_FRESH_SNAPSHOT","observed_utc":observed}),
                             Some(format!("ws-sync|{}|{}|{}",self.session,sid.unwrap_or(-1),seq.unwrap_or(-1)))));
+                        if let Some(sid) = sid {
+                            let all_synced = self.subscriptions.get(&sid).is_some_and(|state| {
+                                state.resync_pending
+                                    && !state.book_markets.is_empty()
+                                    && state.book_markets.iter().all(|market| {
+                                        self.books
+                                            .get(market)
+                                            .is_some_and(|book| book.synchronized())
+                                    })
+                            });
+                            if all_synced {
+                                if let Some(state) = self.subscriptions.get_mut(&sid) {
+                                    state.resync_pending = false;
+                                    state.recovery_requested = false;
+                                    state.gap = None;
+                                }
+                            }
+                        }
                     }
                     Err(error) => {
                         out.push(Event::new(
@@ -645,17 +832,22 @@ mod tests {
             json!(["orderbook_delta", "trade"])
         );
         assert_eq!(command["params"]["market_tickers"], json!(tickers));
+        let recovery = snapshot_recovery_command(2, 7, &tickers);
+        assert_eq!(recovery["cmd"], "update_subscription");
+        assert_eq!(recovery["params"]["action"], "get_snapshot");
+        assert_eq!(recovery["params"]["sids"], json!([7]));
+        assert_eq!(recovery["params"]["market_tickers"], json!(tickers));
     }
 
     #[tokio::test]
-    async fn recorded_frames_detect_gap_and_resynchronize_only_on_snapshot() {
+    async fn fixture_frames_detect_gap_and_resynchronize_only_on_snapshot() {
         let mut engine = WebsocketEngine::with_session("recorded-connection");
         let (tx, mut rx) = mpsc::channel(32);
-        process_text_frame(
+        assert!(process_text_frame(
             &mut engine,
             r#"{"type":"orderbook_snapshot","sid":3,"seq":17,"msg":{"market_ticker":"KXBTC15M-A","yes_dollars_fp":[]}}"#,
             &tx,
-        ).await.unwrap();
+        ).await.unwrap().is_empty());
         assert!(engine.book("KXBTC15M-A").unwrap().synchronized());
         let raw = rx.recv().await.unwrap();
         assert!(
@@ -666,11 +858,13 @@ mod tests {
                 > 10
         );
 
-        process_text_frame(
+        let gap_sids = process_text_frame(
             &mut engine,
             r#"{"type":"orderbook_delta","sid":3,"seq":19,"msg":{"market_ticker":"KXBTC15M-A","side":"yes","price_dollars":"0.5","delta_fp":"1"}}"#,
             &tx,
         ).await.unwrap();
+        assert_eq!(gap_sids, vec![3]);
+        assert_eq!(engine.subscription_markets(3), vec!["KXBTC15M-A"]);
         assert!(!engine.book("KXBTC15M-A").unwrap().synchronized());
         let mut saw_gap = false;
         while let Ok(event) = rx.try_recv() {
@@ -678,16 +872,17 @@ mod tests {
         }
         assert!(saw_gap);
 
-        process_text_frame(
+        assert!(process_text_frame(
             &mut engine,
             r#"{"type":"orderbook_snapshot","sid":3,"seq":20,"msg":{"market_ticker":"KXBTC15M-A","yes_dollars_fp":[]}}"#,
             &tx,
-        ).await.unwrap();
+        ).await.unwrap().is_empty());
         assert!(engine.book("KXBTC15M-A").unwrap().synchronized());
+        assert!(!engine.recovery_pending(3));
     }
 
     #[tokio::test]
-    async fn authenticated_loopback_reconnect_resubscribes_and_requires_fresh_snapshot(
+    async fn authenticated_loopback_requests_snapshot_after_gap_and_recovers_after_reconnect(
     ) -> anyhow::Result<()> {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -706,10 +901,18 @@ mod tests {
                 };
                 let subscription: Value = serde_json::from_str(&subscription)?;
                 if subscription["cmd"] != "subscribe"
-                    || subscription["params"]["market_tickers"] != json!(["KXBTC15M-MOCK"])
+                    || subscription["params"]["market_tickers"]
+                        != json!(["KXBTC15M-MOCK", "KXBTC15M-MOCK-B"])
                 {
                     bail!("unexpected subscription after connection {connection}")
                 }
+                let subscribed = json!({
+                    "type":"subscribed",
+                    "msg":{"channel":"orderbook_delta","sid":7}
+                });
+                socket
+                    .send(Message::Text(subscribed.to_string().into()))
+                    .await?;
                 let snapshot = json!({
                     "type":"orderbook_snapshot",
                     "sid":7,
@@ -719,7 +922,59 @@ mod tests {
                 socket
                     .send(Message::Text(snapshot.to_string().into()))
                     .await?;
+                let second_snapshot = json!({
+                    "type":"orderbook_snapshot",
+                    "sid":7,
+                    "seq":sequence+1,
+                    "msg":{"market_ticker":"KXBTC15M-MOCK-B","yes_dollars_fp":[]}
+                });
+                socket
+                    .send(Message::Text(second_snapshot.to_string().into()))
+                    .await?;
                 if connection == 0 {
+                    let gap_delta = json!({
+                        "type":"orderbook_delta",
+                        "sid":7,
+                        "seq":sequence+3,
+                        "msg":{"market_ticker":"KXBTC15M-MOCK","side":"yes",
+                            "price_dollars":"0.5","delta_fp":"1"}
+                    });
+                    socket
+                        .send(Message::Text(gap_delta.to_string().into()))
+                        .await?;
+                    let recovery = tokio::time::timeout(Duration::from_secs(3), socket.next())
+                        .await?
+                        .ok_or_else(|| anyhow!("client did not request a fresh snapshot"))??;
+                    let Message::Text(recovery) = recovery else {
+                        bail!("client recovery request was not a text command")
+                    };
+                    let recovery: Value = serde_json::from_str(&recovery)?;
+                    if recovery["cmd"] != "update_subscription"
+                        || recovery["params"]["action"] != "get_snapshot"
+                        || recovery["params"]["sids"] != json!([7])
+                        || recovery["params"]["market_tickers"]
+                            != json!(["KXBTC15M-MOCK", "KXBTC15M-MOCK-B"])
+                    {
+                        bail!("unexpected snapshot recovery request: {recovery}")
+                    }
+                    let fresh_snapshot = json!({
+                        "type":"orderbook_snapshot",
+                        "sid":7,
+                        "seq":sequence+4,
+                        "msg":{"market_ticker":"KXBTC15M-MOCK","yes_dollars_fp":[]}
+                    });
+                    socket
+                        .send(Message::Text(fresh_snapshot.to_string().into()))
+                        .await?;
+                    let fresh_second_snapshot = json!({
+                        "type":"orderbook_snapshot",
+                        "sid":7,
+                        "seq":sequence+5,
+                        "msg":{"market_ticker":"KXBTC15M-MOCK-B","yes_dollars_fp":[]}
+                    });
+                    socket
+                        .send(Message::Text(fresh_second_snapshot.to_string().into()))
+                        .await?;
                     socket.close(None).await?;
                 } else {
                     while let Some(message) = socket.next().await {
@@ -758,7 +1013,7 @@ mod tests {
             url,
             key_id: "offline-test-key".into(),
             private_key_path: key_path,
-            market_tickers: vec!["KXBTC15M-MOCK".into()],
+            market_tickers: vec!["KXBTC15M-MOCK".into(), "KXBTC15M-MOCK-B".into()],
             allow_network: true,
             reconnect_initial: Duration::from_millis(5),
             reconnect_max: Duration::from_millis(20),
@@ -777,14 +1032,14 @@ mod tests {
                     synchronized += 1;
                 }
                 events.push(event);
-                if synchronized == 2 {
+                if synchronized == 6 {
                     let _ = stop_tx.send(true);
                     break;
                 }
             }
         })
         .await
-        .expect("both connections should obtain fresh snapshots");
+        .expect("gap recovery and reconnect should obtain fresh snapshots for both markets");
         tokio::time::timeout(Duration::from_secs(3), client)
             .await
             .expect("client should stop promptly")??;
@@ -794,7 +1049,7 @@ mod tests {
             .iter()
             .filter(|event| event.channel == "websocket_raw" && event.kind == "orderbook_snapshot")
             .collect();
-        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots.len(), 6);
         let sessions: std::collections::BTreeSet<_> = snapshots
             .iter()
             .map(|event| event.payload["session_id"].as_str().unwrap())
@@ -811,7 +1066,20 @@ mod tests {
                 .count(),
             1
         );
-        assert!(!events.iter().any(|event| event.kind == "sequence_gap"));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "sequence_gap")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "snapshot_recovery_requested")
+                .count(),
+            1
+        );
         Ok(())
     }
 }
