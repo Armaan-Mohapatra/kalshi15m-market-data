@@ -1,6 +1,6 @@
 param([switch]$InstallDependencies,[switch]$KeepSupervisorPaused)
 $ErrorActionPreference = 'Stop'
-$root = 'C:\Users\dakin\Projects\kalshi-15m-native'
+$root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $homePath = if ($env:KALSHI15M_HOME) { $env:KALSHI15M_HOME } else { Join-Path $env:LOCALAPPDATA 'Kalshi15mNative' }
 $statusPort = if ($env:KALSHI15M_STATUS_PORT) { [int]$env:KALSHI15M_STATUS_PORT } else { 8768 }
 $venvPython = Join-Path $root '.venv\Scripts\python.exe'
