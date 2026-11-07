@@ -965,6 +965,41 @@ mod tests {
         calls: Mutex<Vec<Vec<String>>>,
     }
 
+    struct PriorityMock {
+        markets: Vec<Value>,
+        book_order: Mutex<Vec<String>>,
+    }
+
+    impl ExchangeSource for PriorityMock {
+        async fn discover(&self, _series: &[String], _max_pages: usize) -> Result<InventoryBatch> {
+            Ok(InventoryBatch {
+                markets: self.markets.clone(),
+                failures: Vec::new(),
+            })
+        }
+
+        async fn orderbook(&self, ticker: &str) -> Result<Option<Response>> {
+            self.book_order.lock().unwrap().push(ticker.to_owned());
+            Ok(Some(Response {
+                body: json!({"ticker":ticker,"orderbook_fp":{"yes_dollars_fp":[],"no_dollars_fp":[]}}),
+                metadata: json!({"http_status":200}),
+            }))
+        }
+
+        async fn trades(
+            &self,
+            _ticker: &str,
+            _since: DateTime<Utc>,
+            _max_pages: usize,
+        ) -> Result<TradeBatch> {
+            Ok(TradeBatch {
+                trades: Vec::new(),
+                complete: true,
+                pages: 1,
+            })
+        }
+    }
+
     impl ExchangeSource for CatalogMock {
         async fn series_catalog(&self) -> Result<Vec<Value>> {
             Ok(self.rows.clone())
@@ -1070,6 +1105,36 @@ mod tests {
         assert_eq!(
             *source.calls.lock().unwrap(),
             vec![vec!["A", "B", "C", "D"], vec!["E", "F", "A", "B"]]
+        );
+        journal.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn scheduler_prioritizes_first_three_minutes_before_imminent_contract() {
+        let home = tempfile::tempdir().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 11, 7, 12, 0, 0).unwrap();
+        let open = now - ChronoDuration::seconds(30);
+        let upcoming = now + ChronoDuration::seconds(10);
+        let source = PriorityMock {
+            markets: vec![
+                json!({"ticker":"ACTIVE-OPENING","status":"open","open_time":open.to_rfc3339(),
+                    "close_time":(open+ChronoDuration::seconds(900)).to_rfc3339()}),
+                json!({"ticker":"UPCOMING-NEXT","status":"unopened","open_time":upcoming.to_rfc3339(),
+                    "close_time":(upcoming+ChronoDuration::seconds(900)).to_rfc3339()}),
+            ],
+            book_order: Mutex::new(Vec::new()),
+        };
+        let mut runtime = ContinuousRuntime::default();
+        let mut journal = Journal::open(home.path()).unwrap();
+        let mut health = RuntimeHealth::new(config().queue_capacity);
+        let summary = runtime
+            .run_cycle(&source, &mut journal, &config(), &mut health, now)
+            .await
+            .unwrap();
+        assert_eq!(summary.book_polls, 2);
+        assert_eq!(
+            *source.book_order.lock().unwrap(),
+            ["ACTIVE-OPENING", "UPCOMING-NEXT"]
         );
         journal.close().unwrap();
     }
