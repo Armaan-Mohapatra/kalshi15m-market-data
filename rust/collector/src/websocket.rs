@@ -850,6 +850,48 @@ mod tests {
         assert!(!c.iter().any(|x| x.kind == "sequence_gap"));
         assert!(ws.book("A").unwrap().synchronized());
     }
+
+    #[test]
+    fn recorded_identity_only_empty_snapshot_synchronizes_book() {
+        let mut ws = WebsocketEngine::with_session("segment-186-fixture");
+        let events = ws.handle(json!({
+            "type":"orderbook_snapshot",
+            "sid":1,
+            "seq":773214,
+            "msg":{
+                "market_ticker":"KXETH15M-26OCT300745-45",
+                "market_id":"01a18941-42b7-773e-8a93-f0be1b976825",
+                "clock":15679747546
+            }
+        }));
+        assert!(!events.iter().any(|event| event.kind == "book_invalid"));
+        assert!(!events.iter().any(|event| event.kind == "sequence_gap"));
+        let book = ws.book("KXETH15M-26OCT300745-45").unwrap();
+        assert!(book.synchronized());
+        assert_eq!(book.quote().unwrap().yes_bid, None);
+        assert_eq!(book.quote().unwrap().no_bid, None);
+
+        let delta = ws.handle(json!({
+            "type":"orderbook_delta",
+            "sid":1,
+            "seq":773215,
+            "msg":{
+                "market_ticker":"KXETH15M-26OCT300745-45",
+                "side":"yes",
+                "price_dollars":"0.4500",
+                "delta_fp":"1.25"
+            }
+        }));
+        assert!(!delta.iter().any(|event| event.kind == "book_invalid"));
+        assert_eq!(
+            ws.book("KXETH15M-26OCT300745-45")
+                .unwrap()
+                .quote()
+                .unwrap()
+                .yes_bid,
+            Some(Decimal::new(45, 2))
+        );
+    }
     #[test]
     fn gap_invalidates_books_until_new_snapshot() {
         let mut ws = WebsocketEngine::with_session("a");

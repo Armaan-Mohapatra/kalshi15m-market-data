@@ -126,7 +126,22 @@ impl OrderBook {
         let (yes_rows, has_yes) = side(book, "yes")?;
         let (no_rows, has_no) = side(book, "no")?;
         if !(has_yes || has_no) {
-            bail!("snapshot has no recognized bid side")
+            // Kalshi's captured empty-book snapshots may omit both side
+            // arrays entirely. Treat that shape as an empty book only when
+            // the exchange snapshot identity is complete; otherwise it is
+            // indistinguishable from a malformed payload.
+            let has_exchange_identity = book
+                .get("market_ticker")
+                .and_then(Value::as_str)
+                .is_some_and(|ticker| !ticker.is_empty())
+                && book
+                    .get("market_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| !id.is_empty())
+                && book.get("clock").and_then(Value::as_u64).is_some();
+            if !has_exchange_identity {
+                bail!("snapshot has no recognized bid side or complete empty-book identity")
+            }
         }
         let mut yes = BTreeMap::new();
         let mut no = BTreeMap::new();
@@ -218,6 +233,26 @@ mod tests {
         assert!(b
             .delta(&json!({"side":"yes","price_dollars":"0.4","delta_fp":"1"}))
             .is_err());
+    }
+
+    #[test]
+    fn kalshi_identity_only_snapshot_is_a_valid_empty_book() {
+        let mut book = OrderBook::default();
+        book.snapshot(&json!({
+            "market_ticker":"KXBTC15M-EMPTY",
+            "market_id":"01a18940-bf3f-7807-84c7-9dfae6345547",
+            "clock":15679747546
+        }))
+        .unwrap();
+        assert!(book.synchronized());
+        assert_eq!(book.quote().unwrap().yes_bid, None);
+        assert_eq!(book.quote().unwrap().no_bid, None);
+
+        let mut malformed = OrderBook::default();
+        assert!(malformed
+            .snapshot(&json!({"market_ticker":"KXBTC15M-EMPTY"}))
+            .is_err());
+        assert!(!malformed.synchronized());
     }
     #[test]
     fn legacy_cents_and_dollars_match() {
