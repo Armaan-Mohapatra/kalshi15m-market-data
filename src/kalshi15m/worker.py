@@ -2407,8 +2407,13 @@ class Collector:
             return
         profile_key = "crossmarket" if crossmarket else "btc"
         now_monotonic = time.monotonic()
-        last_poll = self.last_settlement_poll_monotonic.get(profile_key, 0.0)
-        if now_monotonic - last_poll < self.cfg.paper_settlement_poll_interval_seconds:
+        last_poll = self.last_settlement_poll_monotonic.get(profile_key)
+        # The first reconciliation must run even when monotonic uptime is
+        # shorter than the polling interval (e.g. fresh CI/Windows boot).
+        if (
+            last_poll is not None
+            and now_monotonic - last_poll < self.cfg.paper_settlement_poll_interval_seconds
+        ):
             return
         self.last_settlement_poll_monotonic[profile_key] = now_monotonic
         tickers = sorted(positions)
