@@ -891,14 +891,6 @@ class Storage:
             prepared.append((event, dedupe, digest, raw))
 
         keys = list(dict.fromkeys(item[1] for item in prepared))
-        # Prior versions are already committed; do not rearchive them on
-        # overlapping REST observations, even though the canonical key differs.
-        prior_versions = {
-            str(row[0]) for row in self.connection.execute(
-                "SELECT row_sha256 FROM market_event_versions WHERE source_generation = ?",
-                ("collector-runtime",),
-            )
-        }
         existing: dict[str, str] = {}
         seen: dict[str, str] = {}
         for start in range(0, len(keys), 500):
@@ -911,6 +903,29 @@ class Storage:
                     batch_keys,
                 )
             )
+
+        # Targeted indexed lookups only: never load all historical conflict
+        # versions into RAM on every batch.
+        candidates: set[str] = set()
+        hypothetical_new: dict[str, str] = {}
+        for _event, key, digest, _raw in prepared:
+            canonical = existing.get(key, hypothetical_new.get(key))
+            if canonical is None:
+                hypothetical_new[key] = digest
+            elif canonical != digest:
+                candidates.add(hashlib.sha256(
+                    (key + "|" + digest).encode("utf-8")
+                ).hexdigest())
+        prior_versions: set[str] = set()
+        candidate_list = sorted(candidates)
+        for offset in range(0, len(candidate_list), 400):
+            page = candidate_list[offset : offset + 400]
+            marks = ",".join("?" for _ in page)
+            prior_versions.update(str(row[0]) for row in self.connection.execute(
+                f"SELECT row_sha256 FROM market_event_versions "
+                f"WHERE source_generation = ? AND row_sha256 IN ({marks})",
+                ["collector-runtime", *page],
+            ))
 
         rows: list[tuple[Any, ...]] = []
         version_rows: list[tuple[Any, ...]] = []
