@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 .venv-rust-verification/
 rust/collector/target/
+.stage-artifacts/
 .pytest_cache/
 .ruff_cache/
 runtime/*.pid.json
