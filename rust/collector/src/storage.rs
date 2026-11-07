@@ -273,10 +273,14 @@ impl Journal {
         if !spool.exists() {
             return Ok(());
         }
+        // Enumeration failures must fail closed. Silently skipping an entry
+        // could otherwise make recovery appear complete while a spool file
+        // remains unobserved.
         let mut files = fs::read_dir(&spool)?
-            .filter_map(|item| item.ok())
-            .filter(|item| item.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
-            .map(|item| item.path())
+            .map(|item| item.map(|entry| entry.path()))
+            .collect::<std::io::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
             .collect::<Vec<_>>();
         files.sort();
         if files.len() > limit {
@@ -865,5 +869,61 @@ mod tests {
         assert!(!readonly.verify_archive().unwrap());
         drop(readonly);
         assert!(partial.is_file());
+    }
+
+    #[test]
+    fn corrupt_spool_fails_open_and_preserves_evidence() {
+        let home = tempfile::tempdir().unwrap();
+        let spool_dir = home.path().join("data").join("rust_pending");
+        fs::create_dir_all(&spool_dir).unwrap();
+        let corrupt = spool_dir.join("000-corrupt.json");
+        fs::write(&corrupt, b"{not valid event json").unwrap();
+
+        let opened = Journal::open(home.path());
+        assert!(opened.is_err());
+        assert!(corrupt.is_file(), "corrupt spool evidence must be retained");
+
+        let readonly = Journal::open_readonly(home.path()).unwrap();
+        assert_eq!(readonly.audit().unwrap()["pending_spool_entries"], 1);
+        assert!(!readonly.verify_archive().unwrap());
+        drop(readonly);
+        assert!(corrupt.is_file());
+    }
+
+    #[test]
+    fn spool_replay_limit_fails_before_ingesting_or_removing_entries() {
+        let home = tempfile::tempdir().unwrap();
+        let mut store = Journal::open(home.path()).unwrap();
+        let first = store
+            .spool(&Event::new(
+                "rest",
+                "trade",
+                None,
+                json!({"id":1}),
+                Some("one".into()),
+            ))
+            .unwrap();
+        let second = store
+            .spool(&Event::new(
+                "rest",
+                "trade",
+                None,
+                json!({"id":2}),
+                Some("two".into()),
+            ))
+            .unwrap();
+
+        assert!(store.replay_spool(1).is_err());
+        assert!(first.is_file());
+        assert!(second.is_file());
+        assert_eq!(store.unarchived_count().unwrap(), 0);
+        assert_eq!(store.stats.spool_replayed, 0);
+        drop(store);
+
+        let recovered = Journal::open(home.path()).unwrap();
+        assert!(!first.exists());
+        assert!(!second.exists());
+        assert_eq!(recovered.audit().unwrap()["canonical_events"], 2);
+        recovered.close().unwrap();
     }
 }
