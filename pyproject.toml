@@ -1,0 +1,17 @@
+[project]
+name = "kalshi-15m-native"
+version = "0.1.0"
+description = "Isolated native Windows Kalshi 15-minute market-data collector and paper ledger"
+requires-python = ">=3.12"
+dependencies = [
+  "websockets>=15,<16",
+  "cryptography>=45,<48",
+  "pyarrow>=22,<25",
+  "duckdb>=1.3,<2",
+]
+
+[project.scripts]
+kalshi15m = "kalshi15m.cli:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]

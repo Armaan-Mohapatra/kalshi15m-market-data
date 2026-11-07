@@ -1,0 +1,4 @@
+websockets>=15,<16
+cryptography>=45,<48
+pyarrow>=22,<25
+duckdb>=1.3,<2
