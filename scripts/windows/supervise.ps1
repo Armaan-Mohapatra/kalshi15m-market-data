@@ -13,8 +13,7 @@ $startPath = Join-Path $root 'scripts\windows\start.ps1'
 $lastLoggedState = $null
 $lastHealthyPid = $null
 $lastCaptureQuality = $null
-
-New-Item -ItemType Directory -Path (Split-Path -Parent $logPath),(Split-Path -Parent $pidPath) -Force | Out-Null
+$lastCaptureEvidence = $null
 
 function Write-SupervisorLog {
     param([Parameter(Mandatory = $true)][string]$Message)
@@ -24,8 +23,6 @@ function Write-SupervisorLog {
     $line = "{0} {1}{2}" -f [DateTime]::UtcNow.ToString('o'),$Message,[Environment]::NewLine
     [IO.File]::AppendAllText($logPath,$line,[Text.UTF8Encoding]::new($false))
 }
-
-Write-SupervisorLog "SUPERVISOR_CONTEXT root=$root runtime_home=$homePath port=$statusPort account=$([Security.Principal.WindowsIdentity]::GetCurrent().Name) pid_record=$pidPath pid_record_exists=$(Test-Path -LiteralPath $pidPath) runtime_exists=$(Test-Path -LiteralPath (Split-Path -Parent $pidPath))"
 
 function Get-StatusValue {
     param([AllowNull()][object]$Object,[Parameter(Mandatory = $true)][string]$Name)
@@ -81,10 +78,41 @@ function Test-StandaloneWorker {
             }
         }
         if ([string]$status.service_state -eq 'RUNNING') {
+            # Process liveness and durable ingestion are different guarantees.
+            # Do NOT use capture freshness to trigger an automatic restart.
+            $captureEvidence = 'UNKNOWN_NO_CURRENT_DURABLE_PROOF'
+            $heartbeatAgeSeconds = $null
+            $heartbeat = Get-StatusValue $status 'heartbeat_utc'
+            if ($heartbeat) {
+                try {
+                    $heartbeatAgeSeconds = [math]::Max(0, ([DateTime]::UtcNow - [DateTime]::Parse([string]$heartbeat).ToUniversalTime()).TotalSeconds)
+                } catch { $captureEvidence = 'UNKNOWN_HEARTBEAT_UNPARSEABLE' }
+            }
+            $storageWrite = [string](Get-StatusValue $status 'storage_write_state')
+            if ($storageWrite -in @('FATAL_NOT_DURABLE','RECOVERY_SPOOLED_STOPPING','DEGRADED_RETRYING')) {
+                $captureEvidence = 'DEGRADED_WRITER_FAILURE'
+            } elseif ($null -eq $heartbeatAgeSeconds -or $heartbeatAgeSeconds -gt 30) {
+                $captureEvidence = 'UNKNOWN_OR_STALE_HEARTBEAT'
+            } elseif ($storageWrite -eq 'NOT_OPEN') {
+                $captureEvidence = 'UNVERIFIED_STORAGE_NOT_OPEN'
+            } else {
+                $latestDisk = Get-StatusValue $status 'storage_latest_disk_market_event_received_utc'
+                if ($latestDisk) {
+                    try {
+                        $diskAgeSeconds = ([DateTime]::UtcNow - [DateTime]::Parse([string]$latestDisk).ToUniversalTime()).TotalSeconds
+                        if ($diskAgeSeconds -ge 0 -and $diskAgeSeconds -le 180 -and $storageWrite -eq 'HEALTHY') {
+                            $captureEvidence = 'RECENT_DURABLE_EVENT_REPORTED'
+                        }
+                    } catch {}
+                }
+            }
             return [pscustomobject]@{
-                healthy = $true; can_start = $false; reason = 'HEALTHY'
+                healthy = $true; can_start = $false; reason = 'PROCESS_RUNNING_NOT_CAPTURE_VERIFIED'
                 pid = $statusPid; state = [string]$status.service_state; identity_verified = $true
                 capture_quality = [string](Get-StatusValue $status 'collection_quality_state')
+                capture_evidence = $captureEvidence
+                heartbeat_age_seconds = $heartbeatAgeSeconds
+                storage_write_state = $storageWrite
             }
         }
         return [pscustomobject]@{
@@ -124,10 +152,15 @@ function Test-StandaloneWorker {
 
 if ($CheckOnly) {
     $check = Test-StandaloneWorker
-    [pscustomobject]@{ healthy = $check.healthy; reason = $check.reason; pid = $check.pid; state = $check.state; identity_verified = $check.identity_verified; capture_quality = $check.capture_quality; exchange_writes = 0 } | ConvertTo-Json -Compress
+    [pscustomobject]@{ healthy = $check.healthy; reason = $check.reason; pid = $check.pid; state = $check.state; identity_verified = $check.identity_verified; capture_quality = $check.capture_quality; capture_evidence = $check.capture_evidence; heartbeat_age_seconds = $check.heartbeat_age_seconds; storage_write_state = $check.storage_write_state; exchange_writes = 0 } | ConvertTo-Json -Compress
     if ($check.healthy) { exit 0 }
     exit 1
 }
+
+# CheckOnly is strictly observational: logging and directory creation occur
+# ONLY in supervisor service mode after the early exit above.
+New-Item -ItemType Directory -Path (Split-Path -Parent $logPath),(Split-Path -Parent $pidPath) -Force | Out-Null
+Write-SupervisorLog "SUPERVISOR_CONTEXT root=$root runtime_home=$homePath port=$statusPort account=$([Security.Principal.WindowsIdentity]::GetCurrent().Name) pid_record=$pidPath pid_record_exists=$(Test-Path -LiteralPath $pidPath) runtime_exists=$(Test-Path -LiteralPath (Split-Path -Parent $pidPath))"
 
 $env:KALSHI15M_HOME = $homePath
 $env:KALSHI15M_STATUS_PORT = [string]$statusPort
@@ -160,6 +193,10 @@ while ($true) {
         if ($lastCaptureQuality -ne $check.capture_quality) {
             Write-SupervisorLog "CAPTURE_QUALITY_CHANGED worker_pid=$($check.pid) quality=$($check.capture_quality)"
             $lastCaptureQuality = $check.capture_quality
+        }
+        if ($lastCaptureEvidence -ne $check.capture_evidence) {
+            Write-SupervisorLog "CAPTURE_EVIDENCE_CHANGED worker_pid=$($check.pid) evidence=$($check.capture_evidence) storage_write=$($check.storage_write_state)"
+            $lastCaptureEvidence = $check.capture_evidence
         }
         $lastHealthyPid = $check.pid
         $lastLoggedState = 'HEALTHY'

@@ -18,7 +18,7 @@ from kalshi15m.book import OrderBook
 from kalshi15m.config import Settings
 from kalshi15m.coverage import OpeningCoverage
 from kalshi15m.storage import Storage
-from kalshi15m.worker import Collector
+from kalshi15m.worker import Collector, classify_rest_reconciliation
 
 
 def event(key, payload):
@@ -289,6 +289,100 @@ class CaptureReliabilityTests(unittest.TestCase):
             self.assertEqual(len(keys), 2)
             self.assertNotEqual(keys[0], keys[1])
             collector.writer_pool.shutdown(wait=False)
+
+
+    def test_websocket_delta_counters_distinguish_filtered_from_enqueued(self):
+        class FakeSocket:
+            def __init__(self, frame):
+                self.frame = frame
+                self.delivered = False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self.delivered:
+                    raise StopAsyncIteration
+                self.delivered = True
+                return json.dumps(self.frame)
+
+        with TemporaryDirectory() as directory:
+            collector = Collector(Settings(home=Path(directory)))
+            collector.websocket_session_id = "staging-test-session"
+            collector.subscription_channel_by_sid[9] = "orderbook_delta"
+            collector.last_seq[9] = 2
+            frame = {
+                "type": "orderbook_delta", "sid": 9, "seq": 3,
+                "msg": {
+                    "market_ticker": "ONE", "side": "yes",
+                    "price_dollars": "0.50", "delta_fp": "1",
+                },
+            }
+            # Valid sequence, but market is not currently in our capture scope.
+            asyncio.run(collector._receive_ws(FakeSocket(frame)))
+            status = collector.status.snapshot()
+            self.assertEqual(status["websocket_delta_received_count"], 1)
+            self.assertEqual(status["websocket_delta_filtered_out_of_scope_count"], 1)
+            self.assertEqual(status["websocket_delta_enqueued_count"], 0)
+            self.assertEqual(
+                status["last_by_channel"]["websocket_orderbook_delta"]["exchange_ts"],
+                None,
+            )
+            self.assertEqual(len(collector.queue._queue), 0)
+            self.assertEqual(status["orderbook_sequence_delta_count"], 1)
+
+            collector.open_tickers = {"ONE"}
+            book = OrderBook()
+            book.snapshot({"yes_dollars_fp": [["0.50", "2"]], "no_dollars_fp": []})
+            collector.books["ONE"] = book
+            frame["seq"] = 4
+            asyncio.run(collector._receive_ws(FakeSocket(frame)))
+            status = collector.status.snapshot()
+            self.assertEqual(status["websocket_delta_received_count"], 2)
+            self.assertEqual(status["websocket_delta_filtered_out_of_scope_count"], 1)
+            self.assertEqual(status["websocket_delta_enqueued_count"], 1)
+            self.assertIsNotNone(status["websocket_delta_last_enqueued_utc"])
+            self.assertEqual(status["orderbook_sequence_delta_count"], 2)
+            self.assertEqual(
+                len([e for e in collector.queue._queue if e["kind"] == "orderbook_delta"]),
+                1,
+            )
+            # Enqueued does not imply journaled or finalized in Parquet.
+            collector.writer_pool.shutdown(wait=False)
+
+
+class RestHealthClassificationTests(unittest.TestCase):
+    def test_transient_prior_api_error_does_not_permanently_degrade_rest(self):
+        # The API lifetime error total may remain >0 after recovery.
+        # Only errors during the current reconcile should determine freshness.
+        self.assertEqual(
+            classify_rest_reconciliation(
+                interval_errors=0,
+                coverage_state="COMPLETE_CURRENT_AND_NEAR_TERM",
+            ),
+            ("READY", "RECENT_RECONCILIATION_SUCCEEDED"),
+        )
+        self.assertEqual(
+            classify_rest_reconciliation(
+                interval_errors=1,
+                coverage_state="COMPLETE_CURRENT_AND_NEAR_TERM",
+            ),
+            ("DEGRADED", "CURRENT_RECONCILIATION_API_ERRORS"),
+        )
+
+    def test_cached_partial_discovery_does_not_report_rest_ready(self):
+        self.assertEqual(
+            classify_rest_reconciliation(
+                interval_errors=0, coverage_state="PARTIAL",
+            ),
+            ("DEGRADED", "DISCOVERY_COVERAGE_NOT_CONFIRMED_COMPLETE"),
+        )
+        self.assertEqual(
+            classify_rest_reconciliation(
+                interval_errors=0, coverage_state="UNKNOWN",
+            ),
+            ("DEGRADED", "DISCOVERY_COVERAGE_NOT_CONFIRMED_COMPLETE"),
+        )
 
 
 class ApiReliabilityTests(unittest.TestCase):
