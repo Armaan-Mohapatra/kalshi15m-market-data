@@ -2,6 +2,7 @@ use crate::archive::{self, ArchiveRow, PartInfo};
 use crate::event::{hash_bytes, utc_now, Event};
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use serde::Serialize;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
@@ -23,6 +24,27 @@ pub struct Stats {
     pub variants: u64,
     pub duplicates: u64,
     pub spool_replayed: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CapacitySnapshot {
+    pub disk_free_bytes: u64,
+    pub sqlite_bytes: u64,
+    pub wal_bytes: u64,
+    pub capacity_state: String,
+}
+
+pub fn capacity_state(disk_free_bytes: u64, wal_bytes: u64) -> &'static str {
+    const WARNING_FREE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+    const CRITICAL_FREE_BYTES: u64 = 512 * 1024 * 1024;
+    const WARNING_WAL_BYTES: u64 = 512 * 1024 * 1024;
+    if disk_free_bytes < CRITICAL_FREE_BYTES {
+        "CRITICAL_DISK_PRESSURE"
+    } else if disk_free_bytes < WARNING_FREE_BYTES || wal_bytes >= WARNING_WAL_BYTES {
+        "WARNING_CAPACITY_PRESSURE"
+    } else {
+        "NORMAL"
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,6 +137,28 @@ impl Journal {
         journal.discover_existing_parts(10_000)?;
         journal.replay_spool(10_000)?;
         Ok(journal)
+    }
+
+    /// Metadata-only capacity check for the isolated journal volume.
+    pub fn capacity_snapshot(&self) -> Result<CapacitySnapshot> {
+        let db = self.home.join("data").join("paper_ledger.sqlite3");
+        let wal = self.home.join("data").join("paper_ledger.sqlite3-wal");
+        let size = |path: &Path| -> Result<u64> {
+            Ok(if path.exists() {
+                path.metadata()?.len()
+            } else {
+                0
+            })
+        };
+        let disk_free_bytes = fs2::available_space(&self.home)?;
+        let sqlite_bytes = size(&db)?;
+        let wal_bytes = size(&wal)?;
+        Ok(CapacitySnapshot {
+            disk_free_bytes,
+            sqlite_bytes,
+            wal_bytes,
+            capacity_state: capacity_state(disk_free_bytes, wal_bytes).to_owned(),
+        })
     }
 
     fn mark(&self, state: &str) -> Result<()> {
@@ -531,6 +575,38 @@ impl Journal {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn capacity_thresholds_warn_and_fail_closed_at_low_free_space() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(capacity_state(3 * GIB, 0), "NORMAL");
+        assert_eq!(
+            capacity_state(1500 * 1024 * 1024, 0),
+            "WARNING_CAPACITY_PRESSURE"
+        );
+        assert_eq!(
+            capacity_state(3 * GIB, 512 * 1024 * 1024),
+            "WARNING_CAPACITY_PRESSURE"
+        );
+        assert_eq!(
+            capacity_state(511 * 1024 * 1024, 0),
+            "CRITICAL_DISK_PRESSURE"
+        );
+    }
+
+    #[test]
+    fn capacity_snapshot_reads_only_the_staging_journal_and_volume() {
+        let home = tempfile::tempdir().unwrap();
+        let journal = Journal::open(home.path()).unwrap();
+        let snapshot = journal.capacity_snapshot().unwrap();
+        assert!(snapshot.disk_free_bytes > 0);
+        assert!(snapshot.sqlite_bytes > 0);
+        assert_eq!(
+            snapshot.capacity_state,
+            capacity_state(snapshot.disk_free_bytes, snapshot.wal_bytes)
+        );
+        journal.close().unwrap();
+    }
 
     #[test]
     fn journal_retains_conflicts_and_archives_exactly_once() {

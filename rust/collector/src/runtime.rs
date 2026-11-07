@@ -217,6 +217,9 @@ pub struct MarketHealth {
     pub market_state: String,
     pub seconds_to_open: i64,
     pub last_book_poll_utc: Option<String>,
+    pub last_websocket_frame_utc: Option<String>,
+    pub last_websocket_trade_utc: Option<String>,
+    pub book_source: String,
     pub book_state: String,
     pub last_trade_poll_utc: Option<String>,
     pub trades_complete: Option<bool>,
@@ -227,6 +230,11 @@ pub struct MarketHealth {
 pub struct RuntimeHealth {
     pub process_liveness: String,
     pub rest_state: String,
+    pub websocket_state: String,
+    pub websocket_reconnect_count: u64,
+    pub websocket_sequence_gap_count: u64,
+    pub websocket_malformed_frame_count: u64,
+    pub websocket_last_frame_utc: Option<String>,
     pub sqlite_state: String,
     pub archive_state: String,
     pub queue_capacity: usize,
@@ -235,15 +243,24 @@ pub struct RuntimeHealth {
     pub events_acknowledged: u64,
     pub events_duplicate: u64,
     pub poll_failures: u64,
+    pub disk_free_bytes: u64,
+    pub sqlite_bytes: u64,
+    pub wal_bytes: u64,
+    pub capacity_state: String,
     pub updated_utc: String,
     pub markets: BTreeMap<String, MarketHealth>,
 }
 
 impl RuntimeHealth {
-    fn new(queue_capacity: usize) -> Self {
+    pub fn new(queue_capacity: usize) -> Self {
         Self {
             process_liveness: "RUNNING".into(),
             rest_state: "NOT_YET_POLLED".into(),
+            websocket_state: "DISABLED".into(),
+            websocket_reconnect_count: 0,
+            websocket_sequence_gap_count: 0,
+            websocket_malformed_frame_count: 0,
+            websocket_last_frame_utc: None,
             sqlite_state: "OPEN".into(),
             archive_state: "UNVERIFIED".into(),
             queue_capacity,
@@ -252,12 +269,16 @@ impl RuntimeHealth {
             events_acknowledged: 0,
             events_duplicate: 0,
             poll_failures: 0,
+            disk_free_bytes: 0,
+            sqlite_bytes: 0,
+            wal_bytes: 0,
+            capacity_state: "NOT_MEASURED".into(),
             updated_utc: utc_now(),
             markets: BTreeMap::new(),
         }
     }
 
-    fn publish(&mut self, home: &Path) -> Result<()> {
+    pub fn publish(&mut self, home: &Path) -> Result<()> {
         self.updated_utc = utc_now();
         let path = home.join("runtime").join("status.json");
         std::fs::create_dir_all(path.parent().context("status parent")?)?;
@@ -299,6 +320,17 @@ impl ContinuousRuntime {
         now: DateTime<Utc>,
     ) -> Result<CycleSummary> {
         config.validate()?;
+        let capacity = journal.capacity_snapshot()?;
+        health.disk_free_bytes = capacity.disk_free_bytes;
+        health.sqlite_bytes = capacity.sqlite_bytes;
+        health.wal_bytes = capacity.wal_bytes;
+        health.capacity_state = capacity.capacity_state.clone();
+        if capacity.capacity_state == "CRITICAL_DISK_PRESSURE" {
+            health.sqlite_state = "BLOCKED_DISK_PRESSURE".into();
+            health.rest_state = "BLOCKED_DISK_PRESSURE".into();
+            health.publish(&journal.home)?;
+            bail!("critical staging disk pressure; refusing new market polls")
+        }
         let mut summary = CycleSummary::default();
         let mut pending = Vec::new();
 
@@ -415,6 +447,9 @@ impl ContinuousRuntime {
                     market_state: if is_open { "OPEN" } else { "UPCOMING" }.into(),
                     seconds_to_open: market.seconds_to_open(now),
                     last_book_poll_utc: None,
+                    last_websocket_frame_utc: None,
+                    last_websocket_trade_utc: None,
+                    book_source: "REST_SAMPLED_NOT_WS_SYNCHRONIZED".into(),
                     book_state: "NOT_YET_OBSERVED".into(),
                     last_trade_poll_utc: None,
                     trades_complete: None,
@@ -456,6 +491,7 @@ impl ContinuousRuntime {
                         ));
                         if let Some(item) = self.market_health.get_mut(ticker) {
                             item.last_book_poll_utc = Some(observed.clone());
+                            item.book_source = "REST_SAMPLED_NOT_WS_SYNCHRONIZED".into();
                             item.book_state = validation.into();
                             item.last_error = None;
                         }
@@ -569,6 +605,9 @@ impl ContinuousRuntime {
                     market_state: if is_open { "OPEN" } else { "UPCOMING" }.into(),
                     seconds_to_open: market.seconds_to_open(now),
                     last_book_poll_utc: None,
+                    last_websocket_frame_utc: None,
+                    last_websocket_trade_utc: None,
+                    book_source: "REST_SAMPLED_NOT_WS_SYNCHRONIZED".into(),
                     book_state: "NOT_YET_OBSERVED".into(),
                     last_trade_poll_utc: None,
                     trades_complete: None,
@@ -598,6 +637,11 @@ impl ContinuousRuntime {
             "INCOMPLETE".into()
         };
         health.markets = self.market_health.clone();
+        let capacity = journal.capacity_snapshot()?;
+        health.disk_free_bytes = capacity.disk_free_bytes;
+        health.sqlite_bytes = capacity.sqlite_bytes;
+        health.wal_bytes = capacity.wal_bytes;
+        health.capacity_state = capacity.capacity_state;
         health.publish(&journal.home)?;
         Ok(summary)
     }
@@ -657,6 +701,9 @@ impl ContinuousRuntime {
                 market_state: "UNKNOWN".into(),
                 seconds_to_open: 0,
                 last_book_poll_utc: None,
+                last_websocket_frame_utc: None,
+                last_websocket_trade_utc: None,
+                book_source: "REST_SAMPLED_NOT_WS_SYNCHRONIZED".into(),
                 book_state: "NOT_YET_OBSERVED".into(),
                 last_trade_poll_utc: None,
                 trades_complete: None,
@@ -665,6 +712,7 @@ impl ContinuousRuntime {
         {
             item.last_error = Some(error.to_string());
             if channel == "orderbook" {
+                item.book_source = "REST_SAMPLED_NOT_WS_SYNCHRONIZED".into();
                 item.book_state = "ERROR".into();
                 item.last_book_poll_utc = Some(observed);
             } else {
@@ -681,6 +729,9 @@ impl ContinuousRuntime {
         events: Vec<Event>,
     ) -> Result<()> {
         if events.len() > health.queue_capacity {
+            self.queue_saturation_count += 1;
+            health.queue_saturation_count = self.queue_saturation_count;
+            health.queue_depth = health.queue_capacity;
             for event in events {
                 journal
                     .spool(&event)
