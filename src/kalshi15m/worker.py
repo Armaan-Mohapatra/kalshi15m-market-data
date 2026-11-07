@@ -256,11 +256,17 @@ class RuntimeStatus:
     ) -> None:
         """Track successful REST polling separately from observed market data."""
         completed = utc_now()
+        # A successful trade poll may legitimately return zero trades. A book
+        # snapshot poll cannot claim full coverage when requested tickers
+        # are absent from the response, even if HTTP returned 200.
+        missing_market_count = max(0, requested_market_count - markets_with_data)
         poll_status = (
             "NO_MARKETS"
             if requested_market_count == 0
             else "DEGRADED"
-            if error_count
+            if error_count or (
+                channel == "rest_orderbook" and missing_market_count > 0
+            )
             else "READY"
         )
         record = {
@@ -270,6 +276,7 @@ class RuntimeStatus:
             "successful_request_count": successful_request_count,
             "requested_market_count": requested_market_count,
             "markets_with_data": markets_with_data,
+            "missing_market_count": missing_market_count,
             "rows_received": rows_received,
             "error_count": error_count,
             "status": poll_status,
@@ -332,7 +339,11 @@ class RuntimeStatus:
             thresholds = self.data.get("rest_poll_stale_thresholds_seconds", {})
             for channel, age in self.data["rest_poll_ages_seconds"].items():
                 threshold = thresholds.get(channel)
-                if threshold is not None and age > threshold and health.get(channel) == "READY":
+                if (
+                    threshold is not None
+                    and age > threshold
+                    and health.get(channel) in {"READY", "DEGRADED"}
+                ):
                     health[channel] = "STALE"
                     profile_health_field = {
                         "rest_strategy_orderbook": "strategy_rest_poll_health",
