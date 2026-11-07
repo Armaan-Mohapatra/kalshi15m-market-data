@@ -37,7 +37,7 @@ impl WebsocketEngine {
 
     pub fn handle(&mut self, message: Value) -> Vec<Event> {
         let observed = utc_now();
-        let kind = message.get("type").and_then(Value::as_str).unwrap_or("unknown");
+        let kind = message.get("type").and_then(Value::as_str).unwrap_or("unknown").to_string();
         let sid = message.get("sid").and_then(Value::as_i64);
         let seq = message.get("seq").and_then(Value::as_i64);
         let msg = message.get("msg").cloned().unwrap_or(Value::Null);
@@ -48,7 +48,7 @@ impl WebsocketEngine {
             _ => format!("ws|{}|unsequenced|{}|{}",self.session,kind,raw_hash),
         };
         let mut original = Event::new(
-            "websocket_raw", kind, ticker.as_deref(),
+            "websocket_raw", &kind, ticker.as_deref(),
             json!({"raw":message,"session_id":self.session,"received_utc":observed}),
             Some(key),
         );
