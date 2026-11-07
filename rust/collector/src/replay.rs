@@ -29,7 +29,10 @@ pub fn replay_file(journal: &mut Journal, path: &Path, batch_size: usize) -> Res
     let source = File::open(path).with_context(|| format!("cannot open replay input {}",path.display()))?;
     let reader = BufReader::with_capacity(1024 * 1024,source);
     let mut summary = ReplaySummary::default();
-    let mut ws = WebsocketEngine::new();
+    // Stable source-qualified identity makes replay of the same fixture
+    // idempotent, including on another process run.
+    let source_id = crate::event::hash_bytes(path.to_string_lossy().as_bytes());
+    let mut ws = WebsocketEngine::with_session(&source_id[..20]);
     for (index, line) in reader.lines().enumerate() {
         let text = line?;
         if text.len() > 64 * 1024 * 1024 { bail!("fixture line too large at {}", index + 1) }
@@ -40,6 +43,12 @@ pub fn replay_file(journal: &mut Journal, path: &Path, batch_size: usize) -> Res
         let events = if value.get("channel").is_some() {
             vec![Event::from_value(value)?]
         } else if value.get("type").is_some() {
+            if let Some(source_session) = value.get("_fixture_session")
+                .and_then(Value::as_str) {
+                if ws.session() != source_session {
+                    ws = WebsocketEngine::with_session(source_session);
+                }
+            }
             ws.handle(value)
         } else {
             bail!("unsupported event fixture at line {}", index + 1)
@@ -238,6 +247,21 @@ mod tests {
         assert_eq!(stats.lines,3);
         assert_eq!(stats.ws_gap_events,1);
         assert!(journal.verify_archive().unwrap() == false || journal.unarchived_count().unwrap() <= 2);
+        let first_count: i64 = journal.conn.query_row(
+            "SELECT COUNT(*) FROM market_events", [], |row| row.get(0)
+        ).unwrap();
+        let versions_before: i64 = journal.conn.query_row(
+            "SELECT COUNT(*) FROM market_event_versions", [], |row| row.get(0)
+        ).unwrap();
+        replay_file(&mut journal,&input,2).unwrap();
+        let second_count: i64 = journal.conn.query_row(
+            "SELECT COUNT(*) FROM market_events", [], |row| row.get(0)
+        ).unwrap();
+        let versions_after: i64 = journal.conn.query_row(
+            "SELECT COUNT(*) FROM market_event_versions", [], |row| row.get(0)
+        ).unwrap();
+        assert_eq!(first_count, second_count);
+        assert_eq!(versions_before, versions_after);
         journal.close().unwrap();
     }
 }
