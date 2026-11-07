@@ -177,6 +177,7 @@ async fn main() -> Result<()> {
                     "lines":summary.lines,"source_events":summary.source_events,
                     "durable_events":stats.inserted + stats.variants,
                     "duplicates":stats.duplicates,"sequence_gaps":summary.ws_gap_events,
+                    "websocket_state":summary.websocket_state,
                     "status":"ARCHIVE_VERIFIED"
                 }))?
             );

@@ -19,6 +19,7 @@ pub struct ReplaySummary {
     pub source_events: u64,
     pub emitted_events: u64,
     pub ws_gap_events: u64,
+    pub websocket_state: Value,
 }
 
 /// Ingest source in a bounded streaming pass. Production files are never
@@ -71,6 +72,7 @@ pub fn replay_file(journal: &mut Journal, path: &Path, batch_size: usize) -> Res
             journal.flush_archive(2000)?;
         }
     }
+    summary.websocket_state = ws.state_summary();
     Ok(summary)
 }
 

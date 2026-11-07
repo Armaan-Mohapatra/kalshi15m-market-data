@@ -839,8 +839,34 @@ impl WebsocketEngine {
             .values()
             .filter(|b| b.state() == &BookState::Synchronized)
             .count();
+        let market_books = self
+            .books
+            .iter()
+            .map(|(ticker, book)| {
+                let (state, reason) = match book.state() {
+                    BookState::AwaitingSnapshot => ("AWAITING_SNAPSHOT", None),
+                    BookState::Synchronized => ("SYNCHRONIZED", None),
+                    BookState::Desynchronized { reason } => {
+                        ("DESYNCHRONIZED", Some(reason.clone()))
+                    }
+                };
+                let quote = book.quote().map(|quote| {
+                    json!({
+                        "yes_bid":quote.yes_bid.map(|price| price.to_string()),
+                        "yes_bid_size":quote.yes_bid_size.map(|size| size.to_string()),
+                        "yes_ask":quote.yes_ask.map(|price| price.to_string()),
+                        "yes_ask_size":quote.yes_ask_size.map(|size| size.to_string()),
+                        "no_bid":quote.no_bid.map(|price| price.to_string()),
+                        "no_bid_size":quote.no_bid_size.map(|size| size.to_string()),
+                        "no_ask":quote.no_ask.map(|price| price.to_string()),
+                        "no_ask_size":quote.no_ask_size.map(|size| size.to_string())
+                    })
+                });
+                json!({"market_ticker":ticker,"state":state,"reason":reason,"quote":quote})
+            })
+            .collect::<Vec<_>>();
         json!({"session":self.session,"subscriptions":self.subscriptions.len(),
-            "books":self.books.len(),"synchronized_books":healthy})
+            "books":self.books.len(),"synchronized_books":healthy,"market_books":market_books})
     }
 }
 impl Default for WebsocketEngine {
@@ -939,6 +965,44 @@ mod tests {
                 .yes_bid,
             Some(rust_decimal::Decimal::new(45, 2))
         );
+    }
+
+    #[test]
+    fn state_summary_exposes_exact_synchronized_market_quotes_and_sizes() {
+        let mut ws = WebsocketEngine::with_session("quote-summary-connection");
+        ws.handle(json!({
+            "type":"orderbook_snapshot",
+            "sid":4,
+            "seq":31,
+            "msg":{
+                "market_ticker":"QUOTE-SUMMARY",
+                "market_id":"fixture-market-id",
+                "clock":1,
+                "orderbook_fp":{
+                    "yes_dollars_fp":[["0.4000","10.00"]],
+                    "no_dollars_fp":[["0.3000","20.00"]]
+                }
+            }
+        }));
+        ws.handle(json!({
+            "type":"orderbook_delta",
+            "sid":4,
+            "seq":32,
+            "msg":{
+                "market_ticker":"QUOTE-SUMMARY",
+                "side":"yes",
+                "price_dollars":"0.4000",
+                "delta_fp":"2.50"
+            }
+        }));
+
+        let summary = ws.state_summary();
+        assert_eq!(summary["synchronized_books"], 1);
+        assert_eq!(summary["market_books"][0]["state"], "SYNCHRONIZED");
+        assert_eq!(summary["market_books"][0]["quote"]["yes_bid"], "0.4000");
+        assert_eq!(summary["market_books"][0]["quote"]["yes_bid_size"], "12.50");
+        assert_eq!(summary["market_books"][0]["quote"]["yes_ask"], "0.7000");
+        assert_eq!(summary["market_books"][0]["quote"]["yes_ask_size"], "20.00");
     }
     #[test]
     fn gap_invalidates_books_until_new_snapshot() {

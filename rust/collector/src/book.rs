@@ -22,9 +22,13 @@ pub struct OrderBook {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Quote {
     pub yes_bid: Option<Decimal>,
+    pub yes_bid_size: Option<Decimal>,
     pub no_bid: Option<Decimal>,
+    pub no_bid_size: Option<Decimal>,
     pub yes_ask: Option<Decimal>,
+    pub yes_ask_size: Option<Decimal>,
     pub no_ask: Option<Decimal>,
+    pub no_ask_size: Option<Decimal>,
 }
 
 impl Default for OrderBook {
@@ -205,13 +209,25 @@ impl OrderBook {
         if !self.synchronized() {
             return None;
         }
-        let yes_bid = self.yes.last_key_value().map(|(p, _)| *p);
-        let no_bid = self.no.last_key_value().map(|(p, _)| *p);
+        let (yes_bid, yes_bid_size) = self
+            .yes
+            .last_key_value()
+            .map(|(price, size)| (Some(*price), Some(*size)))
+            .unwrap_or((None, None));
+        let (no_bid, no_bid_size) = self
+            .no
+            .last_key_value()
+            .map(|(price, size)| (Some(*price), Some(*size)))
+            .unwrap_or((None, None));
         Some(Quote {
             yes_bid,
+            yes_bid_size,
             no_bid,
+            no_bid_size,
             yes_ask: no_bid.map(|p| Decimal::ONE - p),
+            yes_ask_size: no_bid_size,
             no_ask: yes_bid.map(|p| Decimal::ONE - p),
+            no_ask_size: yes_bid_size,
         })
     }
 }

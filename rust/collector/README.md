@@ -72,6 +72,25 @@ python tools/convert_recorded_ws_parquet.py `
 
 Then replay the emitted raw frames with the offline `replay` command and an isolated `--home`. The adapter preserves all selected subscription frames so sequence checks are not computed from ticker-filtered fragments. Its output is a lossy projection of the source table: REST-only rows and source columns not needed by the WebSocket replay remain documented in the converter manifest and are not represented as WebSocket frames.
 
+### Replay finalized TNEVENT v2 segments
+
+`tools/convert_tnevent_v2_segments.py` handles finalized `.ready` directories containing `events.bin`, `manifest.json`, and `segment.json`. It verifies source hashes, manifest byte/event counts, each compressed block's declared sizes and CRC-32, and record metadata before writing. The v2 block/record framing is validated from the finalized file itself; this is an observed format contract, not a claim that an upstream public specification was found. Unknown markers, versions, record identities, unresolved trade connection generations, and oversized inputs fail closed.
+
+Pass adjacent segments in ascending ID order. The converter retains the original `run...:gN` connection identity across segment boundaries, keeps all numeric-subscription WebSocket frames in the time interval (not only the target ticker), and writes full non-WebSocket discovery rows to a separate `.discovery.jsonl` file. Its manifest records source hashes, output hashes, event counts, target-window coverage, connection-qualified sequence findings, and the mapping from replay lines to source records. It refuses overwrite and protected output locations.
+
+```powershell
+python tools/convert_tnevent_v2_segments.py `
+  --input E:\TradingNextData\kalshi\raw\segment-00000462.ready `
+  --input E:\TradingNextData\kalshi\raw\segment-00000463.ready `
+  --output C:\Users\dakin\Projects\Kalshi15mRustStageResearch\opening-window\opening.ndjson `
+  --start-utc 2026-10-31T10:30:00Z `
+  --end-utc 2026-10-31T10:33:00Z `
+  --target-market KXBTC15M-26OCT310645-45 `
+  --max-source-events 500000
+```
+
+Offline replay reports the final per-market synchronized state and best bid/ask prices and sizes, alongside event, duplicate, and sequence-gap counts. It does not make exchange requests.
+
 ## Verification gates
 
 The crate must compile and pass isolated Windows/Linux CI, smoke-replay synthetic events to SQLite/Parquet, preserve all expected event IDs and conflict versions, classify WSS gaps accurately and reconstruct interrupted archive parts. **Production is not authorized** by these checks. We then need finalized market replay parity, Python PyArrow/SQLite compatibility, native Windows CPU/RAM/latency benchmarks and independent review before any deployment decision.
