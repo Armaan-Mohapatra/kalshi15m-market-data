@@ -810,6 +810,53 @@ mod tests {
     }
 
     #[test]
+    fn temporary_archive_unavailability_never_reports_clean_and_recovers_from_sqlite() {
+        let home = tempfile::tempdir().unwrap();
+        let mut store = Journal::open(home.path()).unwrap();
+        let event = Event::new(
+            "rest",
+            "trade",
+            Some("DISK-FAILURE-TEST"),
+            json!({"id":"archive-volume-unavailable"}),
+            Some("archive-volume-unavailable".into()),
+        );
+        assert_eq!(store.ingest(&event).unwrap(), IngestResult::Inserted);
+        let archive_root = home.path().join("data").join("market_data");
+
+        // Isolated fault injection: make the staging archive path unavailable
+        // while leaving the durable SQLite journal intact.
+        fs::remove_dir(&archive_root).unwrap();
+        fs::write(&archive_root, b"simulated unavailable archive mount").unwrap();
+        assert!(store.flush_archive(10).is_err());
+        assert_eq!(store.unarchived_count().unwrap(), 1);
+        assert!(store.close().is_err());
+
+        let conn = Connection::open(home.path().join("data/paper_ledger.sqlite3")).unwrap();
+        let canonical: i64 = conn
+            .query_row("SELECT COUNT(*) FROM market_events", [], |row| row.get(0))
+            .unwrap();
+        let marker: String = conn
+            .query_row(
+                "SELECT value FROM collector_markers WHERE marker='archive_shutdown'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(canonical, 1);
+        assert_ne!(marker, "CLEAN_ARCHIVE_VERIFIED");
+        drop(conn);
+
+        fs::remove_file(&archive_root).unwrap();
+        fs::create_dir_all(&archive_root).unwrap();
+        let recovered = Journal::open(home.path()).unwrap();
+        assert_eq!(recovered.unarchived_count().unwrap(), 1);
+        recovered.close().unwrap();
+        let verified = Journal::open_readonly(home.path()).unwrap();
+        assert!(verified.verify_archive().unwrap());
+        assert_eq!(verified.audit().unwrap()["canonical_events"], 1);
+    }
+
+    #[test]
     fn spool_survives_restart_and_acknowledges_only_after_replay() {
         let home = tempfile::tempdir().unwrap();
         let store = Journal::open(home.path()).unwrap();

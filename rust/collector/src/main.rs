@@ -134,7 +134,7 @@ enum Commands {
     /// Start the continuously scheduled, read-only REST collector.
     /// Network access requires `--allow-network true`; no trading routes exist.
     RunContinuous {
-        #[arg(long, required = true, num_args = 1..)]
+        #[arg(long, num_args = 0..)]
         series: Vec<String>,
         #[arg(long, required = true)]
         allow_network: bool,
@@ -528,6 +528,23 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn continuous_cli_allows_catalog_discovery_without_explicit_series() {
+        let parsed = Cli::try_parse_from([
+            "kalshi15m-rust",
+            "--home",
+            "C:\\stage",
+            "run-continuous",
+            "--allow-network",
+            "true",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.action,
+            Commands::RunContinuous { series, .. } if series.is_empty()
+        ));
+    }
 
     #[test]
     fn websocket_health_keeps_rest_and_sequence_validated_freshness_separate() {

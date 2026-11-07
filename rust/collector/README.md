@@ -40,6 +40,10 @@ cargo run -- --home "$stage" capture-once --allow-network --ticker KXBTC15M-EXAM
 
 This mode never places orders and does not install a service, configure Task Scheduler, activate WSS or change the active Windows collector.
 
+### Continuous REST scheduler (network-gated)
+
+`run-continuous` can take optional `--series` overrides. If no series are supplied, the runtime reads the public `/series` catalog and rotates through at most four metadata-confirmed 15-minute candidates per discovery cycle. It remains network-disabled unless `--allow-network true` is supplied, and must not be run against live Kalshi during ordinary Phoenix staging validation.
+
 ### Authenticated WebSocket staging mode (NOT automatically run)
 
 The source includes authenticated WebSocket streaming for explicit market tickers. It writes only to the isolated `--home` journal/archive. Running it connects to Kalshi and requires a separate explicit operational decision; ordinary tests and staging validation must use local signing/protocol fixtures. Never point it at a production key path.
