@@ -864,7 +864,7 @@ mod tests {
                 "clock":15679747546
             }
         }));
-        assert!(!events.iter().any(|event| event.kind == "book_invalid"));
+        assert!(!events.iter().any(|event| event.kind == "invalid_snapshot"));
         assert!(!events.iter().any(|event| event.kind == "sequence_gap"));
         let book = ws.book("KXETH15M-26OCT300745-45").unwrap();
         assert!(book.synchronized());
@@ -882,14 +882,14 @@ mod tests {
                 "delta_fp":"1.25"
             }
         }));
-        assert!(!delta.iter().any(|event| event.kind == "book_invalid"));
+        assert!(!delta.iter().any(|event| event.kind == "delta_not_applied"));
         assert_eq!(
             ws.book("KXETH15M-26OCT300745-45")
                 .unwrap()
                 .quote()
                 .unwrap()
                 .yes_bid,
-            Some(Decimal::new(45, 2))
+            Some(rust_decimal::Decimal::new(45, 2))
         );
     }
     #[test]
