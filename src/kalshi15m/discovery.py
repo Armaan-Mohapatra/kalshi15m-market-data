@@ -281,6 +281,12 @@ async def refresh_known_market_rows(
         for field in refresh_fields:
             if field in fresh:
                 cached[field] = fresh[field]
+        # Preserve the authoritative exchange row independently of our
+        # derived event schedule/classification projection.
+        cached["market_api_raw"] = dict(fresh)
+        for field in ("floor_strike", "cap_strike", "custom_strike", "expiration_value", "expiration_value_dollars"):
+            if field in fresh:
+                cached[field] = fresh[field]
         cached["market_status"] = str(fresh.get("status") or cached.get("market_status") or "unknown").lower()
         cached["market_api_reconciled"] = True
         cached["provenance"] = "Kalshi public REST: cached event schedule plus current market API reconciliation"
@@ -470,6 +476,12 @@ async def refresh_upcoming_series_markets(
                 "market_status": str(market.get("status") or "unopened").lower(),
                 "market_api_reconciled": ticker in market_rows_by_ticker,
                 "market_type": market_type,
+                "market_api_raw": dict(market),
+                "floor_strike": market.get("floor_strike"),
+                "cap_strike": market.get("cap_strike"),
+                "custom_strike": market.get("custom_strike"),
+                "expiration_value": market.get("expiration_value"),
+                "expiration_value_dollars": market.get("expiration_value_dollars"),
                 "duration_seconds": duration,
                 "duration_basis": basis,
                 "rules_confirm_15m": rules_confirm,
@@ -766,6 +778,12 @@ async def discover(
                     "market_status": status,
                     "market_api_reconciled": market_api_reconciled,
                     "market_type": market_type,
+                    "market_api_raw": dict(market),
+                    "floor_strike": market.get("floor_strike"),
+                    "cap_strike": market.get("cap_strike"),
+                    "custom_strike": market.get("custom_strike"),
+                    "expiration_value": market.get("expiration_value"),
+                    "expiration_value_dollars": market.get("expiration_value_dollars"),
                     "duration_seconds": duration,
                     "duration_basis": basis,
                     "rules_confirm_15m": rules_confirm,
