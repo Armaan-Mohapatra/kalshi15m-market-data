@@ -53,3 +53,13 @@ jobs:
           python tools/check_python_parity.py "$stage"
           if ($LASTEXITCODE -ne 0) { throw 'Python cross-language parity failed' }
 
+
+      - name: Publish tested Windows binary and lockfile for staging only
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-collector-windows-staging
+          path: |
+            rust/collector/target/debug/kalshi15m-rust.exe
+            rust/collector/Cargo.lock
+          if-no-files-found: error
