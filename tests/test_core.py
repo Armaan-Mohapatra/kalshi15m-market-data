@@ -398,6 +398,47 @@ class RuntimeStatusTests(unittest.TestCase):
             self.assertEqual(snapshot["rest_poll_health"]["rest_orderbook"], "DEGRADED")
             self.assertEqual(snapshot["last_rest_poll_by_channel"]["rest_orderbook"]["error_count"], 1)
 
+    def test_rest_orderbook_partial_success_is_degraded(self):
+        with TemporaryDirectory() as root:
+            status = RuntimeStatus(Settings(home=Path(root)))
+            status.mark_rest_poll(
+                "rest_orderbook",
+                started_utc=datetime.now(timezone.utc).isoformat(),
+                request_count=1,
+                successful_request_count=1,
+                requested_market_count=3,
+                markets_with_data=2,
+                rows_received=2,
+                error_count=0,
+            )
+            snapshot = status.snapshot()
+            self.assertEqual(snapshot["rest_poll_health"]["rest_orderbook"], "DEGRADED")
+            self.assertEqual(
+                snapshot["last_rest_poll_by_channel"]["rest_orderbook"]["missing_market_count"],
+                1,
+            )
+
+    def test_degraded_rest_book_poll_becomes_stale(self):
+        with TemporaryDirectory() as root:
+            status = RuntimeStatus(Settings(home=Path(root), book_poll_interval_seconds=15))
+            status.mark_rest_poll(
+                "rest_orderbook",
+                started_utc=datetime.now(timezone.utc).isoformat(),
+                request_count=1,
+                successful_request_count=1,
+                requested_market_count=3,
+                markets_with_data=2,
+                rows_received=2,
+                error_count=0,
+            )
+            status.data["last_rest_poll_by_channel"]["rest_orderbook"][
+                "completed_utc"
+            ] = (datetime.now(timezone.utc) - timedelta(seconds=31)).isoformat()
+            status.refresh_ages()
+            self.assertEqual(
+                status.snapshot()["rest_poll_health"]["rest_orderbook"], "STALE"
+            )
+
     def test_rest_orderbook_poll_health_marks_stale_after_two_intervals(self):
         with TemporaryDirectory() as root:
             status = RuntimeStatus(
