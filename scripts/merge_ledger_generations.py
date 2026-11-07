@@ -133,7 +133,7 @@ def merge_generations(target: Path, source: Path, output: Path) -> dict[str, Any
 
         result_connection.executescript(
             """
-            CREATE TABLE market_event_versions (
+            CREATE TABLE IF NOT EXISTS market_event_versions (
                 source_generation TEXT NOT NULL,
                 row_sha256 TEXT NOT NULL,
                 captured_utc TEXT NOT NULL,
