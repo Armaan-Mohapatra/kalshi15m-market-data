@@ -12,10 +12,13 @@ use rsa::RsaPrivateKey;
 use serde_json::{json, Value};
 use sha2::Sha256;
 use std::collections::{BTreeMap, HashMap};
+use std::error::Error as StdError;
+use std::fmt::{Display, Formatter};
+use std::future::Future;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::{HeaderName, HeaderValue};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -25,6 +28,79 @@ use uuid::Uuid;
 
 pub const KALSHI_WS_URL: &str = "wss://external-api-ws.kalshi.com/trade-api/ws/v2";
 const KALSHI_WS_PATH: &str = "/trade-api/ws/v2";
+
+/// Event delivered to the combined collector. The transport does not continue
+/// reading the socket until the shared journal owner acknowledges persistence.
+pub struct AcknowledgedEvent {
+    pub event: Event,
+    acknowledgment: oneshot::Sender<std::result::Result<(), String>>,
+}
+
+#[derive(Debug)]
+struct DurableAcknowledgmentFailed(String);
+
+impl Display for DurableAcknowledgmentFailed {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "durable writer acknowledgment failed: {}",
+            self.0
+        )
+    }
+}
+
+impl StdError for DurableAcknowledgmentFailed {}
+
+impl AcknowledgedEvent {
+    pub fn acknowledge(self, result: std::result::Result<(), String>) -> Result<()> {
+        self.acknowledgment
+            .send(result)
+            .map_err(|_| anyhow!("WebSocket producer stopped before durable acknowledgment"))
+    }
+}
+
+trait EventSink: Send + Sync {
+    fn is_closed(&self) -> bool;
+    fn send<'a>(&'a self, event: Event) -> impl Future<Output = Result<()>> + Send + 'a;
+}
+
+impl EventSink for mpsc::Sender<Event> {
+    fn is_closed(&self) -> bool {
+        mpsc::Sender::is_closed(self)
+    }
+
+    async fn send(&self, event: Event) -> Result<()> {
+        mpsc::Sender::send(self, event)
+            .await
+            .map_err(|_| anyhow!("WebSocket event receiver closed"))
+    }
+}
+
+impl EventSink for mpsc::Sender<AcknowledgedEvent> {
+    fn is_closed(&self) -> bool {
+        mpsc::Sender::is_closed(self)
+    }
+
+    async fn send(&self, event: Event) -> Result<()> {
+        let (acknowledgment, durable) = oneshot::channel();
+        mpsc::Sender::send(
+            self,
+            AcknowledgedEvent {
+                event,
+                acknowledgment,
+            },
+        )
+        .await
+        .map_err(|_| anyhow!("WebSocket event receiver closed"))?;
+        match durable.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(anyhow::Error::new(DurableAcknowledgmentFailed(error))),
+            Err(error) => Err(anyhow::Error::new(DurableAcknowledgmentFailed(format!(
+                "acknowledgment channel closed: {error}"
+            )))),
+        }
+    }
+}
 
 /// Produces Kalshi handshake headers from a private key supplied explicitly by
 /// the staging operator. The caller owns key discovery; this module never
@@ -145,19 +221,16 @@ fn register_subscription_ack(
     }
 }
 
-async fn process_text_frame(
+async fn process_text_frame<Sink: EventSink>(
     engine: &mut WebsocketEngine,
     raw: &str,
-    events: &mpsc::Sender<Event>,
+    events: &Sink,
 ) -> Result<Vec<i64>> {
     let mut parsed: Value = match serde_json::from_str(raw) {
         Ok(value) => value,
         Err(error) => {
             let event = malformed_frame_event(engine, raw.as_bytes(), "utf8", &error.to_string());
-            events
-                .send(event)
-                .await
-                .map_err(|_| anyhow!("WebSocket event receiver closed"))?;
+            events.send(event).await?;
             return Err(error).context("invalid WebSocket JSON frame");
         }
     };
@@ -172,27 +245,21 @@ async fn process_text_frame(
         .filter(|sid| engine.needs_recovery_request(*sid))
         .collect::<Vec<_>>();
     for event in handled {
-        events
-            .send(event)
-            .await
-            .map_err(|_| anyhow!("WebSocket event receiver closed"))?;
+        events.send(event).await?;
     }
     Ok(recovery_sids)
 }
 
-async fn process_binary_frame(
+async fn process_binary_frame<Sink: EventSink>(
     engine: &mut WebsocketEngine,
     raw: &[u8],
-    events: &mpsc::Sender<Event>,
+    events: &Sink,
 ) -> Result<Vec<i64>> {
     let mut parsed: Value = match serde_json::from_slice(raw) {
         Ok(value) => value,
         Err(error) => {
             let event = malformed_frame_event(engine, raw, "binary", &error.to_string());
-            events
-                .send(event)
-                .await
-                .map_err(|_| anyhow!("WebSocket event receiver closed"))?;
+            events.send(event).await?;
             return Err(error).context("invalid binary WebSocket JSON frame");
         }
     };
@@ -207,18 +274,15 @@ async fn process_binary_frame(
         .filter(|sid| engine.needs_recovery_request(*sid))
         .collect::<Vec<_>>();
     for event in handled {
-        events
-            .send(event)
-            .await
-            .map_err(|_| anyhow!("WebSocket event receiver closed"))?;
+        events.send(event).await?;
     }
     Ok(recovery_sids)
 }
 
-async fn recover_gapped_subscriptions<S>(
+async fn recover_gapped_subscriptions<S, Sink: EventSink>(
     socket: &mut WebSocketStream<S>,
     engine: &mut WebsocketEngine,
-    events: &mpsc::Sender<Event>,
+    events: &Sink,
     recovery_sids: Vec<i64>,
     next_command_id: &mut u64,
 ) -> Result<()>
@@ -346,7 +410,7 @@ impl AuthenticatedWebSocket {
     }
 
     #[cfg(test)]
-    fn new_loopback_mock(config: WebSocketConfigStage) -> Result<Self> {
+    pub(crate) fn new_loopback_mock(config: WebSocketConfigStage) -> Result<Self> {
         config.validate_with_loopback(true)?;
         Ok(Self {
             config,
@@ -360,8 +424,24 @@ impl AuthenticatedWebSocket {
     /// backpressure instead of silently dropping exchange frames.
     pub async fn run(
         &self,
-        mut shutdown: watch::Receiver<bool>,
+        shutdown: watch::Receiver<bool>,
         events: mpsc::Sender<Event>,
+    ) -> Result<()> {
+        self.run_with_sink(shutdown, events).await
+    }
+
+    pub async fn run_acknowledged(
+        &self,
+        shutdown: watch::Receiver<bool>,
+        events: mpsc::Sender<AcknowledgedEvent>,
+    ) -> Result<()> {
+        self.run_with_sink(shutdown, events).await
+    }
+
+    async fn run_with_sink<Sink: EventSink>(
+        &self,
+        mut shutdown: watch::Receiver<bool>,
+        events: Sink,
     ) -> Result<()> {
         #[cfg(test)]
         self.config
@@ -383,6 +463,12 @@ impl AuthenticatedWebSocket {
             {
                 Ok(()) => return Ok(()),
                 Err(error) => {
+                    if error
+                        .downcast_ref::<DurableAcknowledgmentFailed>()
+                        .is_some()
+                    {
+                        return Err(error.context("stop WebSocket retry after persistence failure"));
+                    }
                     let mut failure = Event::new(
                         "websocket_health",
                         "connection_interrupted",
@@ -391,10 +477,7 @@ impl AuthenticatedWebSocket {
                         Some(format!("ws-transport-error|{}", Uuid::new_v4().simple())),
                     );
                     failure.exchange_ts = None;
-                    events
-                        .send(failure)
-                        .await
-                        .map_err(|_| anyhow!("WebSocket event receiver closed"))?;
+                    events.send(failure).await?;
                     engine.reconnect();
                     tokio::select! {
                         _ = tokio::time::sleep(delay) => {},
@@ -408,12 +491,12 @@ impl AuthenticatedWebSocket {
         }
     }
 
-    async fn run_session(
+    async fn run_session<Sink: EventSink>(
         &self,
         pem: &str,
         engine: &mut WebsocketEngine,
         shutdown: &mut watch::Receiver<bool>,
-        events: &mpsc::Sender<Event>,
+        events: &Sink,
     ) -> Result<()> {
         let timestamp_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -725,6 +808,33 @@ mod tests {
     use rand::rngs::OsRng;
     use rsa::signature::Verifier;
     use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn acknowledged_event_sink_waits_for_writer_commit_response() -> Result<()> {
+        let (sender, mut receiver) = mpsc::channel::<AcknowledgedEvent>(1);
+        let producer = tokio::spawn(async move {
+            let sink = sender;
+            EventSink::send(
+                &sink,
+                Event::new(
+                    "websocket_raw",
+                    "orderbook_snapshot",
+                    Some("ACK-TEST"),
+                    json!({"seq":2}),
+                    Some("ack-test".into()),
+                ),
+            )
+            .await
+        });
+        let queued = receiver.recv().await.expect("event is queued");
+        assert!(
+            !producer.is_finished(),
+            "producer must wait for durable ACK"
+        );
+        queued.acknowledge(Ok(())).expect("writer ACK is delivered");
+        producer.await??;
+        Ok::<(), anyhow::Error>(())
+    }
 
     #[test]
     fn first_sequence_two_is_not_a_gap_and_interleaving_valid() {

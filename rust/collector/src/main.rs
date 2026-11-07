@@ -4,7 +4,9 @@ use kalshi15m_rust::{
     api::{PublicRest, DEFAULT_BASE},
     event::Event,
     replay::{collect_once, replay_file},
-    runtime::{ContinuousRuntime, MarketHealth, RestSource, RuntimeConfig, RuntimeHealth},
+    runtime::{
+        observe_websocket_event, ContinuousRuntime, RestSource, RuntimeConfig, RuntimeHealth,
+    },
     storage::{IngestResult, Journal},
     websocket::{AuthenticatedWebSocket, WebSocketConfigStage, KALSHI_WS_URL},
 };
@@ -12,82 +14,6 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
-
-fn observe_websocket_event(health: &mut RuntimeHealth, event: &Event, queue_depth: usize) {
-    health.websocket_last_frame_utc = Some(event.received_utc.clone());
-    health.queue_depth = queue_depth;
-    if queue_depth.saturating_add(1) >= health.queue_capacity {
-        health.queue_saturation_count += 1;
-    }
-    if event.channel == "websocket_raw"
-        && matches!(
-            health.websocket_state.as_str(),
-            "CONNECTING" | "RECONNECTING"
-        )
-    {
-        health.websocket_state = "CONNECTED".into();
-    }
-    match event.kind.as_str() {
-        "connection_interrupted" => {
-            health.websocket_reconnect_count += 1;
-            health.websocket_state = "RECONNECTING".into();
-        }
-        "sequence_gap" => {
-            health.websocket_sequence_gap_count += 1;
-            health.websocket_state = "DEGRADED_SEQUENCE_GAP".into();
-        }
-        "malformed_frame" | "invalid_snapshot" | "delta_not_applied" => {
-            if event.kind == "malformed_frame" {
-                health.websocket_malformed_frame_count += 1;
-            }
-            health.websocket_state = "DEGRADED_INVALID_FRAME_OR_BOOK".into();
-        }
-        "book_synchronized" => health.websocket_state = "HEALTHY".into(),
-        "subscribed" => health.websocket_state = "CONNECTED_AWAITING_FRESH_SNAPSHOT".into(),
-        _ => {}
-    }
-    if let Some(ticker) = event.market_ticker.as_deref() {
-        let market = health
-            .markets
-            .entry(ticker.to_owned())
-            .or_insert_with(|| MarketHealth {
-                ticker: ticker.to_owned(),
-                market_state: "UNKNOWN_FROM_WEBSOCKET".into(),
-                seconds_to_open: 0,
-                last_book_poll_utc: None,
-                last_websocket_frame_utc: None,
-                last_websocket_trade_utc: None,
-                book_source: "WEBSOCKET_SEQUENCE_STATE".into(),
-                book_state: "NOT_YET_OBSERVED".into(),
-                last_trade_poll_utc: None,
-                trades_complete: None,
-                last_error: None,
-            });
-        market.last_websocket_frame_utc = Some(event.received_utc.clone());
-        match event.kind.as_str() {
-            "orderbook_snapshot" | "orderbook_delta" => {
-                market.book_source = "WEBSOCKET_SEQUENCE_STATE".into();
-            }
-            "book_synchronized" => {
-                market.book_source = "WEBSOCKET_SEQUENCE_VALIDATED".into();
-                market.book_state = "SYNCHRONIZED_WSS".into();
-                market.last_error = None;
-            }
-            "sequence_gap" => {
-                market.book_state = "INVALIDATED_SEQUENCE_GAP".into();
-                market.last_error =
-                    Some("subscription sequence gap; intermediate deltas unrecovered".into());
-            }
-            "invalid_snapshot" => {
-                market.book_state = "INVALID_SNAPSHOT".into();
-                market.last_error = Some("invalid WebSocket snapshot".into());
-            }
-            "delta_not_applied" => market.book_state = "UNSYNCHRONIZED".into(),
-            "trade" => market.last_websocket_trade_utc = Some(event.received_utc.clone()),
-            _ => {}
-        }
-    }
-}
 
 #[derive(Parser)]
 #[command(
@@ -138,6 +64,26 @@ enum Commands {
         series: Vec<String>,
         #[arg(long, required = true)]
         allow_network: bool,
+        #[arg(long, default_value_t = 2.0)]
+        min_spacing_seconds: f64,
+        #[arg(long, default_value = DEFAULT_BASE)]
+        base_url: String,
+    },
+    /// Run the bounded REST scheduler and authenticated WebSocket under one
+    /// journal owner; both explicit network gates are required.
+    RunCombined {
+        #[arg(long, num_args = 0..)]
+        series: Vec<String>,
+        #[arg(long, required = true)]
+        allow_network: bool,
+        #[arg(long, required = true)]
+        allow_websocket: bool,
+        #[arg(long, required = true)]
+        key_id: String,
+        #[arg(long, required = true)]
+        private_key: PathBuf,
+        #[arg(long, required = true, num_args = 1..)]
+        ticker: Vec<String>,
         #[arg(long, default_value_t = 2.0)]
         min_spacing_seconds: f64,
         #[arg(long, default_value = DEFAULT_BASE)]
@@ -288,6 +234,63 @@ async fn main() -> Result<()> {
                 "{}",
                 serde_json::to_string_pretty(&json!({
                     "mode":"CONTINUOUS_READ_ONLY_REST",
+                    "process_state":"STOPPED_GRACEFULLY",
+                    "network_used":true,
+                    "durable_events":stats.inserted + stats.variants,
+                    "duplicates":stats.duplicates,
+                }))?
+            );
+        }
+        Commands::RunCombined {
+            series,
+            allow_network,
+            allow_websocket,
+            key_id,
+            private_key,
+            ticker,
+            min_spacing_seconds,
+            base_url,
+        } => {
+            if !allow_network || !allow_websocket {
+                bail!("combined collection requires explicit --allow-network and --allow-websocket gates")
+            }
+            if !min_spacing_seconds.is_finite() || min_spacing_seconds < 2.0 {
+                bail!("minimum REST pacing is 2 seconds without a separate limit review")
+            }
+            let config = RuntimeConfig {
+                series,
+                ..RuntimeConfig::default()
+            };
+            config.validate()?;
+            let rest = PublicRest::new(&base_url, Duration::from_secs_f64(min_spacing_seconds))?;
+            let source = RestSource::new(rest, allow_network)?;
+            let transport = AuthenticatedWebSocket::new(WebSocketConfigStage {
+                url: KALSHI_WS_URL.to_owned(),
+                key_id,
+                private_key_path: private_key,
+                market_tickers: ticker,
+                allow_network: allow_websocket,
+                reconnect_initial: Duration::from_secs(1),
+                reconnect_max: Duration::from_secs(60),
+                output_capacity: config.queue_capacity,
+            })?;
+            let (stop_tx, mut stop_rx) = watch::channel(false);
+            let signal_task = tokio::spawn(async move {
+                let _ = tokio::signal::ctrl_c().await;
+                let _ = stop_tx.send(true);
+            });
+            let mut runtime = ContinuousRuntime::default();
+            let result = runtime
+                .run_with_websocket(&source, &mut journal, &config, transport, &mut stop_rx)
+                .await;
+            signal_task.abort();
+            let close_result = journal.close();
+            result?;
+            let stats = close_result?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "mode":"CONTINUOUS_REST_AND_AUTHENTICATED_WEBSOCKET",
                     "process_state":"STOPPED_GRACEFULLY",
                     "network_used":true,
                     "durable_events":stats.inserted + stats.variants,
@@ -546,6 +549,40 @@ mod tests {
     }
 
     #[test]
+    fn combined_cli_requires_explicit_rest_and_websocket_gates() {
+        let parsed = Cli::try_parse_from([
+            "kalshi15m-rust",
+            "--home",
+            "C:\\stage",
+            "run-combined",
+            "--allow-network",
+            "--allow-websocket",
+            "--key-id",
+            "offline-test",
+            "--private-key",
+            "C:\\stage\\test.pem",
+            "--ticker",
+            "KXBTC15M-MOCK",
+        ])
+        .unwrap();
+        assert!(matches!(parsed.action, Commands::RunCombined { .. }));
+        assert!(Cli::try_parse_from([
+            "kalshi15m-rust",
+            "--home",
+            "C:\\stage",
+            "run-combined",
+            "--allow-network",
+            "--key-id",
+            "offline-test",
+            "--private-key",
+            "C:\\stage\\test.pem",
+            "--ticker",
+            "KXBTC15M-MOCK",
+        ])
+        .is_err());
+    }
+
+    #[test]
     fn websocket_health_keeps_rest_and_sequence_validated_freshness_separate() {
         let mut health = RuntimeHealth::new(64);
         health.rest_state = "NOT_USED_BY_WS_CAPTURE".into();
@@ -574,8 +611,8 @@ mod tests {
         observe_websocket_event(&mut health, &synchronized, 0);
         assert_eq!(health.websocket_state, "HEALTHY");
         assert_eq!(
-            health.markets["KXBTC15M-FIXTURE"].book_source,
-            "WEBSOCKET_SEQUENCE_VALIDATED"
+            health.markets["KXBTC15M-FIXTURE"].websocket_book_state,
+            "SYNCHRONIZED"
         );
 
         let gap = Event::new(
@@ -590,7 +627,7 @@ mod tests {
         assert_eq!(health.websocket_sequence_gap_count, 1);
         assert_eq!(health.queue_saturation_count, 1);
         assert_eq!(
-            health.markets["KXBTC15M-FIXTURE"].book_state,
+            health.markets["KXBTC15M-FIXTURE"].websocket_book_state,
             "INVALIDATED_SEQUENCE_GAP"
         );
     }

@@ -10,6 +10,7 @@ use crate::book::OrderBook;
 use crate::discovery::{Discovery, Market};
 use crate::event::{utc_now, Event};
 use crate::storage::{IngestResult, Journal};
+use crate::websocket::AuthenticatedWebSocket;
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::Serialize;
@@ -18,7 +19,83 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::Path;
 use std::time::Duration;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
+
+pub fn observe_websocket_event(health: &mut RuntimeHealth, event: &Event, queue_depth: usize) {
+    health.websocket_last_frame_utc = Some(event.received_utc.clone());
+    health.queue_depth = queue_depth;
+    if queue_depth.saturating_add(1) >= health.queue_capacity {
+        health.queue_saturation_count += 1;
+    }
+    if event.channel == "websocket_raw"
+        && matches!(
+            health.websocket_state.as_str(),
+            "CONNECTING" | "RECONNECTING"
+        )
+    {
+        health.websocket_state = "CONNECTED".into();
+    }
+    match event.kind.as_str() {
+        "connection_interrupted" => {
+            health.websocket_reconnect_count += 1;
+            health.websocket_state = "RECONNECTING".into();
+        }
+        "sequence_gap" => {
+            health.websocket_sequence_gap_count += 1;
+            health.websocket_state = "DEGRADED_SEQUENCE_GAP".into();
+        }
+        "malformed_frame" | "invalid_snapshot" | "delta_not_applied" => {
+            if event.kind == "malformed_frame" {
+                health.websocket_malformed_frame_count += 1;
+            }
+            health.websocket_state = "DEGRADED_INVALID_FRAME_OR_BOOK".into();
+        }
+        "book_synchronized" => health.websocket_state = "HEALTHY".into(),
+        "subscribed" => health.websocket_state = "CONNECTED_AWAITING_FRESH_SNAPSHOT".into(),
+        _ => {}
+    }
+    if let Some(ticker) = event.market_ticker.as_deref() {
+        let market = health
+            .markets
+            .entry(ticker.to_owned())
+            .or_insert_with(|| MarketHealth {
+                ticker: ticker.to_owned(),
+                market_state: "UNKNOWN_FROM_WEBSOCKET".into(),
+                seconds_to_open: 0,
+                last_book_poll_utc: None,
+                last_websocket_frame_utc: None,
+                last_websocket_trade_utc: None,
+                book_source: "NOT_POLLED".into(),
+                book_state: "NOT_YET_OBSERVED".into(),
+                websocket_book_state: "NOT_YET_OBSERVED".into(),
+                last_trade_poll_utc: None,
+                trades_complete: None,
+                last_error: None,
+            });
+        market.last_websocket_frame_utc = Some(event.received_utc.clone());
+        match event.kind.as_str() {
+            "orderbook_snapshot" | "orderbook_delta" => {
+                market.websocket_book_state = "FRAME_OBSERVED".into();
+            }
+            "book_synchronized" => {
+                market.websocket_book_state = "SYNCHRONIZED".into();
+                market.last_error = None;
+            }
+            "sequence_gap" => {
+                market.websocket_book_state = "INVALIDATED_SEQUENCE_GAP".into();
+                market.last_error =
+                    Some("subscription sequence gap; intermediate deltas unrecovered".into());
+            }
+            "invalid_snapshot" => {
+                market.websocket_book_state = "INVALID_SNAPSHOT".into();
+                market.last_error = Some("invalid WebSocket snapshot".into());
+            }
+            "delta_not_applied" => market.websocket_book_state = "UNSYNCHRONIZED".into(),
+            "trade" => market.last_websocket_trade_utc = Some(event.received_utc.clone()),
+            _ => {}
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
@@ -232,6 +309,7 @@ pub struct MarketHealth {
     pub last_websocket_trade_utc: Option<String>,
     pub book_source: String,
     pub book_state: String,
+    pub websocket_book_state: String,
     pub last_trade_poll_utc: Option<String>,
     pub trades_complete: Option<bool>,
     pub last_error: Option<String>,
@@ -350,6 +428,248 @@ fn rotating_series_batch(
 }
 
 impl ContinuousRuntime {
+    /// Run the REST scheduler and authenticated WebSocket on one journal-owning
+    /// task. WebSocket reads wait for SQLite's synchronous durable commit ACK;
+    /// both inputs share one bounded channel and one cancellation lifecycle.
+    pub async fn run_with_websocket<S: ExchangeSource>(
+        &mut self,
+        source: &S,
+        journal: &mut Journal,
+        config: &RuntimeConfig,
+        transport: AuthenticatedWebSocket,
+        stop: &mut watch::Receiver<bool>,
+    ) -> Result<()> {
+        config.validate()?;
+        let capacity = journal.capacity_snapshot()?;
+        if capacity.capacity_state == "CRITICAL_DISK_PRESSURE" {
+            bail!("critical staging disk pressure; refusing combined collector startup")
+        }
+
+        let mut health = RuntimeHealth::new(config.queue_capacity);
+        health.rest_state = "CONNECTING".into();
+        health.websocket_state = "CONNECTING".into();
+        health.archive_state = "PENDING".into();
+        health.disk_free_bytes = capacity.disk_free_bytes;
+        health.sqlite_bytes = capacity.sqlite_bytes;
+        health.wal_bytes = capacity.wal_bytes;
+        health.capacity_state = capacity.capacity_state;
+        health.publish(&journal.home)?;
+
+        let (event_tx, mut event_rx) = mpsc::channel(config.queue_capacity);
+        let (websocket_stop_tx, websocket_stop_rx) = watch::channel(false);
+        let mut websocket_task = tokio::spawn(async move {
+            transport
+                .run_acknowledged(websocket_stop_rx, event_tx)
+                .await
+        });
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.tick().await;
+        let mut cycle_error = None;
+        let mut persist_error = None;
+        let mut spool_drain = false;
+        let mut websocket_done = false;
+        let mut capacity_counter = 0_u64;
+
+        'collect: loop {
+            if *stop.borrow() {
+                break;
+            }
+            tokio::select! {
+                biased;
+                changed = stop.changed() => {
+                    if changed.is_err() || *stop.borrow() { break; }
+                }
+                result = &mut websocket_task, if !websocket_done => {
+                    websocket_done = true;
+                    match result {
+                        Ok(Ok(())) if *stop.borrow() => break,
+                        Ok(Ok(())) => {
+                            persist_error = Some(anyhow!("WebSocket transport exited before coordinated shutdown"));
+                            break;
+                        }
+                        Ok(Err(error)) => {
+                            persist_error = Some(error.context("WebSocket transport failed"));
+                            break;
+                        }
+                        Err(error) => {
+                            persist_error = Some(anyhow!("WebSocket task failed: {error}"));
+                            break;
+                        }
+                    }
+                }
+                item = event_rx.recv() => {
+                    let Some(item) = item else {
+                        persist_error = Some(anyhow!("WebSocket event channel closed unexpectedly"));
+                        break;
+                    };
+                    let queue_depth = event_rx.len();
+                    observe_websocket_event(&mut health, &item.event, queue_depth);
+                    match journal.ingest(&item.event) {
+                        Ok(IngestResult::Inserted | IngestResult::Versioned) => {
+                            health.events_acknowledged += 1;
+                            health.sqlite_state = "HEALTHY".into();
+                            capacity_counter += 1;
+                            if let Err(error) = item.acknowledge(Ok(())) {
+                                persist_error = Some(error.context("acknowledge durable WebSocket event"));
+                                break 'collect;
+                            }
+                        }
+                        Ok(IngestResult::Duplicate) => {
+                            health.events_duplicate += 1;
+                            capacity_counter += 1;
+                            if let Err(error) = item.acknowledge(Ok(())) {
+                                persist_error = Some(error.context("acknowledge duplicate durable event"));
+                                break 'collect;
+                            }
+                        }
+                        Err(error) => {
+                            health.sqlite_state = "DEGRADED_SPOOLED".into();
+                            let message = match journal.spool(&item.event) {
+                                Ok(spool) => format!("SQLite write failed; full event spooled at {}: {error}", spool.display()),
+                                Err(spool_error) => format!("SQLite write failed ({error}); emergency spool also failed ({spool_error})"),
+                            };
+                            let _ = item.acknowledge(Err(message.clone()));
+                            persist_error = Some(anyhow!(message));
+                            spool_drain = true;
+                            break 'collect;
+                        }
+                    }
+                    if capacity_counter >= 100 {
+                        capacity_counter = 0;
+                        match journal.capacity_snapshot() {
+                            Ok(snapshot) => {
+                                health.disk_free_bytes = snapshot.disk_free_bytes;
+                                health.sqlite_bytes = snapshot.sqlite_bytes;
+                                health.wal_bytes = snapshot.wal_bytes;
+                                health.capacity_state = snapshot.capacity_state.clone();
+                                if snapshot.capacity_state == "CRITICAL_DISK_PRESSURE" {
+                                    health.sqlite_state = "BLOCKED_DISK_PRESSURE".into();
+                                    persist_error = Some(anyhow!("critical disk pressure during combined collection"));
+                                    spool_drain = true;
+                                    break 'collect;
+                                }
+                            }
+                            Err(error) => {
+                                persist_error = Some(error.context("check combined collector disk capacity"));
+                                spool_drain = true;
+                                break 'collect;
+                            }
+                        }
+                    }
+                    let unarchived = match journal.unarchived_count() {
+                        Ok(count) => count,
+                        Err(error) => {
+                            persist_error = Some(error.context("count unarchived combined collector events"));
+                            break 'collect;
+                        }
+                    };
+                    if unarchived >= 500 {
+                        match journal.flush_archive(500) {
+                            Ok(()) => health.archive_state = "RECONCILIATION_PENDING".into(),
+                            Err(error) => {
+                                health.archive_state = "INCOMPLETE".into();
+                                health.sqlite_state = "DEGRADED_ARCHIVE_PENDING".into();
+                                // SQLite already committed this event. Do not
+                                // falsely turn durable persistence into loss.
+                                persist_error = Some(error.context("flush combined collector Parquet archive"));
+                                break 'collect;
+                            }
+                        }
+                    }
+                    health.queue_depth = event_rx.len();
+                    if let Err(error) = health.publish(&journal.home) {
+                        persist_error = Some(error.context("publish combined collector status"));
+                        break 'collect;
+                    }
+                }
+                _ = interval.tick() => {
+                    if let Err(error) = self.run_cycle(source, journal, config, &mut health, Utc::now()).await {
+                        health.rest_state = "DEGRADED".into();
+                        health.poll_failures += 1;
+                        cycle_error = Some(error);
+                        break;
+                    }
+                    health.websocket_state = if health.websocket_last_frame_utc.is_some() {
+                        health.websocket_state.clone()
+                    } else {
+                        "CONNECTING".into()
+                    };
+                    if let Err(error) = health.publish(&journal.home) {
+                        persist_error = Some(error.context("publish combined collector status after REST cycle"));
+                        break 'collect;
+                    }
+                }
+            }
+        }
+
+        let _ = websocket_stop_tx.send(true);
+        // The transport waits for the current durable ACK and then observes
+        // cancellation; drain any already-enqueued events before joining it.
+        while let Some(item) = event_rx.recv().await {
+            observe_websocket_event(&mut health, &item.event, event_rx.len());
+            if spool_drain {
+                match journal.spool(&item.event) {
+                    Ok(_) => {
+                        health.sqlite_state = "DEGRADED_SPOOLED".into();
+                        health.events_acknowledged += 1;
+                        let _ = item.acknowledge(Ok(()));
+                    }
+                    Err(error) => {
+                        let message =
+                            format!("shutdown spool failed; event remains unacknowledged: {error}");
+                        let _ = item.acknowledge(Err(message.clone()));
+                        persist_error.get_or_insert_with(|| anyhow!(message));
+                    }
+                }
+                continue;
+            }
+            match journal.ingest(&item.event) {
+                Ok(IngestResult::Inserted | IngestResult::Versioned) => {
+                    health.events_acknowledged += 1;
+                    item.acknowledge(Ok(()))?;
+                }
+                Ok(IngestResult::Duplicate) => {
+                    health.events_duplicate += 1;
+                    item.acknowledge(Ok(()))?;
+                }
+                Err(error) => {
+                    let message = match journal.spool(&item.event) {
+                        Ok(path) => format!("shutdown drain write failed; event spooled at {}: {error}", path.display()),
+                        Err(spool_error) => format!("shutdown drain SQLite write failed ({error}); emergency spool also failed ({spool_error})"),
+                    };
+                    let _ = item.acknowledge(Err(message.clone()));
+                    persist_error.get_or_insert_with(|| anyhow!(message));
+                }
+            }
+        }
+        if !websocket_done {
+            match tokio::time::timeout(Duration::from_secs(10), &mut websocket_task).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => {
+                    persist_error.get_or_insert(error);
+                }
+                Ok(Err(error)) => {
+                    persist_error
+                        .get_or_insert_with(|| anyhow!("WebSocket task join failed: {error}"));
+                }
+                Err(_) => {
+                    websocket_task.abort();
+                    let _ = websocket_task.await;
+                    persist_error.get_or_insert_with(|| {
+                        anyhow!("WebSocket transport did not stop within 10 seconds")
+                    });
+                }
+            }
+        }
+        health.process_liveness = "STOPPING".into();
+        health.queue_depth = 0;
+        health.publish(&journal.home)?;
+        if let Some(error) = cycle_error.or(persist_error) {
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub async fn run_cycle<S: ExchangeSource>(
         &mut self,
         source: &S,
@@ -511,6 +831,7 @@ impl ContinuousRuntime {
                     last_websocket_trade_utc: None,
                     book_source: "REST_SAMPLED_NOT_WS_SYNCHRONIZED".into(),
                     book_state: "NOT_YET_OBSERVED".into(),
+                    websocket_book_state: "NOT_YET_OBSERVED".into(),
                     last_trade_poll_utc: None,
                     trades_complete: None,
                     last_error: None,
@@ -669,6 +990,7 @@ impl ContinuousRuntime {
                     last_websocket_trade_utc: None,
                     book_source: "REST_SAMPLED_NOT_WS_SYNCHRONIZED".into(),
                     book_state: "NOT_YET_OBSERVED".into(),
+                    websocket_book_state: "NOT_YET_OBSERVED".into(),
                     last_trade_poll_utc: None,
                     trades_complete: None,
                     last_error: None,
@@ -726,7 +1048,19 @@ impl ContinuousRuntime {
         } else {
             "INCOMPLETE".into()
         };
+        let websocket_markets = std::mem::take(&mut health.markets);
         health.markets = self.market_health.clone();
+        for (ticker, websocket) in websocket_markets {
+            if websocket.last_websocket_frame_utc.is_none()
+                && websocket.last_websocket_trade_utc.is_none()
+            {
+                continue;
+            }
+            let market = health.markets.entry(ticker).or_insert(websocket.clone());
+            market.last_websocket_frame_utc = websocket.last_websocket_frame_utc;
+            market.last_websocket_trade_utc = websocket.last_websocket_trade_utc;
+            market.websocket_book_state = websocket.websocket_book_state;
+        }
         let capacity = journal.capacity_snapshot()?;
         health.disk_free_bytes = capacity.disk_free_bytes;
         health.sqlite_bytes = capacity.sqlite_bytes;
@@ -795,6 +1129,7 @@ impl ContinuousRuntime {
                 last_websocket_trade_utc: None,
                 book_source: "REST_SAMPLED_NOT_WS_SYNCHRONIZED".into(),
                 book_state: "NOT_YET_OBSERVED".into(),
+                websocket_book_state: "NOT_YET_OBSERVED".into(),
                 last_trade_poll_utc: None,
                 trades_complete: None,
                 last_error: None,
@@ -924,6 +1259,7 @@ impl ContinuousRuntime {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use ed25519_dalek::pkcs8::EncodePrivateKey as EdEncodePrivateKey;
     use rusqlite::{Connection, TransactionBehavior};
     use std::fs;
     use std::sync::Mutex;
@@ -1381,5 +1717,153 @@ mod tests {
         let verified = Journal::open_readonly(home.path()).unwrap();
         assert!(verified.verify_archive().unwrap());
         drop(verified);
+    }
+
+    struct EmptySource;
+
+    impl ExchangeSource for EmptySource {
+        async fn discover(&self, _series: &[String], _max_pages: usize) -> Result<InventoryBatch> {
+            Ok(InventoryBatch::default())
+        }
+
+        async fn orderbook(&self, _ticker: &str) -> Result<Option<Response>> {
+            Ok(None)
+        }
+
+        async fn trades(
+            &self,
+            _ticker: &str,
+            _since: DateTime<Utc>,
+            _max_pages: usize,
+        ) -> Result<TradeBatch> {
+            Ok(TradeBatch {
+                trades: Vec::new(),
+                complete: true,
+                pages: 0,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn combined_runtime_durably_acks_mock_websocket_and_shuts_down_cleanly() -> Result<()> {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let url = format!("ws://{address}/trade-api/ws/v2");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            let mut socket = accept_async(stream).await?;
+            let subscription = tokio::time::timeout(Duration::from_secs(3), socket.next())
+                .await?
+                .ok_or_else(|| anyhow!("client closed before WebSocket subscribe"))??;
+            let Message::Text(subscription) = subscription else {
+                bail!("expected WebSocket text subscription")
+            };
+            let subscription: Value = serde_json::from_str(&subscription)?;
+            if subscription["cmd"] != "subscribe" {
+                bail!("unexpected WebSocket command: {subscription}")
+            }
+            socket
+                .send(Message::Text(
+                    json!({
+                        "type":"subscribed","msg":{"channel":"orderbook_delta","sid":17}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await?;
+            socket.send(Message::Text(json!({
+                "type":"orderbook_snapshot","sid":17,"seq":2,
+                "msg":{"market_ticker":"KXBTC15M-COORDINATOR-MOCK","yes_dollars_fp":[],"no_dollars_fp":[]}
+            }).to_string().into())).await?;
+            while let Some(message) = socket.next().await {
+                if matches!(message?, Message::Close(_)) {
+                    break;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+
+        let home = tempfile::tempdir()?;
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let pem = key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)?;
+        let key_path = home.path().join("mock-key.pem");
+        tokio::fs::write(&key_path, pem.as_bytes()).await?;
+        let transport =
+            AuthenticatedWebSocket::new_loopback_mock(crate::websocket::WebSocketConfigStage {
+                url,
+                key_id: "offline-coordinator-test".into(),
+                private_key_path: key_path,
+                market_tickers: vec!["KXBTC15M-COORDINATOR-MOCK".into()],
+                allow_network: true,
+                reconnect_initial: Duration::from_millis(5),
+                reconnect_max: Duration::from_millis(20),
+                output_capacity: 4096,
+            })?;
+        let mut journal = Journal::open(home.path())?;
+        let config = RuntimeConfig {
+            series: Vec::new(),
+            ..RuntimeConfig::default()
+        };
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+        let stage = home.path().to_path_buf();
+        let runner = tokio::spawn(async move {
+            let mut runtime = ContinuousRuntime::default();
+            let result = runtime
+                .run_with_websocket(&EmptySource, &mut journal, &config, transport, &mut stop_rx)
+                .await;
+            let close = journal.close();
+            result?;
+            close?;
+            Ok::<(), anyhow::Error>(())
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status_path = stage.join("runtime/status.json");
+                if let Ok(bytes) = tokio::fs::read(status_path).await {
+                    if serde_json::from_slice::<Value>(&bytes)
+                        .ok()
+                        .and_then(|status| {
+                            status["markets"]["KXBTC15M-COORDINATOR-MOCK"]["websocket_book_state"]
+                                .as_str()
+                                .map(str::to_owned)
+                        })
+                        .as_deref()
+                        == Some("SYNCHRONIZED")
+                    {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("mock WebSocket events should receive durable journal acknowledgments");
+        stop_tx.send(true)?;
+        tokio::time::timeout(Duration::from_secs(5), runner)
+            .await
+            .expect("combined runtime should drain and stop promptly")??;
+        server.await??;
+
+        let verified = Journal::open_readonly(home.path())?;
+        let report = verified.audit()?;
+        assert!(report["canonical_events"].as_u64().unwrap_or_default() >= 2);
+        assert!(verified.verify_archive()?);
+        let conn = rusqlite::Connection::open_with_flags(
+            home.path().join("data/paper_ledger.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let snapshots: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM market_events WHERE channel='websocket_raw' AND kind='orderbook_snapshot'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(snapshots, 1);
+        drop(conn);
+        drop(verified);
+        Ok(())
     }
 }
