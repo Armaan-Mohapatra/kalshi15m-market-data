@@ -2500,6 +2500,7 @@ class Collector:
             request_count += 1
             try:
                 payload = await self.api.get("/markets/orderbooks", {"tickers": batch})
+                http_metadata = getattr(payload, "response_metadata", {})
                 observed_utc = utc_now()
                 successful_request_count += 1
                 orderbooks = payload.get("orderbooks")
@@ -2603,8 +2604,9 @@ class Collector:
                         "valid_tickers": sorted(valid),
                         "missing_or_invalid_tickers": missing,
                         "coverage": "COMPLETE" if not missing else "INCOMPLETE",
-                        "server_date_header": None,
-                        "server_clock_offset_state": "NOT_MEASURED",
+                        "server_date_header": http_metadata.get("server_date_header"),
+                        "server_clock_offset_state": http_metadata.get("server_date_offset_quality", "NOT_MEASURED"),
+                        "server_date_offset_approx_seconds": http_metadata.get("server_date_offset_approx_seconds"),
                     },
                     dedupe_key=f"rest-poll|{self.run_id}|{requested_utc}|rest_orderbook",
                 )
@@ -2661,6 +2663,7 @@ class Collector:
             pages = trades_seen = 0
             complete = False
             request_error: str | None = None
+            http_date_samples: list[dict[str, Any]] = []
             try:
                 for _ in range(20):
                     params: dict[str, Any] = {"ticker": ticker, "limit": 1000, "min_ts": since}
@@ -2668,6 +2671,13 @@ class Collector:
                         params["cursor"] = cursor
                     request_count += 1
                     payload = await self.api.get("/markets/trades", params)
+                    http_meta = getattr(payload, "response_metadata", {})
+                    if http_meta:
+                        http_date_samples.append({
+                            "server_date_header": http_meta.get("server_date_header"),
+                            "server_date_offset_approx_seconds": http_meta.get("server_date_offset_approx_seconds"),
+                            "quality": http_meta.get("server_date_offset_quality", "NOT_MEASURED"),
+                        })
                     successful_request_count += 1
                     trades = payload.get("trades")
                     if not isinstance(trades, list):
@@ -2747,7 +2757,8 @@ class Collector:
                     "min_ts": since, "page_count": pages,
                     "row_count": trades_seen, "complete": complete,
                     "error": request_error,
-                    "server_date_header": None, "server_clock_offset_state": "NOT_MEASURED",
+                    "http_date_samples": http_date_samples,
+                    "server_clock_offset_state": "COARSE_DIAGNOSTIC_ONLY",
                 },
                 ticker,
                 dedupe_key=f"trade-poll|{self.run_id}|{ticker}|{requested_utc}",
