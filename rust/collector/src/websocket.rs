@@ -460,7 +460,6 @@ mod tests {
     use super::*;
     use ed25519_dalek::pkcs8::EncodePrivateKey as EdEncodePrivateKey;
     use rand::rngs::OsRng;
-    use rsa::pkcs8::EncodePrivateKey as RsaEncodePrivateKey;
     use rsa::signature::Verifier;
     #[test]
     fn first_sequence_two_is_not_a_gap_and_interleaving_valid() {
@@ -506,9 +505,7 @@ mod tests {
     #[test]
     fn kalshi_ed25519_auth_header_signs_exact_handshake_payload() {
         let key = ed25519_dalek::SigningKey::generate(&mut OsRng);
-        let pem = key
-            .to_pkcs8_pem(ed25519_dalek::pkcs8::LineEnding::LF)
-            .unwrap();
+        let pem = key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF).unwrap();
         let headers = authentication_headers("test-key", pem.as_str(), 1_700_000_000_123).unwrap();
         let payload = b"1700000000123GET/trade-api/ws/v2";
         let signature = BASE64.decode(&headers[1].1).unwrap();
