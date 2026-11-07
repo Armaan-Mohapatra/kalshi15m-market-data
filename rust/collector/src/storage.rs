@@ -478,6 +478,11 @@ impl Journal {
     }
 
     pub fn close(mut self) -> Result<Stats> {
+        let pending_spool = self.home.join("data").join("rust_pending");
+        if pending_spool.exists() && fs::read_dir(&pending_spool)?.next().is_some() {
+            self.mark("CLOSED_WITH_PENDING_SPOOL_UNVERIFIED")?;
+            bail!("emergency spool still contains unacknowledged events")
+        }
         for _ in 0..200 {
             if self.unarchived_count()? == 0 {
                 break;
@@ -591,5 +596,29 @@ mod tests {
         assert!(!path.exists());
         assert_eq!(restarted.audit().unwrap()["canonical_events"], 1);
         restarted.close().unwrap();
+    }
+
+    #[test]
+    fn close_cannot_mark_clean_while_emergency_spool_is_pending() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Journal::open(home.path()).unwrap();
+        let event = Event::new(
+            "rest",
+            "trade",
+            None,
+            json!({"id":8}),
+            Some("pending".into()),
+        );
+        store.spool(&event).unwrap();
+        assert!(store.close().is_err());
+        let conn = Connection::open(home.path().join("data/paper_ledger.sqlite3")).unwrap();
+        let marker: String = conn
+            .query_row(
+                "SELECT value FROM collector_markers WHERE marker='archive_shutdown'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker, "CLOSED_WITH_PENDING_SPOOL_UNVERIFIED");
     }
 }

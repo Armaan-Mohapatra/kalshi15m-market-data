@@ -5,11 +5,12 @@ use kalshi15m_rust::{
     replay::{collect_once, replay_file},
     runtime::{ContinuousRuntime, RestSource, RuntimeConfig},
     storage::Journal,
+    websocket::{AuthenticatedWebSocket, WebSocketConfigStage, KALSHI_WS_URL},
 };
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 #[derive(Parser)]
 #[command(
@@ -64,6 +65,20 @@ enum Commands {
         min_spacing_seconds: f64,
         #[arg(long, default_value = DEFAULT_BASE)]
         base_url: String,
+    },
+    /// Explicitly gated authenticated market-data WebSocket capture.
+    /// Never run during ordinary offline staging validation.
+    CaptureWebsocket {
+        #[arg(long, required = true)]
+        allow_websocket: bool,
+        #[arg(long, required = true)]
+        key_id: String,
+        #[arg(long, required = true)]
+        private_key: PathBuf,
+        #[arg(long, required = true, num_args = 1..)]
+        ticker: Vec<String>,
+        #[arg(long, default_value_t = 4096)]
+        queue_capacity: usize,
     },
     /// Audit staging journal and verify archive integrity without network.
     Audit,
@@ -196,6 +211,82 @@ async fn main() -> Result<()> {
                     "network_used":true,
                     "durable_events":stats.inserted + stats.variants,
                     "duplicates":stats.duplicates,
+                }))?
+            );
+        }
+        Commands::CaptureWebsocket {
+            allow_websocket,
+            key_id,
+            private_key,
+            ticker,
+            queue_capacity,
+        } => {
+            if !allow_websocket {
+                bail!("authenticated WebSocket access requires --allow-websocket true")
+            }
+            let transport = AuthenticatedWebSocket::new(WebSocketConfigStage {
+                url: KALSHI_WS_URL.to_owned(),
+                key_id,
+                private_key_path: private_key,
+                market_tickers: ticker,
+                allow_network: allow_websocket,
+                reconnect_initial: Duration::from_secs(1),
+                reconnect_max: Duration::from_secs(60),
+                output_capacity: queue_capacity,
+            })?;
+            let (events_tx, mut events_rx) = mpsc::channel(queue_capacity);
+            let (stop_tx, stop_rx) = watch::channel(false);
+            let transport_task =
+                tokio::spawn(async move { transport.run(stop_rx, events_tx).await });
+            let ctrl_c = tokio::signal::ctrl_c();
+            tokio::pin!(ctrl_c);
+            let mut stopping = false;
+            let mut spooled = 0_u64;
+            let mut persistence_error = None;
+            loop {
+                tokio::select! {
+                    signal = &mut ctrl_c, if !stopping => {
+                        signal.context("wait for Ctrl-C")?;
+                        stopping = true;
+                        let _ = stop_tx.send(true);
+                    }
+                    event = events_rx.recv() => match event {
+                        Some(event) => {
+                            if let Err(error) = journal.ingest(&event) {
+                                match journal.spool(&event) {
+                                    Ok(_) => spooled += 1,
+                                    Err(spool_error) => {
+                                        persistence_error = Some(anyhow::anyhow!(
+                                            "journal failed ({error}); emergency spool failed ({spool_error})"
+                                        ));
+                                        stopping = true;
+                                        let _ = stop_tx.send(true);
+                                    }
+                                }
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+            let transport_result = transport_task
+                .await
+                .context("WebSocket transport task panicked")?;
+            if let Some(error) = persistence_error {
+                return Err(error);
+            }
+            transport_result?;
+            let stats = journal.close()?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "mode":"AUTHENTICATED_WEBSOCKET_MARKET_DATA",
+                    "process_state":"STOPPED_GRACEFULLY",
+                    "network_used":true,
+                    "durable_events":stats.inserted + stats.variants,
+                    "duplicates":stats.duplicates,
+                    "spooled_events":spooled,
+                    "archive_state":"VERIFIED_ON_CLOSE"
                 }))?
             );
         }

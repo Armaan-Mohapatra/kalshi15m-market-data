@@ -22,7 +22,7 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
-const KALSHI_WS_URL: &str = "wss://external-api-ws.kalshi.com/trade-api/ws/v2";
+pub const KALSHI_WS_URL: &str = "wss://external-api-ws.kalshi.com/trade-api/ws/v2";
 const KALSHI_WS_PATH: &str = "/trade-api/ws/v2";
 
 /// Produces Kalshi handshake headers from a private key supplied explicitly by
@@ -221,9 +221,13 @@ impl AuthenticatedWebSocket {
             );
         }
         let ws_config = WebSocketConfig::default();
-        let (mut socket, _) = connect_async_with_config(request, Some(ws_config), false)
-            .await
-            .context("authenticated Kalshi WebSocket handshake failed")?;
+        let (mut socket, _) = tokio::time::timeout(
+            Duration::from_secs(20),
+            connect_async_with_config(request, Some(ws_config), false),
+        )
+        .await
+        .context("WebSocket handshake timeout")?
+        .context("authenticated Kalshi WebSocket handshake failed")?;
         let subscription = json!({
             "id":1,
             "cmd":"subscribe",

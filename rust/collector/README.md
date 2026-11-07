@@ -11,9 +11,10 @@ This crate is a **runnable, isolated Rust ingestion prototype**, not yet a produ
 - Durable journal rows before acknowledgment; same-key different-payload variants, persistent event fingerprints, fsynced emergency spool and restart replay.
 - Arrow/Parquet archive parts, bounded reconciliation from SQLite, independent manifest hashes and explicit clean/unverified shutdown.
 - Public GET-only one-shot REST collector with 2-second minimum pacing, bounded 429/5xx/timeouts, discovery of open and unopened 900-second markets, REST book sampling, paginated public trades and incomplete-source telemetry.
+- Authenticated Kalshi WebSocket transport with Ed25519/RSA-PSS handshake signing, explicit subscriptions, connection-qualified raw frames, sequence-gap invalidation, bounded backpressure, reconnect/resubscribe, fresh-snapshot recovery, malformed-frame evidence and graceful cancellation.
 - CI build, Rust unit tests and smoke replay on Windows and Linux.
 
-**Limitations:** This branch is not an authenticated live WebSocket client or a complete continuously scheduled replacement of the Python strategy/paper runtime. WebSocket exchange messages are accepted from replay fixtures; real authenticated WSS activation requires a separate protocol/auth fixture and authorization. REST snapshots cannot reconstruct lost intermediate orderbook deltas. The Rust journal uses staging-specific reconciliation tables and **must never target the production Python SQLite/WAL**. The Rust Parquet schema is explicitly checked by a separate Python compatibility test before any migration decision.
+**Limitations:** WebSocket signing and transport are validated offline only; no authenticated exchange connection has been attempted. The CLI requires `capture-websocket --allow-websocket true` and explicitly supplied credentials; never use it during routine staging validation while Phoenix collection is active. The continuous Rust runtime is not yet an independently accepted replacement for the Python strategy/paper runtime. REST snapshots cannot reconstruct lost intermediate orderbook deltas. The Rust journal uses staging-specific reconciliation tables and **must never target the production Python SQLite/WAL**. The Rust Parquet schema is explicitly checked by a separate Python compatibility test before any migration decision.
 
 ## Build and run — offline by default
 
@@ -38,6 +39,15 @@ cargo run -- --home "$stage" capture-once --allow-network --ticker KXBTC15M-EXAM
 ```
 
 This mode never places orders and does not install a service, configure Task Scheduler, activate WSS or change the active Windows collector.
+
+### Authenticated WebSocket staging mode (NOT automatically run)
+
+The source includes authenticated WebSocket streaming for explicit market tickers. It writes only to the isolated `--home` journal/archive. Running it connects to Kalshi and requires a separate explicit operational decision; ordinary tests and staging validation must use local signing/protocol fixtures. Never point it at a production key path.
+
+```powershell
+# Syntax only. Do not run during ordinary staging validation.
+cargo run -- --home "$stage" capture-websocket --allow-websocket true --key-id STAGING_KEY_ID --private-key "C:\staging\key.pem" --ticker KXBTC15M-EXAMPLE
+```
 
 ## Data contract and recovery
 
