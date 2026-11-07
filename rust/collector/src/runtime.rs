@@ -34,8 +34,8 @@ pub struct RuntimeConfig {
 
 impl RuntimeConfig {
     pub fn validate(&self) -> Result<()> {
-        if self.series.is_empty() || self.series.len() > 100 {
-            bail!("continuous collection requires 1..=100 explicit series tickers")
+        if self.series.len() > 100 {
+            bail!("continuous collection accepts at most 100 explicit series tickers")
         }
         if self.max_pages == 0 || self.max_pages > 20 {
             bail!("page limit outside 1..=20")
@@ -89,6 +89,9 @@ pub struct TradeBatch {
 /// Mockable interface for all exchange reads. Implementations must be
 /// read-only and must return raw market metadata without dropping fields.
 pub trait ExchangeSource: Send + Sync {
+    fn series_catalog<'a>(&'a self) -> impl Future<Output = Result<Vec<Value>>> + Send + 'a {
+        std::future::ready(Ok(Vec::new()))
+    }
     fn discover<'a>(
         &'a self,
         series: &'a [String],
@@ -126,6 +129,14 @@ impl RestSource {
 }
 
 impl ExchangeSource for RestSource {
+    async fn series_catalog(&self) -> Result<Vec<Value>> {
+        if !self.network_allowed {
+            bail!("REST network gate is closed")
+        }
+        let (series, _) = self.rest.pages("/series", "series", &[], 1).await?;
+        Ok(series)
+    }
+
     async fn discover(&self, series: &[String], max_pages: usize) -> Result<InventoryBatch> {
         if !self.network_allowed {
             bail!("REST network gate is closed")
@@ -308,6 +319,34 @@ pub struct ContinuousRuntime {
     last_discovery: Option<DateTime<Utc>>,
     last_open_state: BTreeMap<String, bool>,
     queue_saturation_count: u64,
+    candidate_series: BTreeSet<String>,
+    series_rotation_cursor: usize,
+}
+
+fn rotating_series_batch(
+    configured: &[String],
+    candidates: &BTreeSet<String>,
+    cursor: &mut usize,
+    limit: usize,
+) -> Vec<String> {
+    let all_series: Vec<String> = configured
+        .iter()
+        .cloned()
+        .chain(candidates.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if all_series.is_empty() || limit == 0 {
+        *cursor = 0;
+        return Vec::new();
+    }
+    let start = *cursor % all_series.len();
+    let count = limit.min(all_series.len());
+    let batch = (0..count)
+        .map(|offset| all_series[(start + offset) % all_series.len()].clone())
+        .collect();
+    *cursor = (start + count) % all_series.len();
+    batch
 }
 
 impl ContinuousRuntime {
@@ -343,7 +382,38 @@ impl ContinuousRuntime {
             })
             .unwrap_or(true);
         if should_discover {
-            let inventory = source.discover(&config.series, config.max_pages).await?;
+            match source.series_catalog().await {
+                Ok(rows) => {
+                    self.candidate_series = rows
+                        .iter()
+                        .filter(|row| crate::discovery::series_is_15m_candidate(row))
+                        .filter_map(|row| {
+                            row.get("ticker")
+                                .or_else(|| row.get("series_ticker"))
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                        })
+                        .collect();
+                }
+                Err(error) => {
+                    summary.failures += 1;
+                    health.poll_failures += 1;
+                    pending.push(Event::new(
+                        "rest_market",
+                        "series_catalog_failure",
+                        None,
+                        json!({"error":error.to_string(),"complete":false}),
+                        None,
+                    ));
+                }
+            }
+            let series_batch = rotating_series_batch(
+                &config.series,
+                &self.candidate_series,
+                &mut self.series_rotation_cursor,
+                4,
+            );
+            let inventory = source.discover(&series_batch, config.max_pages).await?;
             summary.failures += inventory.failures.len();
             health.poll_failures += inventory.failures.len() as u64;
             for failure in inventory.failures {
@@ -858,10 +928,69 @@ mod tests {
     use std::fs;
     use std::sync::Mutex;
 
+    #[test]
+    fn catalog_rotation_is_bounded_deduplicated_and_fair() {
+        let configured = vec!["B".to_string()];
+        let candidates = ["A", "B", "C", "D", "E"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let mut cursor = 0;
+        assert_eq!(
+            rotating_series_batch(&configured, &candidates, &mut cursor, 2),
+            ["A", "B"]
+        );
+        assert_eq!(
+            rotating_series_batch(&configured, &candidates, &mut cursor, 2),
+            ["C", "D"]
+        );
+        assert_eq!(
+            rotating_series_batch(&configured, &candidates, &mut cursor, 2),
+            ["E", "A"]
+        );
+        assert_eq!(
+            rotating_series_batch(&[], &BTreeSet::new(), &mut cursor, 2),
+            Vec::<String>::new()
+        );
+    }
+
     struct MockSource {
         market: Value,
         books: Mutex<Vec<Option<Value>>>,
         trade_complete: bool,
+    }
+
+    struct CatalogMock {
+        rows: Vec<Value>,
+        calls: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl ExchangeSource for CatalogMock {
+        async fn series_catalog(&self) -> Result<Vec<Value>> {
+            Ok(self.rows.clone())
+        }
+
+        async fn discover(&self, series: &[String], _max_pages: usize) -> Result<InventoryBatch> {
+            self.calls.lock().unwrap().push(series.to_vec());
+            Ok(InventoryBatch::default())
+        }
+
+        async fn orderbook(&self, _ticker: &str) -> Result<Option<Response>> {
+            Ok(None)
+        }
+
+        async fn trades(
+            &self,
+            _ticker: &str,
+            _since: DateTime<Utc>,
+            _max_pages: usize,
+        ) -> Result<TradeBatch> {
+            Ok(TradeBatch {
+                trades: Vec::new(),
+                complete: true,
+                pages: 1,
+            })
+        }
     }
 
     impl ExchangeSource for MockSource {
@@ -905,6 +1034,44 @@ mod tests {
             max_pages: 4,
             queue_capacity: 4096,
         }
+    }
+
+    #[tokio::test]
+    async fn runtime_discovers_candidate_series_with_fair_four_series_rotation() {
+        let home = tempfile::tempdir().unwrap();
+        let source = CatalogMock {
+            rows: ["A", "B", "C", "D", "E", "F"]
+                .into_iter()
+                .map(|ticker| json!({"ticker":ticker,"frequency":"15_minutes"}))
+                .chain(std::iter::once(json!({"ticker":"FALSE15M"})))
+                .collect(),
+            calls: Mutex::new(Vec::new()),
+        };
+        let mut runtime = ContinuousRuntime::default();
+        let mut journal = Journal::open(home.path()).unwrap();
+        let mut health = RuntimeHealth::new(config().queue_capacity);
+        let mut runtime_config = config();
+        runtime_config.series.clear();
+        let at = Utc.with_ymd_and_hms(2026, 11, 7, 12, 0, 0).unwrap();
+        runtime
+            .run_cycle(&source, &mut journal, &runtime_config, &mut health, at)
+            .await
+            .unwrap();
+        runtime
+            .run_cycle(
+                &source,
+                &mut journal,
+                &runtime_config,
+                &mut health,
+                at + ChronoDuration::seconds(16),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            *source.calls.lock().unwrap(),
+            vec![vec!["A", "B", "C", "D"], vec!["E", "F", "A", "B"]]
+        );
+        journal.close().unwrap();
     }
 
     #[tokio::test]

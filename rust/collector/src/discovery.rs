@@ -85,21 +85,59 @@ impl Market {
 }
 
 pub fn series_is_15m_candidate(value: &Value) -> bool {
-    let as_string = serde_json::to_string(value)
+    let frequency = value
+        .get("frequency")
+        .and_then(Value::as_str)
         .unwrap_or_default()
+        .trim()
         .to_ascii_lowercase();
-    // Do not use a ticker prefix to infer contract duration.
-    [
-        "15 minutes",
-        "15 minute",
-        "15-min",
-        "15min",
-        "15m",
-        "900 seconds",
-        "fifteen minutes",
-    ]
-    .iter()
-    .any(|phrase| as_string.contains(phrase))
+    if ["fifteen_min", "fifteen_minutes", "15_minutes"].contains(&frequency.as_str()) {
+        return true;
+    }
+    let tags_match = value
+        .get("tags")
+        .and_then(Value::as_array)
+        .map(|tags| {
+            tags.iter().filter_map(Value::as_str).any(|tag| {
+                ["15 min", "15-minute", "15 minute", "fifteen minutes"]
+                    .contains(&tag.trim().to_ascii_lowercase().as_str())
+            })
+        })
+        .unwrap_or(false);
+    if tags_match {
+        return true;
+    }
+
+    fn metadata_text(value: &Value, out: &mut Vec<String>) {
+        match value {
+            Value::String(text) => out.push(text.to_ascii_lowercase()),
+            Value::Array(items) => items.iter().for_each(|item| metadata_text(item, out)),
+            Value::Object(map) => map.iter().for_each(|(key, item)| {
+                if !["ticker", "series_ticker"].contains(&key.to_ascii_lowercase().as_str()) {
+                    metadata_text(item, out);
+                }
+            }),
+            _ => {}
+        }
+    }
+    let mut fields = Vec::new();
+    if let Some(object) = value.as_object() {
+        for (key, item) in object {
+            if !["ticker", "series_ticker"].contains(&key.to_ascii_lowercase().as_str()) {
+                metadata_text(item, &mut fields);
+            }
+        }
+    }
+    fields.iter().any(|text| {
+        let tokens: Vec<&str> = text.split(|ch: char| !ch.is_ascii_alphanumeric()).collect();
+        tokens.windows(2).any(|pair| {
+            (pair[0] == "15" && ["minute", "minutes", "min", "mins"].contains(&pair[1]))
+                || (pair[0] == "900" && ["second", "seconds"].contains(&pair[1]))
+                || (pair[0] == "fifteen" && ["minute", "minutes"].contains(&pair[1]))
+        }) || tokens
+            .iter()
+            .any(|token| ["15minute", "15minutes", "15min", "15mins"].contains(token))
+    })
 }
 
 #[derive(Default)]
@@ -242,5 +280,30 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn series_catalog_candidates_match_python_rules_without_ticker_false_positives() {
+        assert!(series_is_15m_candidate(
+            &json!({"ticker":"SERIES","frequency":"15_minutes"})
+        ));
+        assert!(series_is_15m_candidate(
+            &json!({"ticker":"SERIES","tags":["15-minute"]})
+        ));
+        assert!(series_is_15m_candidate(
+            &json!({"ticker":"SERIES","description":"Contracts settle every fifteen minutes"})
+        ));
+        assert!(series_is_15m_candidate(
+            &json!({"ticker":"SERIES","description":"900 seconds per contract"})
+        ));
+        assert!(series_is_15m_candidate(
+            &json!({"ticker":"SERIES","description":"15min contract"})
+        ));
+        assert!(!series_is_15m_candidate(
+            &json!({"ticker":"15M-CRYPTO","title":"Crypto price"})
+        ));
+        assert!(!series_is_15m_candidate(
+            &json!({"ticker":"SERIES","description":"115 minutes"})
+        ));
     }
 }
