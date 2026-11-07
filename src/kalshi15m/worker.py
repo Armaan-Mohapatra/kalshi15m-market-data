@@ -895,7 +895,9 @@ class Collector:
         try:
             postopen_check_due = self._skip_upcoming_scan_for_postopen_reconcile()
             priority_tickers = set(self.rollover_priority_tickers)
-            postopen_series_scan_skipped = postopen_check_due or bool(priority_tickers)
+            # Recently opened, not-yet-discovered markets must still be scanned.
+            # Priority reconciliation and rotating discovery are independent.
+            postopen_series_scan_skipped = False
             full_refresh = (
                 self.inventory_snapshot is None
                 or time.monotonic() - self.last_full_inventory_monotonic
@@ -3343,7 +3345,10 @@ class Collector:
         self.stop_file.unlink(missing_ok=True)
         writer = asyncio.create_task(self.writer_loop(), name="sqlite-parquet-writer")
         heartbeat = asyncio.create_task(self.heartbeat_loop(), name="runtime-heartbeat")
-        await self.refresh_inventory()
+        # Start potentially long discovery without blocking the ingest loop.
+        inventory_task: asyncio.Task[None] | None = asyncio.create_task(
+            self.refresh_inventory(), name="startup-inventory-discovery"
+        )
         ws_task = asyncio.create_task(self.websocket_loop(), name="kalshi-websocket")
         await self.emit(
             "runtime",
@@ -3361,14 +3366,39 @@ class Collector:
         next_trades = time.monotonic()
         next_strategy = time.monotonic()
         next_capture_resume_check = time.monotonic()
-        inventory_task: asyncio.Task[None] | None = None
         trades_task: asyncio.Task[None] | None = None
+        depth_task: asyncio.Task[None] | None = None
         try:
             while not self.stopping.is_set():
                 if self.stop_file.exists():
                     self.stopping.set()
                     break
                 now = time.monotonic()
+                if inventory_task is not None and inventory_task.done():
+                    try:
+                        inventory_task.result()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        LOG.exception("inventory background discovery failed")
+                        self.status.update(
+                            error_count=self.status.data.get("error_count", 0) + 1,
+                            last_error=f"inventory discovery failed: {type(exc).__name__}",
+                            discovery_coverage_state="INCOMPLETE_EXCEPTION",
+                        )
+                    inventory_task = None
+                for background_task, kind in ((trades_task, "trades"), (depth_task, "depth")):
+                    if background_task is not None and background_task.done():
+                        try:
+                            background_task.result()
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            LOG.exception("background %s collection failed", kind)
+                            self.status.update(
+                                error_count=self.status.data.get("error_count", 0) + 1,
+                                last_error=f"{kind} collection failed: {type(exc).__name__}",
+                            )
                 rollover_check_due = (
                     self.pending_rollover_check is not None
                     and datetime.now(timezone.utc) >= self.pending_rollover_check[1]
@@ -3418,21 +3448,10 @@ class Collector:
                         # Do not queue overlapping discovery calls; retry as soon as
                         # the existing rate-limited reconciliation has completed.
                         next_reconcile = time.monotonic() + 1.0
-                if rollover_check_due and inventory_task is not None:
-                    try:
-                        await inventory_task
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        LOG.exception("rollover priority inventory reconcile failed")
-                        self.status.update(
-                            error_count=self.status.data.get("error_count", 0) + 1,
-                            last_error="rollover priority inventory reconcile failed",
-                        )
-                    finally:
-                        inventory_task = None
-                    next_reconcile = time.monotonic() + self._next_inventory_reconcile_delay()
-                    continue
+                # Never await a long inventory scan inside the opening-window
+                # scheduler. The shared API priority gate serves book requests
+                # ahead of bulk scans, and the finished inventory is harvested
+                # at the next scheduler iteration.
                 # Keep the frozen strategy poll ahead of broad, slower collection.
                 if now >= next_strategy:
                     await self.collect_strategy_inputs()
@@ -3443,16 +3462,18 @@ class Collector:
                         and datetime.now(timezone.utc) >= self.pending_rollover_check[1]
                     ):
                         continue
-                if now >= next_depth:
-                    await self.collect_rest_depth()
+                if now >= next_depth and (depth_task is None or depth_task.done()):
+                    depth_task = asyncio.create_task(
+                        self.collect_rest_depth(), name="background-rest-book-poll"
+                    )
                     next_depth = time.monotonic() + self.cfg.book_poll_interval_seconds
-                    if (
-                        self.pending_rollover_check is not None
-                        and datetime.now(timezone.utc) >= self.pending_rollover_check[1]
-                    ):
-                        continue
                 if now >= next_trades and (trades_task is None or trades_task.done()):
-                    rollover_deferral = self._public_trade_poll_rollover_deferral()
+                    # Do not blacklist active contracts' opening trades.
+                    # Prioritized GET pacing protects opening book requests.
+                    rollover_deferral = (
+                        None if self.active_tickers
+                        else self._public_trade_poll_rollover_deferral()
+                    )
                     if rollover_deferral is not None:
                         delay, scheduled_open = rollover_deferral
                         next_trades = time.monotonic() + delay
@@ -3545,7 +3566,7 @@ class Collector:
             except asyncio.CancelledError:
                 pass
             background_tasks = [
-                task for task in (inventory_task, trades_task) if task is not None
+                task for task in (inventory_task, trades_task, depth_task) if task is not None
             ]
             for task in background_tasks:
                 if not task.done():
