@@ -115,6 +115,8 @@ class Storage:
         self.sqlite_bytes = 0
         self.events_inserted = 0
         self.events_duplicate = 0
+        self.events_key_conflict = 0
+        self.events_quarantined = 0
         self.parquet_buffer: list[dict[str, Any]] = []
         self.parquet_buffer_bytes_estimate = 0
         self.parquet_buffer_started_monotonic: float | None = None
@@ -146,6 +148,32 @@ class Storage:
                 market_ticker TEXT,
                 raw_json TEXT NOT NULL,
                 payload_sha256 TEXT NOT NULL
+            )"""
+        )
+        self.connection.execute(
+            """CREATE TABLE IF NOT EXISTS market_event_versions (
+                source_generation TEXT NOT NULL,
+                row_sha256 TEXT NOT NULL,
+                captured_utc TEXT NOT NULL,
+                dedupe_key TEXT NOT NULL,
+                received_utc TEXT NOT NULL,
+                exchange_ts TEXT,
+                channel TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                market_ticker TEXT,
+                raw_json BLOB NOT NULL,
+                payload_sha256 TEXT NOT NULL,
+                PRIMARY KEY (source_generation, row_sha256)
+            ) WITHOUT ROWID"""
+        )
+        self.connection.execute(
+            """CREATE TABLE IF NOT EXISTS quarantined_market_events (
+                quarantine_id TEXT PRIMARY KEY,
+                captured_utc TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                original_dedupe_key TEXT,
+                event_diagnostic_json TEXT NOT NULL,
+                original_payload_fidelity TEXT NOT NULL
             )"""
         )
         self.connection.execute(
@@ -612,94 +640,154 @@ class Storage:
             for row in rows
         ]
 
+    def _quarantine_invalid_event(self, event: dict[str, Any], exc: Exception) -> None:
+        """Durably preserve the diagnostic representation before acknowledging an invalid event.
+
+        This is not a lossless capture of arbitrary unserializable Python objects.
+        The diagnostic explicitly marks that limitation rather than claiming the
+        original market event has been archived.
+        """
+        if self.connection is None:
+            raise RuntimeError("storage is not open")
+        diagnostic = json.dumps(
+            event,
+            sort_keys=True,
+            ensure_ascii=True,
+            default=lambda item: {"unserializable_type": type(item).__name__, "repr": repr(item)},
+        )
+        self.connection.execute(
+            "INSERT INTO quarantined_market_events VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                uuid.uuid4().hex,
+                datetime.now(timezone.utc).isoformat(),
+                type(exc).__name__,
+                str(event.get("dedupe_key") or ""),
+                diagnostic,
+                "DIAGNOSTIC_ONLY_NOT_ORIGINAL_EVENT",
+            ),
+        )
+        self.connection.commit()
+        self.events_quarantined += 1
+
+    def append_batch_resilient(self, events: list[dict[str, Any]]) -> int:
+        """Isolate unencodable input; never misclassify a DB/disk failure as poison.
+
+        Persistent I/O errors propagate to the worker and must not be
+        acknowledged. Only individual, proven encoding failures are
+        quarantined into the same durable SQLite store.
+        """
+        valid: list[dict[str, Any]] = []
+        for event in events:
+            try:
+                _, _, raw = self._normalized(event)
+                encode_journal_payload(raw)
+            except (TypeError, ValueError, UnicodeError, OverflowError) as exc:
+                self._quarantine_invalid_event(event, exc)
+                continue
+            valid.append(event)
+        return self.append_batch(valid) if valid else 0
+
     def append_batch(self, events: list[dict[str, Any]]) -> int:
         if self.connection is None:
             self.open()
         assert self.connection is not None
-        rows: list[tuple[Any, ...]] = []
-        parquet_rows: list[dict[str, Any]] = []
-        prepared: list[tuple[dict[str, Any], str, str | None, str | None]] = []
+        # Serialize before opening the SQL transaction; partial input errors
+        # cannot leave a half-applied batch behind.
+        prepared: list[tuple[dict[str, Any], str, str, str]] = []
         for event in events:
-            supplied = event.get("dedupe_key")
-            if supplied:
-                prepared.append((event, str(supplied), None, None))
-            else:
-                dedupe, digest, raw = self._normalized(event)
-                prepared.append((event, dedupe, digest, raw))
+            dedupe, digest, raw = self._normalized(event)
+            prepared.append((event, dedupe, digest, raw))
 
         keys = list(dict.fromkeys(item[1] for item in prepared))
-        existing: set[str] = set()
-        seen: set[str] = set()
+        existing: dict[str, str] = {}
+        seen: dict[str, str] = {}
         for start in range(0, len(keys), 500):
             batch_keys = keys[start : start + 500]
             placeholders = ",".join("?" for _ in batch_keys)
             existing.update(
-                row[0]
+                (str(row[0]), str(row[1]))
                 for row in self.connection.execute(
-                    f"SELECT dedupe_key FROM market_events WHERE dedupe_key IN ({placeholders})",
+                    f"SELECT dedupe_key, payload_sha256 FROM market_events WHERE dedupe_key IN ({placeholders})",
                     batch_keys,
                 )
             )
 
+        rows: list[tuple[Any, ...]] = []
+        version_rows: list[tuple[Any, ...]] = []
         new_parquet_rows: list[dict[str, Any]] = []
         for event, dedupe, digest, raw in prepared:
-            if dedupe in existing or dedupe in seen:
+            canonical = existing.get(dedupe, seen.get(dedupe))
+            if canonical == digest:
                 continue
-            seen.add(dedupe)
-            if digest is None or raw is None:
-                _, digest, raw = self._normalized(event)
             received = str(event.get("received_utc") or datetime.now(timezone.utc).isoformat())
-            rows.append(
-                (
-                    dedupe,
-                    received,
-                    event.get("exchange_ts"),
-                    str(event.get("channel", "unknown")),
-                    str(event.get("kind", "unknown")),
-                    event.get("market_ticker"),
-                    encode_journal_payload(raw),
-                    digest,
+            exchange_ts = event.get("exchange_ts")
+            channel = str(event.get("channel", "unknown"))
+            kind = str(event.get("kind", "unknown"))
+            ticker = event.get("market_ticker")
+            encoded = encode_journal_payload(raw)
+            row = (dedupe, received, exchange_ts, channel, kind, ticker, encoded, digest)
+            if canonical is not None:
+                # Deduplicate the conflicting version by source key and payload,
+                # not by time of this observation.
+                version_hash = hashlib.sha256(
+                    (dedupe + "|" + digest).encode("utf-8")
+                ).hexdigest()
+                version_rows.append(
+                    ("collector-runtime", version_hash, datetime.now(timezone.utc).isoformat(), *row)
                 )
-            )
+            else:
+                seen[dedupe] = digest
+                rows.append(row)
             new_parquet_rows.append(
                 {
                     "dedupe_key": dedupe,
                     "received_utc": received,
-                    "exchange_ts": event.get("exchange_ts"),
-                    "channel": str(event.get("channel", "unknown")),
-                    "kind": str(event.get("kind", "unknown")),
-                    "market_ticker": event.get("market_ticker"),
+                    "exchange_ts": exchange_ts,
+                    "channel": channel,
+                    "kind": kind,
+                    "market_ticker": ticker,
                     "payload_sha256": digest,
                     "raw_json": raw,
                 }
             )
 
-        cursor = None
+        inserted = 0
+        inserted_versions = 0
         try:
-            if rows:
+            if rows or version_rows:
                 self.connection.execute("BEGIN IMMEDIATE")
-                cursor = self.connection.executemany(
-                    "INSERT OR IGNORE INTO market_events VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    rows,
-                )
+                if rows:
+                    inserted = max(0, int(self.connection.executemany(
+                        "INSERT OR IGNORE INTO market_events VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        rows,
+                    ).rowcount))
+                if version_rows:
+                    inserted_versions = max(0, int(self.connection.executemany(
+                        "INSERT OR IGNORE INTO market_event_versions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        version_rows,
+                    ).rowcount))
                 self.connection.commit()
         except Exception:
-            try:
-                self.connection.rollback()
-            except Exception:
-                pass
+            self.connection.rollback()
             raise
-        inserted = int(
-            cursor.rowcount if cursor is not None and cursor.rowcount >= 0 else len(rows)
-        )
+
         self.events_inserted += inserted
-        self.events_duplicate += max(0, len(events) - inserted)
+        self.events_key_conflict += inserted_versions
+        self.events_duplicate += max(0, len(events) - inserted - inserted_versions)
         self.sqlite_bytes = self._sqlite_size()
         latest_event = self.connection.execute(
             "SELECT received_utc FROM market_events ORDER BY rowid DESC LIMIT 1"
         ).fetchone()
         self.latest_market_event_received_utc = str(latest_event[0]) if latest_event else None
 
+        # All candidates have stable archive fingerprints, but only committed
+        # canonical/variant rows should enter Parquet.
+        committed = set((row[0], row[7]) for row in rows)
+        committed.update((row[3], row[10]) for row in version_rows)
+        new_parquet_rows = [
+            row for row in new_parquet_rows
+            if (row["dedupe_key"], row["payload_sha256"]) in committed
+        ]
         if self.raw_capture_enabled and new_parquet_rows:
             incoming_estimate = sum(
                 len(row["raw_json"].encode("utf-8")) + 192 for row in new_parquet_rows
@@ -719,7 +807,7 @@ class Storage:
                     self.flush_parquet(reason="ROW_THRESHOLD")
         elif new_parquet_rows:
             self.parquet_dropped_rows += len(new_parquet_rows)
-        return inserted
+        return inserted + inserted_versions
 
     def _write_partitioned_parquet(self, rows: list[dict[str, Any]]) -> None:
         groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
