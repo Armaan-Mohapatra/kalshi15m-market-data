@@ -117,6 +117,8 @@ class Storage:
         self.events_duplicate = 0
         self.events_key_conflict = 0
         self.events_quarantined = 0
+        self.events_spooled = 0
+        self.events_replayed = 0
         self.parquet_buffer: list[dict[str, Any]] = []
         self.parquet_buffer_bytes_estimate = 0
         self.parquet_buffer_started_monotonic: float | None = None
@@ -315,6 +317,11 @@ class Storage:
             "parquet_bytes": self.parquet_bytes,
             "events_key_conflict": self.events_key_conflict,
             "events_quarantined": self.events_quarantined,
+            "events_spooled": self.events_spooled,
+            "events_replayed": self.events_replayed,
+            "spool_pending_batch_count": sum(
+                1 for _ in self.pending_spool_dir.glob("pending-*.json")
+            ),
             "archive_corrupt_part_count": len(self.corrupt_parquet_parts),
             "archive_corrupt_part_paths": [Path(path).name for path in self.corrupt_parquet_parts[:20]],
             "archive_orphaned_partial_count": self.orphaned_partial_parts,
@@ -608,6 +615,7 @@ class Storage:
         if (
             self.parquet_buffer or not self.raw_capture_enabled
             or self.parquet_dropped_rows > 0
+            or any(self.pending_spool_dir.glob("pending-*.json"))
             or self.corrupt_parquet_parts or self.orphaned_partial_parts > 0
         ):
             return False
@@ -766,6 +774,57 @@ class Storage:
             }
             for row in rows
         ]
+
+    @property
+    def pending_spool_dir(self) -> Path:
+        return self.cfg.data_dir / "pending_market_batches"
+
+    def spool_batch(self, events: list[dict[str, Any]]) -> Path:
+        """Durable last-resort spool for a temporarily unavailable journal.
+
+        This is not a successful journal commit. Callers must report degraded
+        state and stop normal capture. The spool uses exclusive, atomically
+        finalized files and cannot silently overwrite another batch.
+        """
+        directory = self.pending_spool_dir
+        directory.mkdir(parents=True, exist_ok=True)
+        raw = json.dumps(
+            events,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        output = directory / f"pending-{uuid.uuid4().hex}.json"
+        temporary = output.with_suffix(".partial")
+        with temporary.open("xb") as handle:
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, output)
+        self.events_spooled += len(events)
+        return output
+
+    def replay_spooled_batches(self) -> int:
+        """Idempotently replay fully serialized batches after SQLite is available.
+
+        Never remove source spool data until its append (including conflict
+        version handling) returns without an exception.
+        """
+        directory = self.pending_spool_dir
+        if not directory.exists():
+            return 0
+        recovered = 0
+        for path in sorted(directory.glob("pending-*.json")):
+            with path.open("rb") as source:
+                payload = json.loads(source.read())
+            if not isinstance(payload, list) or not all(isinstance(item, dict) for item in payload):
+                raise ValueError(f"spooled event batch is malformed: {path.name}")
+            self.append_batch_resilient(payload)
+            path.unlink()
+            recovered += len(payload)
+        self.events_replayed += recovered
+        return recovered
 
     def _quarantine_invalid_event(self, event: dict[str, Any], exc: Exception) -> None:
         """Durably preserve the diagnostic representation before acknowledging an invalid event.
