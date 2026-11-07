@@ -431,6 +431,8 @@ class Collector:
         self.cfg = cfg
         self.run_id = uuid.uuid4().hex
         self.websocket_session_id: str | None = None
+        self.ws_gap_start_by_ticker: dict[str, tuple[str, float]] = {}
+        self.ws_last_message_monotonic: float | None = None
         self.first_seen_tickers: set[str] = set()
         self.first_rest_books: set[str] = set()
         self.first_executable_quotes: set[str] = set()
@@ -2738,6 +2740,7 @@ class Collector:
 
     async def websocket_loop(self) -> None:
         reconnect_delay = 1.0
+        connected_at: float | None = None
         while not self.stopping.is_set():
             self._invalidate_websocket_books()
             try:
@@ -2771,7 +2774,7 @@ class Collector:
                         websocket_state="READY",
                         reconnect_count=self.status.data.get("reconnect_count", 0) + 1,
                     )
-                    reconnect_delay = 1.0
+                    connected_at = time.monotonic()
                     self.websocket_session_id = uuid.uuid4().hex
                     await self.emit(
                         "websocket",
@@ -2847,12 +2850,20 @@ class Collector:
                     last_error=f"WebSocket connection ended: {type(exc).__name__}",
                 )
                 LOG.warning("WebSocket disconnected: %s", type(exc).__name__)
+                # Only reset exponential backoff after a stable connection;
+                # rapid resynchronization flaps must back off.
+                if connected_at is not None and time.monotonic() - connected_at >= 60:
+                    reconnect_delay = 1.0
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(30.0, reconnect_delay * 2)
+                connected_at = None
         self.websocket_session_id = None
         self.status.update(websocket_state="STOPPED")
 
     def _invalidate_websocket_books(self) -> None:
+        for ticker, book in self.books.items():
+            if book.synchronized and ticker not in self.ws_gap_start_by_ticker:
+                self.ws_gap_start_by_ticker[ticker] = (utc_now(), time.monotonic())
         self._publish_orderbook_sequence_state(connected=False)
         self.last_seq.clear()
         self.book_received_monotonic.clear()
@@ -3141,11 +3152,27 @@ class Collector:
 
     async def _receive_ws(self, ws: Any) -> None:
         async for message in ws:
+            received_wall = utc_now()
+            received_mono_ns = time.perf_counter_ns()
+            self.ws_last_message_monotonic = time.monotonic()
             try:
                 outer = json.loads(message)
             except json.JSONDecodeError:
                 await self.emit("websocket", "malformed_message", {"raw": str(message)[:2048]})
                 continue
+            # Preserve the original payload and record a separate ingest timing
+            # envelope. Millisecond exchange send time is diagnostic, not an
+            # exact wall-clock synchronization guarantee.
+            if not isinstance(outer, dict):
+                await self.emit("websocket", "malformed_message", {"raw_type": type(outer).__name__})
+                continue
+            outer["_collector_received"] = {
+                "run_id": self.run_id,
+                "websocket_session_id": self.websocket_session_id,
+                "received_utc": received_wall,
+                "received_monotonic_ns": received_mono_ns,
+                "sending_ts_ms": outer.get("sending_ts_ms"),
+            }
             kind = str(outer.get("type", "unknown"))
             if kind in {"subscribed", "unsubscribed", "ok", "error"}:
                 self._handle_subscription_response(outer)
@@ -3199,7 +3226,35 @@ class Collector:
                 self._record_orderbook_sequence(sid, seq, snapshot=True)
                 if str(ticker) in self.open_tickers:
                     book = self.books.setdefault(str(ticker), OrderBook())
-                    book.snapshot(payload)
+                    try:
+                        book.snapshot(payload)
+                    except ValueError as exc:
+                        book.invalidate()
+                        await self.emit(
+                            "websocket_orderbook", "invalid_snapshot",
+                            {"raw": outer, "reason": type(exc).__name__},
+                            str(ticker), exchange_ts,
+                            f"invalid-snapshot|{self.websocket_session_id}|{sid}|{seq}",
+                        )
+                        self._record_orderbook_sequence_failure(sid, "invalid snapshot content")
+                        await ws.close(code=1011, reason="invalid snapshot; resync required")
+                        return
+                    gap = self.ws_gap_start_by_ticker.pop(str(ticker), None)
+                    if gap is not None:
+                        await self.emit(
+                            "websocket_orderbook", "capture_gap_ended",
+                            {
+                                "ticker": str(ticker),
+                                "disconnected_utc": gap[0],
+                                "resynchronized_utc": received_wall,
+                                "elapsed_monotonic_seconds": round(time.monotonic() - gap[1], 3),
+                                "recovery": "FRESH_WS_SNAPSHOT",
+                                "intermediate_orderbook_deltas": "UNRECOVERED",
+                                "session_id": self.websocket_session_id,
+                            },
+                            str(ticker), exchange_ts,
+                            f"ws-gap-ended|{self.websocket_session_id}|{ticker}|{seq}",
+                        )
                     self.book_received_monotonic[str(ticker)] = time.monotonic()
                     self._mark_orderbook_quote(str(ticker))
                     await self.emit(
