@@ -446,6 +446,7 @@ class Storage:
                 )
                 try:
                     fingerprint_db.execute("SAVEPOINT parquet_part")
+                    observed_rows = 0
                     for batch in parquet_file.iter_batches(columns=columns, batch_size=5000):
                         fingerprints = []
                         for row in batch.to_pylist():
@@ -453,9 +454,32 @@ class Storage:
                                 row["kind"] = partition_kind
                             if row.get("dedupe_key") is not None:
                                 fingerprints.append((event_archive_fingerprint(row),))
+                        observed_rows += len(fingerprints)
                         fingerprint_db.executemany(insert_fingerprint, fingerprints)
                     fingerprint_db.execute("RELEASE SAVEPOINT parquet_part")
                     fingerprint_db.commit()
+                    # Existing finalized files may predate the manifest feature.
+                    # Register only after a complete readable scan; stream the
+                    # digest in bounded blocks and keep the files untouched.
+                    if self.connection.execute(
+                        "SELECT 1 FROM archive_manifests WHERE part_path = ?",
+                        (str(path.relative_to(self.cfg.parquet_dir)),),
+                    ).fetchone() is None:
+                        digest = hashlib.sha256()
+                        with path.open("rb") as archive_file:
+                            for block in iter(lambda: archive_file.read(1024 * 1024), b""):
+                                digest.update(block)
+                        self.connection.execute(
+                            "INSERT INTO archive_manifests VALUES (?, ?, ?, ?, ?)",
+                            (
+                                str(path.relative_to(self.cfg.parquet_dir)),
+                                observed_rows,
+                                path.stat().st_size,
+                                digest.hexdigest(),
+                                datetime.now(timezone.utc).isoformat(),
+                            ),
+                        )
+                        self.connection.commit()
                 except Exception as exc:
                     fingerprint_db.execute("ROLLBACK TO SAVEPOINT parquet_part")
                     fingerprint_db.execute("RELEASE SAVEPOINT parquet_part")
