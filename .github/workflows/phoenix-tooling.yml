@@ -1,0 +1,48 @@
+name: Phoenix tooling isolated bootstrap validation
+on:
+  push:
+    branches: [tooling/phoenix-codex-sandbox]
+  pull_request:
+    paths:
+      - 'tooling/phoenix-third-party/**'
+      - '.github/workflows/phoenix-tooling.yml'
+permissions:
+  contents: read
+jobs:
+  validate-no-side-effects:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse PowerShell without executing an installer
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          $script = 'tooling/phoenix-third-party/bootstrap.ps1'
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path $script).Path, [ref]$tokens, [ref]$errors
+          ) | Out-Null
+          if ($errors.Count -gt 0) { throw "PowerShell parse errors: $($errors -join '; ')" }
+      - name: Validate repository inventory
+        shell: pwsh
+        run: |
+          $manifest = Get-Content -LiteralPath tooling/phoenix-third-party/repos.json -Raw | ConvertFrom-Json
+          if ($manifest.repos.Count -ne 23) { throw 'Expected exactly 23 inventoried repositories' }
+          $names = @($manifest.repos | ForEach-Object { $_.repo })
+          if (@($names | Select-Object -Unique).Count -ne $names.Count) { throw 'Duplicate repository names' }
+          foreach ($item in $manifest.repos) {
+            if ($item.repo -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw "Bad repository: $($item.repo)" }
+            if ($item.url -cne "https://github.com/$($item.repo).git") { throw "Untrusted URL: $($item.url)" }
+          }
+      - name: Dry-run inventory without E drive, writes, or network
+        shell: pwsh
+        run: |
+          $raw = & ./tooling/phoenix-third-party/bootstrap.ps1
+          $inventory = ($raw | Out-String) | ConvertFrom-Json
+          if ($inventory.mode -ne 'INVENTORY_ONLY' -or $inventory.total_repository_sources -ne 23) {
+            throw 'Inventory-only mode returned unexpected result'
+          }
+          if (Test-Path -LiteralPath 'E:\PhoenixTooling') {
+            throw 'Inventory-only mode must never write E drive'
+          }
+          Write-Output "Validated inventory-only mode for $($inventory.total_repository_sources) repositories"
