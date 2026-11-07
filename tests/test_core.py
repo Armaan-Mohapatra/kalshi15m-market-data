@@ -2587,7 +2587,10 @@ class WriterLoopTests(unittest.IsolatedAsyncioTestCase):
             writer = asyncio.create_task(collector.writer_loop())
             try:
                 deadline = asyncio.get_running_loop().time() + 3
-                while store.parquet_buffer and asyncio.get_running_loop().time() < deadline:
+                while (
+                    (store.parquet_buffer or collector.status.data.get("parquet_last_flush_reason") != "IDLE_BUFFER_AGE")
+                    and asyncio.get_running_loop().time() < deadline
+                ):
                     await asyncio.sleep(0.05)
 
                 self.assertEqual(store.parquet_buffer, [])
