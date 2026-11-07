@@ -1361,7 +1361,7 @@ class ApiTests(unittest.TestCase):
 
         self.assertEqual(next_cursor, 4)
         self.assertEqual(added, 4)
-        self.assertEqual(len(api.market_series_calls), 4)
+        self.assertEqual(len(api.market_series_calls), 8)
         self.assertEqual(len(api.event_calls), 1)
         self.assertEqual(len(snapshot["markets"]), 4)
         self.assertTrue(all(row["duration_seconds"] == 900 for row in snapshot["markets"]))
@@ -2018,7 +2018,7 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(pq.ParquetFile(parquet_files[0]).read().num_rows, 1)
             self.assertEqual(pq.ParquetFile(parquet_files[0]).metadata.row_group(0).column(0).compression, "ZSTD")
 
-    def test_existing_deduplicated_events_skip_payload_normalization(self):
+    def test_existing_deduplicated_events_are_hash_checked(self):
         with TemporaryDirectory() as temporary:
             store = Storage(Settings(home=Path(temporary)))
             store.open()
@@ -2032,12 +2032,9 @@ class StorageTests(unittest.TestCase):
             }
             self.assertEqual(store.append_batch([event]), 1)
 
-            with patch.object(
-                store,
-                "_normalized",
-                side_effect=AssertionError("duplicate payload was normalized"),
-            ):
+            with patch.object(store, "_normalized", wraps=store._normalized) as normalized:
                 self.assertEqual(store.append_batch([event]), 0)
+            self.assertGreater(normalized.call_count, 0)
 
             self.assertEqual(store.events_duplicate, 1)
             self.assertEqual(len(store.parquet_buffer), 1)
@@ -2144,7 +2141,7 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(recovered.integrity_check(), "ok")
             recovered.close()
 
-    def test_clean_stopped_capture_skips_parquet_recovery(self):
+    def test_status_only_does_not_skip_archive_recovery(self):
         with TemporaryDirectory() as temporary:
             cfg = Settings(home=Path(temporary), min_free_bytes=0)
             cfg.runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -2162,7 +2159,7 @@ class StorageTests(unittest.TestCase):
             store = Storage(cfg)
             store.open()
 
-            self.assertEqual(store.parquet_recovery_state, "SKIPPED_PREVIOUS_RUN_STOPPED")
+            self.assertEqual(store.parquet_recovery_state, "VERIFIED_NO_GAP")
             self.assertEqual(store.parquet_recovery_rows, 0)
             store.close()
 
