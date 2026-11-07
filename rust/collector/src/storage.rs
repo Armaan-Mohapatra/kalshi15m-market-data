@@ -779,7 +779,7 @@ mod tests {
         let pending = store.outstanding_rows(10).unwrap();
         assert_eq!(pending.len(), 1);
         let part = archive::write_part(&store.archive_root, &pending).unwrap();
-        assert!(part.path.is_file());
+        assert!(store.archive_root.join(&part.path).is_file());
         assert_eq!(
             store
                 .conn
