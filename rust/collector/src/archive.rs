@@ -5,7 +5,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -173,7 +173,7 @@ pub fn read_part(path: &Path) -> Result<Vec<ArchiveRow>> {
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
     let mut reader = builder.with_batch_size(2048).build()?;
     let mut rows = Vec::new();
-    while let Some(batch) = reader.next() {
+    for batch in reader {
         let batch = batch?;
         let names = [
             "dedupe_key",

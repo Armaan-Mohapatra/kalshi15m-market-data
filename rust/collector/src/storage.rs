@@ -4,8 +4,8 @@ use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde_json::json;
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -411,7 +411,6 @@ impl Journal {
         }
         let parts = archive::list_final_parts(&self.archive_root, 10_000)?;
         let mut expected_rows: i64 = 0;
-        let mut observed_rows: i64 = 0;
         let count: i64 =
             self.conn
                 .query_row("SELECT COUNT(*) FROM rust_archive_index", [], |r| r.get(0))?;
@@ -475,8 +474,7 @@ impl Journal {
                 return Ok(false);
             }
         }
-        observed_rows = count;
-        Ok(observed_rows == expected_rows)
+        Ok(count == expected_rows)
     }
 
     pub fn close(mut self) -> Result<Stats> {

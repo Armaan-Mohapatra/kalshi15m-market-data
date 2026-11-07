@@ -1,5 +1,5 @@
 use crate::book::{BookState, OrderBook};
-use crate::event::{hash_bytes, utc_now, Event};
+use crate::event::{hash_bytes, Event};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use uuid::Uuid;
