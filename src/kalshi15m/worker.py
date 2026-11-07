@@ -804,6 +804,7 @@ class Collector:
             )
             return flushed_rows
 
+        spool_only = False
         while not self.stopping.is_set() or not self.queue.empty():
             batch: list[dict[str, Any]] = []
             try:
@@ -817,14 +818,45 @@ class Collector:
                 except asyncio.QueueEmpty:
                     break
             retry_count = 0
+            batch_spooled = False
             while True:
                 try:
-                    await loop.run_in_executor(
-                        self.writer_pool, self.storage.append_batch_resilient, batch
-                    )
+                    if spool_only:
+                        await loop.run_in_executor(
+                            self.writer_pool, self.storage.spool_batch, batch
+                        )
+                        batch_spooled = True
+                    else:
+                        await loop.run_in_executor(
+                            self.writer_pool, self.storage.append_batch_resilient, batch
+                        )
                     break
                 except Exception as exc:
                     retry_count += 1
+                    if retry_count >= 8:
+                        # Do not retry the same batch forever. Spool a complete
+                        # JSON batch durably and exit normal capture. If the
+                        # spool also fails, explicitly report non-durability.
+                        try:
+                            await loop.run_in_executor(
+                                self.writer_pool, self.storage.spool_batch, batch
+                            )
+                            batch_spooled = True
+                            spool_only = True
+                            self.stopping.set()
+                            self.status.update(
+                                storage_write_state="RECOVERY_SPOOLED_STOPPING",
+                                storage_pending_batch_events=len(batch),
+                                last_error=f"journal unavailable; batch spooled: {type(exc).__name__}",
+                            )
+                            break
+                        except Exception as spool_exc:
+                            self.stopping.set()
+                            self.status.update(
+                                storage_write_state="FATAL_NOT_DURABLE",
+                                last_error=f"journal and emergency spool failed: {type(spool_exc).__name__}",
+                            )
+                            raise RuntimeError("unable to persist collector events") from spool_exc
                     delay = min(0.25 * (2 ** min(retry_count - 1, 7)), 30.0)
                     try:
                         self.status.update(
@@ -851,14 +883,15 @@ class Collector:
                 self.queue.task_done()
             try:
                 self.status.update(
-                    storage_write_state="HEALTHY",
-                    storage_pending_batch_events=0,
+                    storage_write_state=("RECOVERY_SPOOLED_STOPPING" if batch_spooled else "HEALTHY"),
+                    storage_pending_batch_events=(len(batch) if batch_spooled else 0),
                     storage_last_write_error=None,
                     storage_last_write_retry_count=retry_count,
                 )
             except Exception:
                 LOG.exception("could not persist journal write status")
-            await flush_aged_buffer("BUSY_BUFFER_AGE")
+            if not spool_only:
+                await flush_aged_buffer("BUSY_BUFFER_AGE")
             storage_status = await loop.run_in_executor(
                 self.writer_pool, self.storage.connection_status
             )
@@ -3310,6 +3343,12 @@ class Collector:
         configure_logging(self.cfg)
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(self.writer_pool, self.storage.open)
+        # Replay only previously fsynced emergency batches before accepting
+        # any new market data; failures leave the originals on disk.
+        replayed = await loop.run_in_executor(
+            self.writer_pool, self.storage.replay_spooled_batches
+        )
+        self.status.update(emergency_spool_replayed_events=replayed)
         storage_status = await loop.run_in_executor(
             self.writer_pool, self.storage.connection_status
         )
@@ -3571,10 +3610,17 @@ class Collector:
                     task.cancel()
             if background_tasks:
                 await asyncio.gather(*background_tasks, return_exceptions=True)
-            await self.queue.join()
-            await writer
+            writer_failed = None
+            if writer.done():
+                try:
+                    writer.result()
+                except Exception as exc:
+                    writer_failed = f"{type(exc).__name__}: writer exited without durable acknowledgement"
+            if writer_failed is None:
+                await self.queue.join()
+                await writer
             metrics: dict[str, Any] = {}
-            storage_error = None
+            storage_error = writer_failed
             try:
                 await loop.run_in_executor(
                     self.writer_pool,
@@ -3593,7 +3639,7 @@ class Collector:
                     if storage_error is None:
                         storage_error = "Parquet or SQLite close failed"
                 self.status.update(
-                    service_state="STOPPED",
+                    service_state=("STOPPED" if storage_error is None else "STOPPED_STORAGE_UNVERIFIED"),
                     final_storage_metrics=metrics,
                     final_storage_error=storage_error,
                     parquet_archive_recovery_state=self.storage.parquet_recovery_state,
