@@ -60,6 +60,18 @@ The journal is authoritative. Parquet parts are staged to `.partial` and renamed
 
 Both the archive and the journal live under an isolated staging root. Python keeps responsibility for research/backtesting and any separately authorized PAPER strategy runtime.
 
+### Replay a finalized Phoenix WebSocket Parquet segment
+
+`tools/convert_recorded_ws_parquet.py` is a bounded, read-only adapter for finalized Phoenix Parquet exports. It verifies an adjacent source sidecar when present, preserves numeric-subscription raw protocol messages in source order, injects source-time/session replay metadata, excludes non-WebSocket rows, and writes a SHA-256 provenance manifest next to a new staging NDJSON file. It refuses to overwrite converter outputs or write under protected Phoenix/runtime roots. Never point `--output` into the source export tree.
+
+```powershell
+python tools/convert_recorded_ws_parquet.py `
+  --input E:\TradingNextData\kalshi\parquet\segment-00000186.parquet `
+  --output C:\Users\dakin\Projects\Kalshi15mRustStageResearch\segment186\segment186-ws.ndjson
+```
+
+Then replay the emitted raw frames with the offline `replay` command and an isolated `--home`. The adapter preserves all selected subscription frames so sequence checks are not computed from ticker-filtered fragments. Its output is a lossy projection of the source table: REST-only rows and source columns not needed by the WebSocket replay remain documented in the converter manifest and are not represented as WebSocket frames.
+
 ## Verification gates
 
 The crate must compile and pass isolated Windows/Linux CI, smoke-replay synthetic events to SQLite/Parquet, preserve all expected event IDs and conflict versions, classify WSS gaps accurately and reconstruct interrupted archive parts. **Production is not authorized** by these checks. We then need finalized market replay parity, Python PyArrow/SQLite compatibility, native Windows CPU/RAM/latency benchmarks and independent review before any deployment decision.
