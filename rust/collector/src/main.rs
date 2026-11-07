@@ -210,7 +210,11 @@ fn validate_staging_home(root: &Path) -> Result<PathBuf> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let home = validate_staging_home(&cli.home)?;
-    let mut journal = Journal::open(&home)?;
+    let mut journal = if matches!(&cli.action, Commands::Audit) {
+        Journal::open_readonly(&home)?
+    } else {
+        Journal::open(&home)?
+    };
     match cli.action {
         Commands::Replay { input, batch_size } => {
             let input = input.canonicalize().context("resolve replay input")?;
@@ -508,7 +512,6 @@ async fn main() -> Result<()> {
         Commands::Audit => {
             let report = journal.audit()?;
             let verified = journal.verify_archive()?;
-            journal.close()?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({

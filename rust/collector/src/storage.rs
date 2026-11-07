@@ -1,7 +1,7 @@
 use crate::archive::{self, ArchiveRow, PartInfo};
 use crate::event::{hash_bytes, utc_now, Event};
 use anyhow::{bail, Context, Result};
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -137,6 +137,27 @@ impl Journal {
         journal.discover_existing_parts(10_000)?;
         journal.replay_spool(10_000)?;
         Ok(journal)
+    }
+
+    /// Open an existing staging journal for audit without changing markers,
+    /// replaying spool files, or creating database objects.
+    pub fn open_readonly(home: &Path) -> Result<Self> {
+        let db_path = home.join("data").join("paper_ledger.sqlite3");
+        let archive_root = home.join("data").join("market_data");
+        if !db_path.is_file() || !archive_root.is_dir() {
+            bail!("staging journal or archive is missing; read-only audit cannot initialize it")
+        }
+        let conn = Connection::open_with_flags(
+            db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .context("open staging SQLite journal read-only")?;
+        Ok(Self {
+            home: home.to_path_buf(),
+            conn,
+            archive_root,
+            stats: Stats::default(),
+        })
     }
 
     /// Metadata-only capacity check for the isolated journal volume.
@@ -443,6 +464,10 @@ impl Journal {
     }
 
     pub fn verify_archive(&self) -> Result<bool> {
+        let pending_spool = self.home.join("data").join("rust_pending");
+        if pending_spool.exists() && fs::read_dir(pending_spool)?.next().is_some() {
+            return Ok(false);
+        }
         if self.unarchived_count()? > 0 {
             return Ok(false);
         }
@@ -563,9 +588,16 @@ impl Journal {
             [],
             |r| r.get(0),
         )?;
+        let spool_dir = self.home.join("data").join("rust_pending");
+        let pending_spool_entries = if spool_dir.is_dir() {
+            fs::read_dir(spool_dir)?.take(10_001).count()
+        } else {
+            0
+        };
         Ok(json!({
             "canonical_events":canonical, "conflicting_versions":variants,
             "unarchived":unarchived, "archive_marker":marker,
+            "pending_spool_entries":pending_spool_entries,
             "staging_home":self.home.to_string_lossy()
         }))
     }
@@ -606,6 +638,38 @@ mod tests {
             capacity_state(snapshot.disk_free_bytes, snapshot.wal_bytes)
         );
         journal.close().unwrap();
+    }
+
+    #[test]
+    fn readonly_audit_preserves_clean_marker_and_does_not_replay_spool() {
+        let home = tempfile::tempdir().unwrap();
+        let mut writer = Journal::open(home.path()).unwrap();
+        let event = Event::new("rest", "trade", None, json!({"id":9}), Some("audit".into()));
+        writer.ingest(&event).unwrap();
+        writer.close().unwrap();
+
+        let pending_dir = home.path().join("data").join("rust_pending");
+        fs::create_dir_all(&pending_dir).unwrap();
+        let pending = Event::new(
+            "rest",
+            "trade",
+            None,
+            json!({"id":10}),
+            Some("pending".into()),
+        );
+        let pending_path = pending_dir.join("pending.json");
+        fs::write(&pending_path, serde_json::to_vec(&pending).unwrap()).unwrap();
+
+        let readonly = Journal::open_readonly(home.path()).unwrap();
+        assert_eq!(
+            readonly.audit().unwrap()["archive_marker"],
+            "CLEAN_ARCHIVE_VERIFIED"
+        );
+        assert_eq!(readonly.audit().unwrap()["canonical_events"], 1);
+        assert_eq!(readonly.audit().unwrap()["pending_spool_entries"], 1);
+        assert!(!readonly.verify_archive().unwrap());
+        drop(readonly);
+        assert!(pending_path.is_file());
     }
 
     #[test]
