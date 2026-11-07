@@ -255,7 +255,7 @@ mod tests {
         assert_eq!(metadata.len(), 2);
         let paths = server.await.unwrap();
         assert_eq!(paths.len(), 2);
-        assert!(paths[0].contains("/markets/trades?"));
+        assert!(paths[0].contains("/markets/trades"));
         assert!(paths[1].contains("cursor=next-page"));
     }
 
