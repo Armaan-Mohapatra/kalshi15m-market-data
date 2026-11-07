@@ -762,6 +762,50 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_after_parquet_finalization_reconciles_orphan_part() {
+        let home = tempfile::tempdir().unwrap();
+        let mut store = Journal::open(home.path()).unwrap();
+        let event = Event::new(
+            "rest",
+            "trade",
+            Some("T"),
+            json!({"id":"finalized-before-manifest"}),
+            Some("T-finalized-before-manifest".into()),
+        );
+        assert_eq!(store.ingest(&event).unwrap(), IngestResult::Inserted);
+
+        // Simulate a process exit after the part is atomically finalized but
+        // before its SQLite manifest/index transaction commits.
+        let pending = store.outstanding_rows(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        let part = archive::write_part(&store.archive_root, &pending).unwrap();
+        assert!(part.path.is_file());
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM archive_manifests", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        drop(store);
+
+        let mut recovered = Journal::open(home.path()).unwrap();
+        assert_eq!(recovered.unarchived_count().unwrap(), 0);
+        assert_eq!(recovered.audit().unwrap()["canonical_events"], 1);
+        assert!(recovered.verify_archive().unwrap());
+        assert_eq!(
+            recovered
+                .conn
+                .query_row("SELECT COUNT(*) FROM archive_manifests", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        recovered.close().unwrap();
+    }
+
+    #[test]
     fn spool_survives_restart_and_acknowledges_only_after_replay() {
         let home = tempfile::tempdir().unwrap();
         let store = Journal::open(home.path()).unwrap();
