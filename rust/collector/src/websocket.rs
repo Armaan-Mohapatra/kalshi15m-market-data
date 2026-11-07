@@ -1,8 +1,245 @@
 use crate::book::{BookState, OrderBook};
 use crate::event::{hash_bytes, Event};
+use anyhow::{anyhow, bail, Context, Result};
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
+use ed25519_dalek::pkcs8::DecodePrivateKey as EdDecodePrivateKey;
+use ed25519_dalek::Signer as EdSigner;
+use futures_util::{SinkExt, StreamExt};
+use rsa::pkcs1::DecodeRsaPrivateKey;
+use rsa::pkcs8::DecodePrivateKey as RsaDecodePrivateKey;
+use rsa::signature::{RandomizedSigner, SignatureEncoding};
+use rsa::RsaPrivateKey;
 use serde_json::{json, Value};
+use sha2::Sha256;
 use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
+use std::time::Duration;
+use tokio::sync::{mpsc, watch};
+use tokio_tungstenite::connect_async_with_config;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::header::{HeaderName, HeaderValue};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
+
+const KALSHI_WS_URL: &str = "wss://external-api-ws.kalshi.com/trade-api/ws/v2";
+const KALSHI_WS_PATH: &str = "/trade-api/ws/v2";
+
+/// Produces Kalshi handshake headers from a private key supplied explicitly by
+/// the staging operator. The caller owns key discovery; this module never
+/// searches environment variables or Phoenix authority paths.
+pub fn authentication_headers(
+    key_id: &str,
+    pem: &str,
+    timestamp_ms: u64,
+) -> Result<[(&'static str, String); 3]> {
+    if key_id.trim().is_empty()
+        || key_id.len() > 256
+        || key_id.contains('\r')
+        || key_id.contains('\n')
+    {
+        bail!("invalid Kalshi API key identifier")
+    }
+    let pre_sign = format!("{timestamp_ms}GET{KALSHI_WS_PATH}");
+    let signature = if pem.contains("BEGIN PRIVATE KEY") && !pem.contains("BEGIN RSA PRIVATE KEY") {
+        if let Ok(key) = ed25519_dalek::SigningKey::from_pkcs8_pem(pem) {
+            BASE64.encode(key.sign(pre_sign.as_bytes()).to_bytes())
+        } else if let Ok(key) = RsaPrivateKey::from_pkcs8_pem(pem) {
+            sign_rsa(&key, pre_sign.as_bytes())?
+        } else {
+            bail!("private key PEM is neither supported Ed25519 nor RSA PKCS#8")
+        }
+    } else {
+        let key = RsaPrivateKey::from_pkcs1_pem(pem)
+            .or_else(|_| RsaPrivateKey::from_pkcs8_pem(pem))
+            .context("parse RSA private key PEM")?;
+        sign_rsa(&key, pre_sign.as_bytes())?
+    };
+    Ok([
+        ("KALSHI-ACCESS-KEY", key_id.to_owned()),
+        ("KALSHI-ACCESS-SIGNATURE", signature),
+        ("KALSHI-ACCESS-TIMESTAMP", timestamp_ms.to_string()),
+    ])
+}
+
+fn sign_rsa(key: &RsaPrivateKey, message: &[u8]) -> Result<String> {
+    let signing_key = rsa::pss::SigningKey::<Sha256>::new_with_salt_len(key.clone(), 32);
+    let signature = signing_key
+        .sign_with_rng(&mut rand::thread_rng(), message)
+        .to_vec();
+    Ok(BASE64.encode(signature))
+}
+
+#[derive(Clone, Debug)]
+pub struct WebSocketConfigStage {
+    pub url: String,
+    pub key_id: String,
+    pub private_key_path: PathBuf,
+    pub market_tickers: Vec<String>,
+    pub allow_network: bool,
+    pub reconnect_initial: Duration,
+    pub reconnect_max: Duration,
+    pub output_capacity: usize,
+}
+
+impl WebSocketConfigStage {
+    pub fn validate(&self) -> Result<()> {
+        if !self.allow_network {
+            bail!("WebSocket access is disabled without the explicit operational gate")
+        }
+        if self.url != KALSHI_WS_URL {
+            bail!("WebSocket URL must be the documented Kalshi production market-data endpoint")
+        }
+        if self.key_id.trim().is_empty() || self.private_key_path.as_os_str().is_empty() {
+            bail!("explicit API key ID and private-key path are required")
+        }
+        if self.market_tickers.is_empty() || self.market_tickers.len() > 1000 {
+            bail!("WebSocket requires 1..=1000 explicit market tickers")
+        }
+        if self.output_capacity == 0 || self.output_capacity > 100_000 {
+            bail!("WebSocket event queue capacity outside 1..=100000")
+        }
+        if self.reconnect_initial.is_zero() || self.reconnect_max < self.reconnect_initial {
+            bail!("invalid WebSocket reconnect backoff bounds")
+        }
+        for ticker in &self.market_tickers {
+            if ticker.is_empty()
+                || ticker.len() > 128
+                || ticker.contains('\r')
+                || ticker.contains('\n')
+            {
+                bail!("invalid WebSocket market ticker")
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Authenticated transport. Construction is intentionally separate from the
+/// replay engine, and this run loop is never invoked by ordinary CLI startup.
+pub struct AuthenticatedWebSocket {
+    config: WebSocketConfigStage,
+}
+
+impl AuthenticatedWebSocket {
+    pub fn new(config: WebSocketConfigStage) -> Result<Self> {
+        config.validate()?;
+        Ok(Self { config })
+    }
+
+    /// Reconnects with bounded exponential backoff, resubscribes on each new
+    /// socket, and emits every raw frame and derived health event through a
+    /// bounded queue. Queue pressure blocks reads and therefore propagates
+    /// backpressure instead of silently dropping exchange frames.
+    pub async fn run(
+        &self,
+        mut shutdown: watch::Receiver<bool>,
+        events: mpsc::Sender<Event>,
+    ) -> Result<()> {
+        self.config.validate()?;
+        let pem = tokio::fs::read_to_string(&self.config.private_key_path)
+            .await
+            .context("read explicitly configured WebSocket private key")?;
+        let mut engine = WebsocketEngine::new();
+        let mut delay = self.config.reconnect_initial;
+        loop {
+            if *shutdown.borrow() || events.is_closed() {
+                return Ok(());
+            }
+            match self
+                .run_session(&pem, &mut engine, &shutdown, &events)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    let mut failure = Event::new(
+                        "websocket_health",
+                        "connection_interrupted",
+                        None,
+                        json!({"error":error.to_string(),"next_action":"RECONNECT_AND_RESUBSCRIBE_WITH_FRESH_SNAPSHOT"}),
+                        Some(format!("ws-transport-error|{}", Uuid::new_v4().simple())),
+                    );
+                    failure.exchange_ts = None;
+                    events
+                        .send(failure)
+                        .await
+                        .map_err(|_| anyhow!("WebSocket event receiver closed"))?;
+                    engine.reconnect();
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {},
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() { return Ok(()); }
+                        }
+                    }
+                    delay = delay.saturating_mul(2).min(self.config.reconnect_max);
+                }
+            }
+        }
+    }
+
+    async fn run_session(
+        &self,
+        pem: &str,
+        engine: &mut WebsocketEngine,
+        shutdown: &watch::Receiver<bool>,
+        events: &mpsc::Sender<Event>,
+    ) -> Result<()> {
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis() as u64;
+        let auth = authentication_headers(&self.config.key_id, pem, timestamp_ms)?;
+        let mut request = self.config.url.as_str().into_client_request()?;
+        for (name, value) in auth {
+            request.headers_mut().insert(
+                HeaderName::from_bytes(name.as_bytes())?,
+                HeaderValue::from_str(&value)?,
+            );
+        }
+        let ws_config = WebSocketConfig::default();
+        let (mut socket, _) = connect_async_with_config(request, Some(ws_config), false)
+            .await
+            .context("authenticated Kalshi WebSocket handshake failed")?;
+        let subscription = json!({
+            "id":1,
+            "cmd":"subscribe",
+            "params":{"channels":["orderbook_delta","trade"],"market_tickers":self.config.market_tickers}
+        });
+        socket
+            .send(Message::Text(subscription.to_string().into()))
+            .await?;
+        loop {
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        let _ = socket.close(None).await;
+                        return Ok(());
+                    }
+                }
+                next = socket.next() => match next {
+                    Some(Ok(Message::Text(raw))) => {
+                        let parsed: Value = serde_json::from_str(&raw).context("invalid WebSocket JSON frame")?;
+                        for event in engine.handle(parsed) {
+                            events.send(event).await.map_err(|_| anyhow!("WebSocket event receiver closed"))?;
+                        }
+                    }
+                    Some(Ok(Message::Binary(raw))) => {
+                        let parsed: Value = serde_json::from_slice(&raw).context("invalid binary WebSocket JSON frame")?;
+                        for event in engine.handle(parsed) {
+                            events.send(event).await.map_err(|_| anyhow!("WebSocket event receiver closed"))?;
+                        }
+                    }
+                    Some(Ok(Message::Ping(payload))) => socket.send(Message::Pong(payload)).await?,
+                    Some(Ok(Message::Pong(_))) => {},
+                    Some(Ok(Message::Close(frame))) => return Err(anyhow!("WebSocket peer closed: {frame:?}")),
+                    Some(Ok(_)) => {},
+                    Some(Err(error)) => return Err(error.into()),
+                    None => return Err(anyhow!("WebSocket stream ended")),
+                }
+            }
+        }
+    }
+}
 
 /// Sequence state belongs to the subscription, NOT the market. A first
 /// snapshot may carry seq=2; interleaved markets share their subscription ID.
@@ -177,6 +414,10 @@ impl Default for WebsocketEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::pkcs8::EncodePrivateKey as EdEncodePrivateKey;
+    use rand::rngs::OsRng;
+    use rsa::pkcs8::EncodePrivateKey as RsaEncodePrivateKey;
+    use rsa::signature::Verifier;
     #[test]
     fn first_sequence_two_is_not_a_gap_and_interleaving_valid() {
         let mut ws = WebsocketEngine::with_session("a");
@@ -216,5 +457,53 @@ mod tests {
         ws.reconnect();
         let b = ws.handle(input)[0].key().unwrap();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn kalshi_ed25519_auth_header_signs_exact_handshake_payload() {
+        let key = ed25519_dalek::SigningKey::generate(&mut OsRng);
+        let pem = key
+            .to_pkcs8_pem(ed25519_dalek::pkcs8::LineEnding::LF)
+            .unwrap();
+        let headers = authentication_headers("test-key", pem.as_str(), 1_700_000_000_123).unwrap();
+        let payload = b"1700000000123GET/trade-api/ws/v2";
+        let signature = BASE64.decode(&headers[1].1).unwrap();
+        let signature = ed25519_dalek::Signature::from_slice(&signature).unwrap();
+        key.verifying_key().verify(payload, &signature).unwrap();
+        assert_eq!(headers[0], ("KALSHI-ACCESS-KEY", "test-key".to_owned()));
+        assert_eq!(headers[2].1, "1700000000123");
+    }
+
+    #[test]
+    fn kalshi_rsa_auth_header_uses_pss_sha256_digest_salt() {
+        let key = RsaPrivateKey::new(&mut OsRng, 2048).unwrap();
+        let pem = key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF).unwrap();
+        let headers = authentication_headers("test-key", pem.as_str(), 42).unwrap();
+        let signature = BASE64.decode(&headers[1].1).unwrap();
+        let verifying_key =
+            rsa::pss::VerifyingKey::<Sha256>::new_with_salt_len(key.to_public_key(), 32);
+        let signature = rsa::pss::Signature::try_from(signature.as_slice()).unwrap();
+        verifying_key
+            .verify(b"42GET/trade-api/ws/v2", &signature)
+            .unwrap();
+    }
+
+    #[test]
+    fn authenticated_transport_requires_explicit_gate_and_official_endpoint() {
+        let base = WebSocketConfigStage {
+            url: KALSHI_WS_URL.to_owned(),
+            key_id: "staging-key".to_owned(),
+            private_key_path: PathBuf::from("staging-only.pem"),
+            market_tickers: vec!["KXBTC15M-TEST".to_owned()],
+            allow_network: false,
+            reconnect_initial: Duration::from_secs(1),
+            reconnect_max: Duration::from_secs(30),
+            output_capacity: 512,
+        };
+        assert!(AuthenticatedWebSocket::new(base.clone()).is_err());
+        let mut enabled = base;
+        enabled.allow_network = true;
+        enabled.url = "wss://attacker.invalid/trade-api/ws/v2".to_owned();
+        assert!(AuthenticatedWebSocket::new(enabled).is_err());
     }
 }
