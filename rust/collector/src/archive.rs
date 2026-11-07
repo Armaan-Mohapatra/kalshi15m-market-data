@@ -52,7 +52,9 @@ fn sanitize_kind(kind: &str) -> String {
 pub fn hash_file(path: &Path) -> Result<String> {
     let mut source = File::open(path)?;
     let mut hasher = Sha256::new();
-    let mut buf = [0u8; 1024 * 1024];
+    // Windows main threads have limited default stack space. Keep the
+    // bounded checksum buffer on the heap, not a 1 MiB stack allocation.
+    let mut buf = vec![0u8; 64 * 1024];
     loop {
         let n = source.read(&mut buf)?;
         if n == 0 { break }
