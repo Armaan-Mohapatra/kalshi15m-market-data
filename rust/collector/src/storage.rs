@@ -76,6 +76,11 @@ impl Journal {
                 value TEXT NOT NULL,
                 updated_utc TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS rust_archive_issues (
+                part_path TEXT PRIMARY KEY,
+                failure TEXT NOT NULL,
+                detected_utc TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS rust_archive_index (
                 dedupe_key TEXT NOT NULL,
                 payload_sha256 TEXT NOT NULL,
@@ -258,24 +263,64 @@ impl Journal {
         Ok(archived)
     }
 
+    fn revoke_archive_part(&mut self, name: &str, reason: &str) -> Result<()> {
+        // Do not delete or move any source/archive bytes. Only revoke the
+        // staging index that previously claimed an unavailable/corrupt part.
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("DELETE FROM rust_archive_index WHERE part_path=?1",[name])?;
+        tx.execute("DELETE FROM archive_manifests WHERE part_path=?1",[name])?;
+        tx.execute(
+            "INSERT OR REPLACE INTO rust_archive_issues VALUES (?1,?2,?3)",
+            params![name,reason,utc_now()]
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     fn discover_existing_parts(&mut self, max_files: usize) -> Result<()> {
         let parts = archive::list_final_parts(&self.archive_root, max_files)?;
+        // Verify manifests and index targets even when the file is absent.
+        // An orphaned index must not hide missing data from reconciliation.
+        let tracked = {
+            let mut stmt = self.conn.prepare(
+                "SELECT part_path FROM archive_manifests UNION SELECT part_path FROM rust_archive_index"
+            )?;
+            let result = stmt.query_map([],|r|r.get::<_,String>(0))?;
+            result.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if tracked.len() > max_files { bail!("too many staged archive manifest entries") }
+        for name in tracked {
+            if !self.archive_root.join(&name).is_file() {
+                self.revoke_archive_part(&name, "MISSING_FINALIZED_PART")?;
+            }
+        }
         for part in parts {
             let name = part.strip_prefix(&self.archive_root)?
                 .to_string_lossy().replace('\\', "/");
-            let actual_sha = archive::hash_file(&part)?;
+            let actual_sha = match archive::hash_file(&part) {
+                Ok(digest) => digest,
+                Err(_) => {
+                    self.revoke_archive_part(&name,"UNREADABLE_FINALIZED_PART")?;
+                    continue;
+                }
+            };
             let expected: Option<String> = self.conn.query_row(
                 "SELECT sha256 FROM archive_manifests WHERE part_path=?1", [&name],
                 |row| row.get(0),
             ).optional()?;
             if let Some(expected_sha) = expected {
                 if actual_sha != expected_sha {
-                    bail!("archive part hash mismatch: {} (original retained)", name)
+                    self.revoke_archive_part(&name,"CORRUPT_SHA256_MISMATCH")?;
+                    continue;
                 }
             }
-            // Also rebuild the index if the manifest transaction was interrupted
-            // or index entries were lost (never trust a clean status file).
-            let rows = archive::read_part(&part)?;
+            let rows = match archive::read_part(&part) {
+                Ok(rows) => rows,
+                Err(_) => {
+                    self.revoke_archive_part(&name,"CORRUPT_PARQUET_DATA")?;
+                    continue;
+                }
+            };
             let meta = PartInfo {
                 path: name, rows: rows.len(), bytes: part.metadata()?.len(),
                 sha256: actual_sha,
@@ -287,6 +332,41 @@ impl Journal {
 
     pub fn verify_archive(&self) -> Result<bool> {
         if self.unarchived_count()? > 0 { return Ok(false) }
+        let broken: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM rust_archive_issues WHERE failure LIKE 'CORRUPT_%' OR failure='UNREADABLE_FINALIZED_PART'",
+            [],|r|r.get(0)
+        )?;
+        if broken > 0 { return Ok(false) }
+        let parts = archive::list_final_parts(&self.archive_root, 10_000)?;
+        let mut expected_rows: i64 = 0;
+        let mut observed_rows: i64 = 0;
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM rust_archive_index",[],|r|r.get(0)
+        )?;
+        let canonical: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM market_events",[],|r|r.get(0)
+        )?;
+        let conflicts: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM market_event_versions",[],|r|r.get(0)
+        )?;
+        if count != canonical + conflicts { return Ok(false) }
+        if parts.len() != self.conn.query_row(
+            "SELECT COUNT(*) FROM archive_manifests",[],|r|r.get::<_,i64>(0)
+        )? as usize { return Ok(false) }
+        // Presence of any incomplete temporary part prevents a clean marker.
+        for date in std::fs::read_dir(&self.archive_root)? {
+            let date=date?;
+            if !date.file_type()?.is_dir() {continue}
+            for kind in std::fs::read_dir(date.path())? {
+                let kind=kind?;
+                if !kind.file_type()?.is_dir() {continue}
+                for file in std::fs::read_dir(kind.path())? {
+                    if file?.path().extension().and_then(|e|e.to_str())==Some("partial") {
+                        return Ok(false)
+                    }
+                }
+            }
+        }
         let mut statement = self.conn.prepare(
             "SELECT part_path, row_count, byte_count, sha256 FROM archive_manifests"
         )?;
@@ -295,14 +375,16 @@ impl Journal {
                 r.get::<_, i64>(2)?, r.get::<_, String>(3)?))
         })?;
         for check in checks {
-            let (name, _rows, bytes, checksum) = check?;
+            let (name, rows, bytes, checksum) = check?;
+            expected_rows += rows;
             let path = self.archive_root.join(name);
             if !path.is_file() || path.metadata()?.len() != bytes as u64
                 || archive::hash_file(&path)? != checksum {
                 return Ok(false)
             }
         }
-        Ok(true)
+        observed_rows = count;
+        Ok(observed_rows == expected_rows)
     }
 
     pub fn close(mut self) -> Result<Stats> {
