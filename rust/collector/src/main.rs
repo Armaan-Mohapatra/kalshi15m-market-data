@@ -49,6 +49,14 @@ fn validate_staging_home(root: &Path) -> Result<PathBuf> {
     if root.is_file() {bail!("--home points to a file")}
     std::fs::create_dir_all(root)?;
     let home = root.canonicalize().context("resolve staging root")?;
+    let resolved = home.to_string_lossy().to_ascii_lowercase().replace('/', "\\");
+    for prohibited in [
+        "tradingnextdata", "kalshiruntime", "\\kalshi15mnative", "\\production\\"
+    ] {
+        if resolved.contains(prohibited) {
+            bail!("canonical staging path resolves inside a protected source root")
+        }
+    }
     if home.components().count() < 3 {
         bail!("staging root too broad; choose a dedicated child directory")
     }
