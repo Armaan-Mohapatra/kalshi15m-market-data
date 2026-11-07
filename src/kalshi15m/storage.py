@@ -189,6 +189,17 @@ class Storage:
             )"""
         )
         self.connection.execute(
+            """CREATE TABLE IF NOT EXISTS archive_manifest_history (
+                observation_id TEXT PRIMARY KEY,
+                part_path TEXT NOT NULL,
+                prior_row_count INTEGER NOT NULL,
+                prior_byte_count INTEGER NOT NULL,
+                prior_sha256 TEXT NOT NULL,
+                observed_utc TEXT NOT NULL,
+                reason TEXT NOT NULL
+            )"""
+        )
+        self.connection.execute(
             """CREATE TABLE IF NOT EXISTS collector_markers (
                 marker TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
@@ -264,6 +275,7 @@ class Storage:
             and self._archive_manifest_files_present()
         ):
             self.parquet_recovery_state = "SKIPPED_VERIFIED_SHUTDOWN_MARKER"
+            self.parquet_unrecovered_rows = 0
         else:
             try:
                 self.parquet_recovery_rows = self.recover_parquet_archive()
@@ -393,6 +405,39 @@ class Storage:
         self.corrupt_parquet_parts = []
         if self.connection is None:
             raise RuntimeError("Storage is not open")
+        # Never treat a missing or changed file's original manifest as active.
+        # Preserve its original size/digest in durable history, then allow a
+        # replacement Parquet part to be reconciled from the SQLite journal.
+        previous_parts = self.connection.execute(
+            "SELECT part_path, row_count, byte_count, sha256 FROM archive_manifests"
+        ).fetchall()
+        invalid = []
+        for name, rows, size, digest in previous_parts:
+            source = self.cfg.parquet_dir / str(name)
+            try:
+                if not source.is_file() or source.stat().st_size != int(size):
+                    invalid.append((name, rows, size, digest, "MISSING_OR_RESIZED"))
+                    continue
+            except OSError:
+                invalid.append((name, rows, size, digest, "UNREADABLE_STAT"))
+        if invalid:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                for name, rows, size, digest, reason in invalid:
+                    self.connection.execute(
+                        "INSERT INTO archive_manifest_history VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            uuid.uuid4().hex, name, int(rows), int(size), digest,
+                            datetime.now(timezone.utc).isoformat(), reason,
+                        ),
+                    )
+                    self.connection.execute(
+                        "DELETE FROM archive_manifests WHERE part_path = ?", (name,)
+                    )
+                self.connection.commit()
+            except Exception:
+                self.connection.rollback()
+                raise
         if self.parquet_bytes >= self.cfg.raw_data_budget_bytes:
             self.raw_capture_enabled = False
             self.parquet_recovery_state = "SKIPPED_RAW_BUDGET"
