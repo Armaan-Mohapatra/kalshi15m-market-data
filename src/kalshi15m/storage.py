@@ -129,6 +129,8 @@ class Storage:
         self.parquet_dropped_rows = self.previous_parquet_dropped_rows
         self.parquet_recovery_state = "NOT_RUN"
         self.parquet_recovery_rows = 0
+        self.corrupt_parquet_parts: list[str] = []
+        self.orphaned_partial_parts = 0
         self.persistence_audit_interval_seconds = 15.0
         self.persistence_audit_last_monotonic = 0.0
         self.persistence_audit_cache: dict[str, Any] = {}
@@ -165,6 +167,22 @@ class Storage:
                 payload_sha256 TEXT NOT NULL,
                 PRIMARY KEY (source_generation, row_sha256)
             ) WITHOUT ROWID"""
+        )
+        self.connection.execute(
+            """CREATE TABLE IF NOT EXISTS archive_manifests (
+                part_path TEXT PRIMARY KEY,
+                row_count INTEGER NOT NULL,
+                byte_count INTEGER NOT NULL,
+                sha256 TEXT NOT NULL,
+                committed_utc TEXT NOT NULL
+            )"""
+        )
+        self.connection.execute(
+            """CREATE TABLE IF NOT EXISTS collector_markers (
+                marker TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_utc TEXT NOT NULL
+            )"""
         )
         self.connection.execute(
             """CREATE TABLE IF NOT EXISTS quarantined_market_events (
@@ -215,14 +233,23 @@ class Storage:
         self.latest_market_event_received_utc = str(latest_event[0]) if latest_event else None
         self.parquet_bytes = self._parquet_directory_size()
         self.sqlite_bytes = self._sqlite_size()
-        previous_capture_incomplete = (
-            self.previous_parquet_dropped_rows > 0
-            or self.previous_raw_capture_state not in (None, "ENABLED")
+        # A status.json label is not an archival commit marker. The previous
+        # process must have durably verified its final archive before skip is
+        # allowed. Missing/old schemas always go through reconciliation.
+        previous_marker = self.connection.execute(
+            "SELECT value FROM collector_markers WHERE marker = 'archive_shutdown'"
+        ).fetchone()
+        self.connection.execute(
+            "INSERT OR REPLACE INTO collector_markers VALUES (?, ?, ?)",
+            ("archive_shutdown", "RUNNING_UNVERIFIED", datetime.now(timezone.utc).isoformat()),
         )
-        if (
-            self.previous_service_state
-            and self.previous_service_state != "STOPPED"
-        ) or previous_capture_incomplete:
+        self.connection.commit()
+        self.orphaned_partial_parts = sum(
+            1 for _ in self.cfg.parquet_dir.rglob("*.partial")
+        )
+        if previous_marker and previous_marker[0] == "CLEAN_ARCHIVE_VERIFIED":
+            self.parquet_recovery_state = "SKIPPED_VERIFIED_SHUTDOWN_MARKER"
+        else:
             try:
                 self.parquet_recovery_rows = self.recover_parquet_archive()
                 if self.parquet_recovery_state == "NOT_RUN":
@@ -230,8 +257,6 @@ class Storage:
             except Exception as exc:
                 self.parquet_recovery_state = f"FAILED_{type(exc).__name__}"
                 LOG.exception("Parquet archive recovery failed; SQLite journal remains available")
-        else:
-            self.parquet_recovery_state = "SKIPPED_PREVIOUS_RUN_STOPPED"
 
     @staticmethod
     def _file_identity(path: Path) -> tuple[int, int] | None:
@@ -368,7 +393,13 @@ class Storage:
             )
             insert_fingerprint = "INSERT OR IGNORE INTO archived_fingerprints VALUES (?)"
             for path in self.cfg.parquet_dir.rglob("*.parquet"):
-                parquet_file = pq.ParquetFile(path)
+                try:
+                    parquet_file = pq.ParquetFile(path)
+                except Exception as exc:
+                    # Preserve source files intact; the journal is canonical.
+                    self.corrupt_parquet_parts.append(str(path))
+                    LOG.error("unreadable Parquet part recorded for repair: %s (%s)", path, type(exc).__name__)
+                    continue
                 names = set(parquet_file.schema_arrow.names)
                 columns = [
                     name
@@ -389,15 +420,20 @@ class Storage:
                     if path.parent.name.startswith("kind=")
                     else None
                 )
-                for batch in parquet_file.iter_batches(columns=columns, batch_size=5000):
-                    fingerprints = []
-                    for row in batch.to_pylist():
-                        if "kind" not in row:
-                            row["kind"] = partition_kind
-                        if row.get("dedupe_key") is not None:
-                            fingerprints.append((event_archive_fingerprint(row),))
-                    fingerprint_db.executemany(insert_fingerprint, fingerprints)
-                fingerprint_db.commit()
+                try:
+                    for batch in parquet_file.iter_batches(columns=columns, batch_size=5000):
+                        fingerprints = []
+                        for row in batch.to_pylist():
+                            if "kind" not in row:
+                                row["kind"] = partition_kind
+                            if row.get("dedupe_key") is not None:
+                                fingerprints.append((event_archive_fingerprint(row),))
+                        fingerprint_db.executemany(insert_fingerprint, fingerprints)
+                    fingerprint_db.commit()
+                except Exception as exc:
+                    self.corrupt_parquet_parts.append(str(path))
+                    LOG.error("unreadable Parquet row group: %s (%s)", path, type(exc).__name__)
+                    continue
 
             assert self.connection is not None
             tables = ["market_events"]
@@ -458,7 +494,9 @@ class Storage:
         self.parquet_bytes = sum(
             path.stat().st_size for path in self.cfg.parquet_dir.rglob("*.parquet")
         )
-        if self.parquet_recovery_state == "NOT_RUN":
+        if self.corrupt_parquet_parts:
+            self.parquet_recovery_state = "REPAIRED_WITH_CORRUPT_PARTS_STILL_PRESENT"
+        elif self.parquet_recovery_state == "NOT_RUN":
             self.parquet_recovery_state = "RECOVERED_MISSING_ROWS" if recovered else "VERIFIED_NO_GAP"
         return recovered
 
@@ -845,9 +883,27 @@ class Storage:
                     os.fsync(handle.fileno())
                 os.replace(temporary, output)
             except Exception:
-                temporary.unlink(missing_ok=True)
+                # Leave the .partial file for forensic recovery; never silently
+                # remove evidence of an interrupted archive commit.
                 raise
-            self.parquet_bytes += output.stat().st_size
+            size = output.stat().st_size
+            digest = hashlib.sha256()
+            with output.open("rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            if self.connection is not None:
+                self.connection.execute(
+                    "INSERT OR REPLACE INTO archive_manifests VALUES (?, ?, ?, ?, ?)",
+                    (
+                        str(output.relative_to(self.cfg.parquet_dir)),
+                        len(batch),
+                        size,
+                        digest.hexdigest(),
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+                self.connection.commit()
+            self.parquet_bytes += size
 
     def integrity_check(self) -> str:
         if self.connection is None:
