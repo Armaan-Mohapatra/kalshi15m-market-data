@@ -51,16 +51,17 @@ impl PublicRest {
             bail!("route is not in the read-only GET allowlist: {path}")
         }
         let mut last = self.last_at.lock().await;
-        if let Some(earlier) = *last {
-            let due = earlier + self.min_spacing;
-            if let Some(wait) = due.checked_duration_since(Instant::now()) {
-                tokio::time::sleep(wait).await;
-            }
-        }
         // Serializing the GET budget through this mutex ensures no other
         // caller can bypass the configured minimum spacing.
         let mut last_error = anyhow!("not attempted");
         for retry in 0..4u32 {
+            // Apply the spacing budget to every attempt, including retries.
+            if let Some(earlier) = *last {
+                let due = earlier + self.min_spacing;
+                if let Some(wait) = due.checked_duration_since(Instant::now()) {
+                    tokio::time::sleep(wait).await;
+                }
+            }
             *last = Some(Instant::now());
             let started = Instant::now();
             let requested = utc_now();
@@ -77,7 +78,17 @@ impl PublicRest {
                     if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
                         last_error = anyhow!("Kalshi REST {status} on {path}");
                         if retry < 3 {
-                            tokio::time::sleep(Duration::from_millis(250 * 2u64.pow(retry))).await;
+                            let fallback = Duration::from_millis(250 * 2u64.pow(retry));
+                            let retry_after = resp
+                                .headers()
+                                .get(reqwest::header::RETRY_AFTER)
+                                .and_then(|value| value.to_str().ok())
+                                .and_then(|value| value.parse::<u64>().ok())
+                                .map(|seconds| Duration::from_secs(seconds.min(60)))
+                                .unwrap_or(fallback);
+                            let minimum_spacing =
+                                self.min_spacing.saturating_sub(started.elapsed());
+                            tokio::time::sleep(retry_after.max(minimum_spacing)).await;
                             continue;
                         }
                         break;
@@ -115,7 +126,9 @@ impl PublicRest {
                 Err(err) => {
                     last_error = anyhow!("REST network timeout/transport: {err}");
                     if retry < 3 {
-                        tokio::time::sleep(Duration::from_millis(250 * 2u64.pow(retry))).await;
+                        let fallback = Duration::from_millis(250 * 2u64.pow(retry));
+                        let minimum_spacing = self.min_spacing.saturating_sub(started.elapsed());
+                        tokio::time::sleep(fallback.max(minimum_spacing)).await;
                     }
                 }
             }
@@ -175,13 +188,13 @@ mod tests {
     use tokio::net::TcpListener;
 
     async fn mock_http_server(
-        responses: Vec<(u16, Value)>,
+        responses: Vec<(u16, Value, Option<String>)>,
     ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}/trade-api/v2", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
             let mut paths = Vec::new();
-            for (status, body) in responses {
+            for (status, body, retry_after) in responses {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = Vec::new();
                 let mut buffer = [0_u8; 1024];
@@ -209,7 +222,8 @@ mod tests {
                     _ => "Fixture Response",
                 };
                 let response = format!(
-                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    retry_after.map(|v| format!("Retry-After: {v}\r\n")).unwrap_or_default(),
                     body.len()
                 );
                 stream.write_all(response.as_bytes()).await.unwrap();
@@ -239,8 +253,9 @@ mod tests {
             (
                 200,
                 json!({"trades":[{"trade_id":"a"}],"cursor":"next-page"}),
+                None,
             ),
-            (200, json!({"trades":[{"trade_id":"b"}],"cursor":""})),
+            (200, json!({"trades":[{"trade_id":"b"}],"cursor":""}), None),
         ])
         .await;
         let client = PublicRest::new(&base, Duration::ZERO).unwrap();
@@ -262,8 +277,8 @@ mod tests {
     #[tokio::test]
     async fn pagination_rejects_repeated_cursor_and_saturated_page_limit() {
         let (base, server) = mock_http_server(vec![
-            (200, json!({"trades":[],"cursor":"same"})),
-            (200, json!({"trades":[],"cursor":"same"})),
+            (200, json!({"trades":[],"cursor":"same"}), None),
+            (200, json!({"trades":[],"cursor":"same"}), None),
         ])
         .await;
         let repeated = PublicRest::new(&base, Duration::ZERO).unwrap();
@@ -276,8 +291,8 @@ mod tests {
         assert_eq!(server.await.unwrap().len(), 2);
 
         let (base, server) = mock_http_server(vec![
-            (200, json!({"trades":[],"cursor":"one"})),
-            (200, json!({"trades":[],"cursor":"two"})),
+            (200, json!({"trades":[],"cursor":"one"}), None),
+            (200, json!({"trades":[],"cursor":"two"}), None),
         ])
         .await;
         let saturated = PublicRest::new(&base, Duration::ZERO).unwrap();
@@ -293,9 +308,9 @@ mod tests {
     #[tokio::test]
     async fn retries_http_429_and_503_before_returning_success() {
         let (base, server) = mock_http_server(vec![
-            (429, json!({"error":"rate limited"})),
-            (503, json!({"error":"temporary service issue"})),
-            (200, json!({"trades":[],"cursor":""})),
+            (429, json!({"error":"rate limited"}), None),
+            (503, json!({"error":"temporary service issue"}), None),
+            (200, json!({"trades":[],"cursor":""}), None),
         ])
         .await;
         let client = PublicRest::new(&base, Duration::ZERO).unwrap();
@@ -303,5 +318,34 @@ mod tests {
         assert_eq!(response.body, json!({"trades":[],"cursor":""}));
         assert_eq!(response.metadata["http_status"], 200);
         assert_eq!(server.await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn retry_after_header_is_honored_with_bounded_seconds_delay() {
+        let (base, server) = mock_http_server(vec![
+            (429, json!({"error":"rate limited"}), Some("1".into())),
+            (200, json!({"trades":[],"cursor":""}), None),
+        ])
+        .await;
+        let client = PublicRest::new(&base, Duration::ZERO).unwrap();
+        let started = Instant::now();
+        client.get("/markets/trades", &[]).await.unwrap();
+        assert!(started.elapsed() >= Duration::from_secs(1));
+        assert_eq!(server.await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn minimum_spacing_applies_between_independent_requests() {
+        let (base, server) = mock_http_server(vec![
+            (200, json!({"trades":[],"cursor":""}), None),
+            (200, json!({"trades":[],"cursor":""}), None),
+        ])
+        .await;
+        let client = PublicRest::new(&base, Duration::from_millis(40)).unwrap();
+        client.get("/markets/trades", &[]).await.unwrap();
+        let started = Instant::now();
+        client.get("/markets/trades", &[]).await.unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(35));
+        assert_eq!(server.await.unwrap().len(), 2);
     }
 }
