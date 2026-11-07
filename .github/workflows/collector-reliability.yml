@@ -26,6 +26,21 @@ jobs:
           cache: 'pip'
       - name: Install pinned project dependencies
         run: python -m pip install -r requirements-lock.txt
+      - name: Parse Windows PowerShell scripts without executing them
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          Get-ChildItem -Path scripts/windows -Filter '*.ps1' | ForEach-Object {
+            $tokens = $null
+            $parseErrors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              $_.FullName, [ref]$tokens, [ref]$parseErrors
+            ) | Out-Null
+            if ($parseErrors.Count -gt 0) {
+              $parseErrors | ForEach-Object { Write-Error $_.Message }
+              throw "PowerShell parse failure: $($_.FullName)"
+            }
+          }
       - name: Run isolated regression suite
         env:
           PYTHONPATH: src
