@@ -84,6 +84,34 @@ class StorageReliabilityTests(unittest.TestCase):
             store.close()
             self.assertTrue(list((Path(directory) / "data" / "market_data").rglob("*.parquet")))
 
+    def test_hot_writer_flush_and_watermark_audit_avoid_full_archive_scan(self):
+        # The archive can contain thousands of prior parts on a slow HDD.
+        # Each new writer flush must account incrementally, never recursively
+        # enumerate historical parts. Restart still scans the archive once.
+        with TemporaryDirectory() as directory:
+            cfg = Settings(home=Path(directory), min_free_bytes=0)
+            store = Storage(cfg)
+            store.open()
+            store.parquet_flush_rows = 1
+            store.persistence_audit_last_monotonic = 0
+            with patch.object(
+                store, "_parquet_directory_size",
+                side_effect=AssertionError("full archive walk during hot ingest"),
+            ):
+                self.assertEqual(store.append_batch([event("fast-1", {"price": "0.40"})]), 1)
+                status = store.connection_status()
+                self.assertTrue(status["storage_market_event_watermark_matches_disk"])
+                self.assertEqual(store.append_batch([event("fast-2", {"price": "0.41"})]), 1)
+            exact_bytes = sum(p.stat().st_size for p in cfg.parquet_dir.rglob("*.parquet"))
+            self.assertGreater(exact_bytes, 0)
+            self.assertEqual(store.parquet_bytes, exact_bytes)
+            self.assertEqual(store.parquet_flush_count, 2)
+            store.close()
+            reopened = Storage(cfg)
+            reopened.open()
+            self.assertEqual(reopened.parquet_bytes, exact_bytes)
+            reopened.close()
+
     def test_invalid_payload_quarantined_but_valid_event_preserved(self):
         with TemporaryDirectory() as directory:
             store = Storage(Settings(home=Path(directory), min_free_bytes=0))
