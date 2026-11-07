@@ -2,7 +2,6 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use kalshi15m_rust::{
     api::{PublicRest, DEFAULT_BASE},
-    event::Event,
     replay::{collect_once, replay_file},
     runtime::{
         observe_websocket_event, ContinuousRuntime, RestSource, RuntimeConfig, RuntimeHealth,
@@ -530,6 +529,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kalshi15m_rust::event::Event;
     use serde_json::json;
 
     #[test]
