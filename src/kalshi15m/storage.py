@@ -138,7 +138,13 @@ class Storage:
         self.persistence_audit_cache: dict[str, Any] = {}
 
     def open(self) -> None:
-        self.connection = sqlite3.connect(self.cfg.ledger_path, timeout=15)
+        # Production serializes writes through one worker executor. The
+        # standalone fixture harness may open from one thread and flush
+        # manifests from its executor; do not rely on SQLite's thread affinity
+        # as the serialization mechanism.
+        self.connection = sqlite3.connect(
+            self.cfg.ledger_path, timeout=15, check_same_thread=False
+        )
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA synchronous=FULL")
         self.connection.execute("PRAGMA busy_timeout=15000")
