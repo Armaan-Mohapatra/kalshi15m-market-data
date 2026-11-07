@@ -17,18 +17,41 @@ pub struct Market {
 
 impl Market {
     pub fn from_api(raw: &Value) -> Result<Self> {
-        let ticker = raw.get("ticker").and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("market ticker missing"))?.to_owned();
-        let open = parse_utc(raw.get("open_time").and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("open_time missing"))?)?;
-        let close = parse_utc(raw.get("close_time").and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("close_time missing"))?)?;
-        if close <= open { return Err(anyhow!("market close before opening")); }
+        let ticker = raw
+            .get("ticker")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("market ticker missing"))?
+            .to_owned();
+        let open = parse_utc(
+            raw.get("open_time")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("open_time missing"))?,
+        )?;
+        let close = parse_utc(
+            raw.get("close_time")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("close_time missing"))?,
+        )?;
+        if close <= open {
+            return Err(anyhow!("market close before opening"));
+        }
         Ok(Market {
-            ticker, open, close,
-            event_ticker: raw.get("event_ticker").and_then(Value::as_str).map(str::to_string),
-            series_ticker: raw.get("series_ticker").and_then(Value::as_str).map(str::to_string),
-            status: raw.get("status").and_then(Value::as_str).unwrap_or("unknown").to_string(),
+            ticker,
+            open,
+            close,
+            event_ticker: raw
+                .get("event_ticker")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            series_ticker: raw
+                .get("series_ticker")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            status: raw
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
             raw: raw.clone(),
         })
     }
@@ -42,18 +65,41 @@ impl Market {
     }
 
     pub fn metadata_event(&self) -> Event {
-        let digest = Event::new("rest_market", "market_metadata", Some(&self.ticker),
-            self.raw.clone(), None).payload_hash().expect("valid API JSON");
-        Event::new("rest_market", "market_metadata", Some(&self.ticker),
-            self.raw.clone(), Some(format!("market-meta|{}|{}", self.ticker, digest)))
+        let digest = Event::new(
+            "rest_market",
+            "market_metadata",
+            Some(&self.ticker),
+            self.raw.clone(),
+            None,
+        )
+        .payload_hash()
+        .expect("valid API JSON");
+        Event::new(
+            "rest_market",
+            "market_metadata",
+            Some(&self.ticker),
+            self.raw.clone(),
+            Some(format!("market-meta|{}|{}", self.ticker, digest)),
+        )
     }
 }
 
 pub fn series_is_15m_candidate(value: &Value) -> bool {
-    let as_string = serde_json::to_string(value).unwrap_or_default().to_ascii_lowercase();
+    let as_string = serde_json::to_string(value)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     // Do not use a ticker prefix to infer contract duration.
-    ["15 minutes", "15 minute", "15-min", "15min", "15m", "900 seconds", "fifteen minutes"]
-        .iter().any(|phrase| as_string.contains(phrase))
+    [
+        "15 minutes",
+        "15 minute",
+        "15-min",
+        "15min",
+        "15m",
+        "900 seconds",
+        "fifteen minutes",
+    ]
+    .iter()
+    .any(|phrase| as_string.contains(phrase))
 }
 
 #[derive(Default)]
@@ -70,23 +116,33 @@ impl Discovery {
                 Ok(market) => {
                     // Preserve candidate status but never assert confirmed 15m
                     // just because the ticker resembles a known crypto series.
-                    if !market.is_exact_15m() { continue }
+                    if !market.is_exact_15m() {
+                        continue;
+                    }
                     let ticker = market.ticker.clone();
                     let first = self.first_seen.insert(ticker.clone());
                     if first {
                         out.push(Event::new(
-                            "coverage", "market_first_seen", Some(&ticker),
+                            "coverage",
+                            "market_first_seen",
+                            Some(&ticker),
                             json!({
                                 "ticker": ticker, "scheduled_open_utc":market.open.to_rfc3339(),
                                 "observed_utc": utc_now(),
                                 "first_seen_is_api_response_time": false,
                                 "source": "rust_discovery"
                             }),
-                            Some(format!("rust-market-first-seen|{ticker}|{}", now.timestamp_nanos_opt().unwrap_or(0))),
+                            Some(format!(
+                                "rust-market-first-seen|{ticker}|{}",
+                                now.timestamp_nanos_opt().unwrap_or(0)
+                            )),
                         ));
                     }
-                    let has_changed = self.markets.get(&ticker)
-                        .map(|old| old.raw != market.raw).unwrap_or(true);
+                    let has_changed = self
+                        .markets
+                        .get(&ticker)
+                        .map(|old| old.raw != market.raw)
+                        .unwrap_or(true);
                     if has_changed {
                         out.push(market.metadata_event());
                     }
@@ -102,20 +158,29 @@ impl Discovery {
     }
 
     pub fn active(&self, now: DateTime<Utc>) -> Vec<&Market> {
-        self.markets.values().filter(|m| {
-            m.open <= now && now < m.close
-                && ["open", "active", "unopened", "initialized"].contains(&m.status.as_str())
-        }).collect()
+        self.markets
+            .values()
+            .filter(|m| {
+                m.open <= now
+                    && now < m.close
+                    && ["open", "active", "unopened", "initialized"].contains(&m.status.as_str())
+            })
+            .collect()
     }
 
     pub fn near_open(&self, now: DateTime<Utc>, pre: i64, post: i64) -> Vec<&Market> {
-        self.markets.values().filter(|m| {
-            let delta = m.seconds_to_open(now);
-            delta <= pre && delta >= -post
-        }).collect()
+        self.markets
+            .values()
+            .filter(|m| {
+                let delta = m.seconds_to_open(now);
+                delta <= pre && delta >= -post
+            })
+            .collect()
     }
 
-    pub fn all(&self) -> Vec<&Market> { self.markets.values().collect() }
+    pub fn all(&self) -> Vec<&Market> {
+        self.markets.values().collect()
+    }
 }
 
 #[cfg(test)]
@@ -133,7 +198,9 @@ mod tests {
         assert_eq!(d.all().len(), 2);
         assert_eq!(d.active(now).len(), 1);
         assert_eq!(d.near_open(now, 600, 120).len(), 2);
-        assert!(events.iter().any(|x| x.payload.get("floor_strike").is_some()));
+        assert!(events
+            .iter()
+            .any(|x| x.payload.get("floor_strike").is_some()));
         assert!(d.add_rows(&[], now).is_empty());
     }
     #[test]
@@ -143,8 +210,15 @@ mod tests {
             "close_time":"2026-11-07T00:15:00Z","floor_strike":100});
         let mut d = Discovery::default();
         d.add_rows(&[a.clone()], now);
-        let mut changed = a; changed["floor_strike"] = json!(101);
+        let mut changed = a;
+        changed["floor_strike"] = json!(101);
         let events = d.add_rows(&[changed], now);
-        assert_eq!(events.iter().filter(|x| x.kind=="market_metadata").count(), 1);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|x| x.kind == "market_metadata")
+                .count(),
+            1
+        );
     }
 }

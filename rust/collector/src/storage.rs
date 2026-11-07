@@ -26,7 +26,11 @@ pub struct Stats {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IngestResult { Inserted, Versioned, Duplicate }
+pub enum IngestResult {
+    Inserted,
+    Versioned,
+    Duplicate,
+}
 
 impl Journal {
     pub fn open(home: &Path) -> Result<Self> {
@@ -36,7 +40,8 @@ impl Journal {
         fs::create_dir_all(&archive_root)?;
         let conn = Connection::open(home.join("data").join("paper_ledger.sqlite3"))
             .context("open isolated Rust SQLite journal")?;
-        conn.execute_batch(r#"
+        conn.execute_batch(
+            r#"
             PRAGMA journal_mode=WAL;
             PRAGMA synchronous=FULL;
             PRAGMA busy_timeout=15000;
@@ -96,8 +101,14 @@ impl Journal {
             );
             CREATE INDEX IF NOT EXISTS idx_events_market_time
             ON market_events(market_ticker, received_utc);
-        "#)?;
-        let mut journal = Self { home: home.to_path_buf(), conn, archive_root, stats: Stats::default() };
+        "#,
+        )?;
+        let mut journal = Self {
+            home: home.to_path_buf(),
+            conn,
+            archive_root,
+            stats: Stats::default(),
+        };
         journal.mark("RUNNING_UNVERIFIED")?;
         // A past crash may leave a finalized file without a manifest commit.
         // All operations below are bounded to the *staging* archive root.
@@ -119,18 +130,30 @@ impl Journal {
         let key = event.key()?;
         let raw = event.canonical_payload()?;
         let digest = event.payload_hash()?;
-        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let prior: Option<String> = tx.query_row(
-            "SELECT payload_sha256 FROM market_events WHERE dedupe_key = ?1",
-            [&key],
-            |row| row.get(0),
-        ).optional()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let prior: Option<String> = tx
+            .query_row(
+                "SELECT payload_sha256 FROM market_events WHERE dedupe_key = ?1",
+                [&key],
+                |row| row.get(0),
+            )
+            .optional()?;
         let outcome = match prior {
             None => {
                 tx.execute(
                     "INSERT INTO market_events VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-                    params![key, event.received_utc, event.exchange_ts,
-                        event.channel, event.kind, event.market_ticker, raw, digest],
+                    params![
+                        key,
+                        event.received_utc,
+                        event.exchange_ts,
+                        event.channel,
+                        event.kind,
+                        event.market_ticker,
+                        raw,
+                        digest
+                    ],
                 )?;
                 IngestResult::Inserted
             }
@@ -143,10 +166,14 @@ impl Journal {
                         event.received_utc, event.exchange_ts, event.channel,
                         event.kind, event.market_ticker, raw, digest],
                 )?;
-                if added > 0 { IngestResult::Versioned } else { IngestResult::Duplicate }
+                if added > 0 {
+                    IngestResult::Versioned
+                } else {
+                    IngestResult::Duplicate
+                }
             }
         };
-        tx.commit()?;  // synchronous=FULL. Nothing acknowledged before this.
+        tx.commit()?; // synchronous=FULL. Nothing acknowledged before this.
         match outcome {
             IngestResult::Inserted => self.stats.inserted += 1,
             IngestResult::Versioned => self.stats.variants += 1,
@@ -165,7 +192,10 @@ impl Journal {
         let output = spool.join(format!("{id}.json"));
         let bytes = serde_json::to_vec(event)?;
         {
-            let mut target = OpenOptions::new().write(true).create_new(true).open(&temporary)?;
+            let mut target = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
             target.write_all(&bytes)?;
             target.sync_all()?;
         }
@@ -175,13 +205,18 @@ impl Journal {
 
     fn replay_spool(&mut self, limit: usize) -> Result<()> {
         let spool = self.home.join("data").join("rust_pending");
-        if !spool.exists() { return Ok(()) }
+        if !spool.exists() {
+            return Ok(());
+        }
         let mut files = fs::read_dir(&spool)?
             .filter_map(|item| item.ok())
             .filter(|item| item.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
-            .map(|item| item.path()).collect::<Vec<_>>();
+            .map(|item| item.path())
+            .collect::<Vec<_>>();
         files.sort();
-        if files.len() > limit { bail!("pending spool exceeds safe replay bound") }
+        if files.len() > limit {
+            bail!("pending spool exceeds safe replay bound")
+        }
         for path in files {
             let raw = fs::read_to_string(&path)?;
             let event: Event = serde_json::from_str(&raw)?;
@@ -219,19 +254,34 @@ impl Journal {
             LIMIT ?1
             "#
         )?;
-        let rows = query.query_map([limit as i64], |row| Ok(ArchiveRow {
-            dedupe_key: row.get(0)?, received_utc: row.get(1)?, exchange_ts: row.get(2)?,
-            channel: row.get(3)?, kind: row.get(4)?, market_ticker: row.get(5)?,
-            payload_sha256: row.get(6)?, raw_json: row.get(7)?,
-        }))?;
+        let rows = query.query_map([limit as i64], |row| {
+            Ok(ArchiveRow {
+                dedupe_key: row.get(0)?,
+                received_utc: row.get(1)?,
+                exchange_ts: row.get(2)?,
+                channel: row.get(3)?,
+                kind: row.get(4)?,
+                market_ticker: row.get(5)?,
+                payload_sha256: row.get(6)?,
+                raw_json: row.get(7)?,
+            })
+        })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     fn register_part(&mut self, part: &PartInfo, rows: &[ArchiveRow]) -> Result<()> {
-        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
             "INSERT OR IGNORE INTO archive_manifests VALUES (?1,?2,?3,?4,?5)",
-            params![part.path, part.rows as i64, part.bytes as i64, part.sha256, utc_now()],
+            params![
+                part.path,
+                part.rows as i64,
+                part.bytes as i64,
+                part.sha256,
+                utc_now()
+            ],
         )?;
         for row in rows {
             tx.execute(
@@ -244,13 +294,19 @@ impl Journal {
     }
 
     pub fn flush_archive(&mut self, limit: usize) -> Result<usize> {
-        if limit == 0 || limit > 5000 { bail!("archive chunk size outside 1..=5000") }
+        if limit == 0 || limit > 5000 {
+            bail!("archive chunk size outside 1..=5000")
+        }
         let pending = self.outstanding_rows(limit)?;
-        if pending.is_empty() { return Ok(0) }
+        if pending.is_empty() {
+            return Ok(0);
+        }
         let mut partitions = BTreeMap::<PathBuf, Vec<ArchiveRow>>::new();
         for row in pending {
-            partitions.entry(archive::partition_path(&self.archive_root, &row))
-                .or_default().push(row);
+            partitions
+                .entry(archive::partition_path(&self.archive_root, &row))
+                .or_default()
+                .push(row);
         }
         let mut archived = 0;
         for (_path, rows) in partitions {
@@ -266,12 +322,14 @@ impl Journal {
     fn revoke_archive_part(&mut self, name: &str, reason: &str) -> Result<()> {
         // Do not delete or move any source/archive bytes. Only revoke the
         // staging index that previously claimed an unavailable/corrupt part.
-        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute("DELETE FROM rust_archive_index WHERE part_path=?1",[name])?;
-        tx.execute("DELETE FROM archive_manifests WHERE part_path=?1",[name])?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("DELETE FROM rust_archive_index WHERE part_path=?1", [name])?;
+        tx.execute("DELETE FROM archive_manifests WHERE part_path=?1", [name])?;
         tx.execute(
             "INSERT OR REPLACE INTO rust_archive_issues VALUES (?1,?2,?3)",
-            params![name,reason,utc_now()]
+            params![name, reason, utc_now()],
         )?;
         tx.commit()?;
         Ok(())
@@ -285,44 +343,54 @@ impl Journal {
             let mut stmt = self.conn.prepare(
                 "SELECT part_path FROM archive_manifests UNION SELECT part_path FROM rust_archive_index"
             )?;
-            let result = stmt.query_map([],|r|r.get::<_,String>(0))?;
+            let result = stmt.query_map([], |r| r.get::<_, String>(0))?;
             result.collect::<rusqlite::Result<Vec<_>>>()?
         };
-        if tracked.len() > max_files { bail!("too many staged archive manifest entries") }
+        if tracked.len() > max_files {
+            bail!("too many staged archive manifest entries")
+        }
         for name in tracked {
             if !self.archive_root.join(&name).is_file() {
                 self.revoke_archive_part(&name, "MISSING_FINALIZED_PART")?;
             }
         }
         for part in parts {
-            let name = part.strip_prefix(&self.archive_root)?
-                .to_string_lossy().replace('\\', "/");
+            let name = part
+                .strip_prefix(&self.archive_root)?
+                .to_string_lossy()
+                .replace('\\', "/");
             let actual_sha = match archive::hash_file(&part) {
                 Ok(digest) => digest,
                 Err(_) => {
-                    self.revoke_archive_part(&name,"UNREADABLE_FINALIZED_PART")?;
+                    self.revoke_archive_part(&name, "UNREADABLE_FINALIZED_PART")?;
                     continue;
                 }
             };
-            let expected: Option<String> = self.conn.query_row(
-                "SELECT sha256 FROM archive_manifests WHERE part_path=?1", [&name],
-                |row| row.get(0),
-            ).optional()?;
+            let expected: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT sha256 FROM archive_manifests WHERE part_path=?1",
+                    [&name],
+                    |row| row.get(0),
+                )
+                .optional()?;
             if let Some(expected_sha) = expected {
                 if actual_sha != expected_sha {
-                    self.revoke_archive_part(&name,"CORRUPT_SHA256_MISMATCH")?;
+                    self.revoke_archive_part(&name, "CORRUPT_SHA256_MISMATCH")?;
                     continue;
                 }
             }
             let rows = match archive::read_part(&part) {
                 Ok(rows) => rows,
                 Err(_) => {
-                    self.revoke_archive_part(&name,"CORRUPT_PARQUET_DATA")?;
+                    self.revoke_archive_part(&name, "CORRUPT_PARQUET_DATA")?;
                     continue;
                 }
             };
             let meta = PartInfo {
-                path: name, rows: rows.len(), bytes: part.metadata()?.len(),
+                path: name,
+                rows: rows.len(),
+                bytes: part.metadata()?.len(),
                 sha256: actual_sha,
             };
             self.register_part(&meta, &rows)?;
@@ -331,56 +399,80 @@ impl Journal {
     }
 
     pub fn verify_archive(&self) -> Result<bool> {
-        if self.unarchived_count()? > 0 { return Ok(false) }
+        if self.unarchived_count()? > 0 {
+            return Ok(false);
+        }
         let broken: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM rust_archive_issues WHERE failure LIKE 'CORRUPT_%' OR failure='UNREADABLE_FINALIZED_PART'",
             [],|r|r.get(0)
         )?;
-        if broken > 0 { return Ok(false) }
+        if broken > 0 {
+            return Ok(false);
+        }
         let parts = archive::list_final_parts(&self.archive_root, 10_000)?;
         let mut expected_rows: i64 = 0;
         let mut observed_rows: i64 = 0;
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM rust_archive_index",[],|r|r.get(0)
-        )?;
-        let canonical: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM market_events",[],|r|r.get(0)
-        )?;
-        let conflicts: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM market_event_versions",[],|r|r.get(0)
-        )?;
-        if count != canonical + conflicts { return Ok(false) }
-        if parts.len() != self.conn.query_row(
-            "SELECT COUNT(*) FROM archive_manifests",[],|r|r.get::<_,i64>(0)
-        )? as usize { return Ok(false) }
+        let count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM rust_archive_index", [], |r| r.get(0))?;
+        let canonical: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM market_events", [], |r| r.get(0))?;
+        let conflicts: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM market_event_versions", [], |r| {
+                    r.get(0)
+                })?;
+        if count != canonical + conflicts {
+            return Ok(false);
+        }
+        if parts.len()
+            != self
+                .conn
+                .query_row("SELECT COUNT(*) FROM archive_manifests", [], |r| {
+                    r.get::<_, i64>(0)
+                })? as usize
+        {
+            return Ok(false);
+        }
         // Presence of any incomplete temporary part prevents a clean marker.
         for date in std::fs::read_dir(&self.archive_root)? {
-            let date=date?;
-            if !date.file_type()?.is_dir() {continue}
+            let date = date?;
+            if !date.file_type()?.is_dir() {
+                continue;
+            }
             for kind in std::fs::read_dir(date.path())? {
-                let kind=kind?;
-                if !kind.file_type()?.is_dir() {continue}
+                let kind = kind?;
+                if !kind.file_type()?.is_dir() {
+                    continue;
+                }
                 for file in std::fs::read_dir(kind.path())? {
-                    if file?.path().extension().and_then(|e|e.to_str())==Some("partial") {
-                        return Ok(false)
+                    if file?.path().extension().and_then(|e| e.to_str()) == Some("partial") {
+                        return Ok(false);
                     }
                 }
             }
         }
-        let mut statement = self.conn.prepare(
-            "SELECT part_path, row_count, byte_count, sha256 FROM archive_manifests"
-        )?;
+        let mut statement = self
+            .conn
+            .prepare("SELECT part_path, row_count, byte_count, sha256 FROM archive_manifests")?;
         let checks = statement.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?,
-                r.get::<_, i64>(2)?, r.get::<_, String>(3)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+            ))
         })?;
         for check in checks {
             let (name, rows, bytes, checksum) = check?;
             expected_rows += rows;
             let path = self.archive_root.join(name);
-            if !path.is_file() || path.metadata()?.len() != bytes as u64
-                || archive::hash_file(&path)? != checksum {
-                return Ok(false)
+            if !path.is_file()
+                || path.metadata()?.len() != bytes as u64
+                || archive::hash_file(&path)? != checksum
+            {
+                return Ok(false);
             }
         }
         observed_rows = count;
@@ -389,23 +481,40 @@ impl Journal {
 
     pub fn close(mut self) -> Result<Stats> {
         for _ in 0..200 {
-            if self.unarchived_count()? == 0 {break}
+            if self.unarchived_count()? == 0 {
+                break;
+            }
             let n = self.flush_archive(2000)?;
-            if n == 0 {bail!("archive reconciliation made no progress")}
+            if n == 0 {
+                bail!("archive reconciliation made no progress")
+            }
         }
         let verified = self.verify_archive()?;
-        self.mark(if verified {"CLEAN_ARCHIVE_VERIFIED"} else {"CLOSED_WITH_ARCHIVE_UNVERIFIED"})?;
-        if !verified { bail!("journal complete but archive is not independently verified") }
+        self.mark(if verified {
+            "CLEAN_ARCHIVE_VERIFIED"
+        } else {
+            "CLOSED_WITH_ARCHIVE_UNVERIFIED"
+        })?;
+        if !verified {
+            bail!("journal complete but archive is not independently verified")
+        }
         Ok(self.stats)
     }
 
     pub fn audit(&self) -> Result<serde_json::Value> {
-        let canonical: i64 = self.conn.query_row("SELECT COUNT(*) FROM market_events", [], |r| r.get(0))?;
-        let variants: i64 = self.conn.query_row("SELECT COUNT(*) FROM market_event_versions", [], |r| r.get(0))?;
+        let canonical: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM market_events", [], |r| r.get(0))?;
+        let variants: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM market_event_versions", [], |r| {
+                    r.get(0)
+                })?;
         let unarchived = self.unarchived_count()?;
         let marker: String = self.conn.query_row(
             "SELECT value FROM collector_markers WHERE marker='archive_shutdown'",
-            [], |r| r.get(0),
+            [],
+            |r| r.get(0),
         )?;
         Ok(json!({
             "canonical_events":canonical, "conflicting_versions":variants,
@@ -424,8 +533,20 @@ mod tests {
     fn journal_retains_conflicts_and_archives_exactly_once() {
         let home = tempfile::tempdir().unwrap();
         let mut store = Journal::open(home.path()).unwrap();
-        let first = Event::new("rest", "metadata", Some("TEST"), json!({"price":1}), Some("K".into()));
-        let changed = Event::new("rest", "metadata", Some("TEST"), json!({"price":2}), Some("K".into()));
+        let first = Event::new(
+            "rest",
+            "metadata",
+            Some("TEST"),
+            json!({"price":1}),
+            Some("K".into()),
+        );
+        let changed = Event::new(
+            "rest",
+            "metadata",
+            Some("TEST"),
+            json!({"price":2}),
+            Some("K".into()),
+        );
         assert_eq!(store.ingest(&first).unwrap(), IngestResult::Inserted);
         assert_eq!(store.ingest(&changed).unwrap(), IngestResult::Versioned);
         assert_eq!(store.ingest(&changed).unwrap(), IngestResult::Duplicate);
@@ -443,7 +564,13 @@ mod tests {
     fn interrupted_after_sqlite_commit_is_reconciled() {
         let home = tempfile::tempdir().unwrap();
         let mut store = Journal::open(home.path()).unwrap();
-        let event = Event::new("rest", "trade", Some("T"), json!({"id":"a"}), Some("T-a".into()));
+        let event = Event::new(
+            "rest",
+            "trade",
+            Some("T"),
+            json!({"id":"a"}),
+            Some("T-a".into()),
+        );
         store.ingest(&event).unwrap();
         drop(store); // crash before Parquet finalize
         let reopened = Journal::open(home.path()).unwrap();
