@@ -1,5 +1,5 @@
 use crate::book::{BookState, OrderBook};
-use crate::event::{hash_bytes, Event};
+use crate::event::{hash_bytes, utc_now, Event};
 use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
@@ -218,13 +218,19 @@ impl AuthenticatedWebSocket {
                 }
                 next = socket.next() => match next {
                     Some(Ok(Message::Text(raw))) => {
-                        let parsed: Value = serde_json::from_str(&raw).context("invalid WebSocket JSON frame")?;
+                        let mut parsed: Value = serde_json::from_str(&raw).context("invalid WebSocket JSON frame")?;
+                        if let Some(object) = parsed.as_object_mut() {
+                            object.insert("_collector_received_utc".into(), json!(utc_now()));
+                        }
                         for event in engine.handle(parsed) {
                             events.send(event).await.map_err(|_| anyhow!("WebSocket event receiver closed"))?;
                         }
                     }
                     Some(Ok(Message::Binary(raw))) => {
-                        let parsed: Value = serde_json::from_slice(&raw).context("invalid binary WebSocket JSON frame")?;
+                        let mut parsed: Value = serde_json::from_slice(&raw).context("invalid binary WebSocket JSON frame")?;
+                        if let Some(object) = parsed.as_object_mut() {
+                            object.insert("_collector_received_utc".into(), json!(utc_now()));
+                        }
                         for event in engine.handle(parsed) {
                             events.send(event).await.map_err(|_| anyhow!("WebSocket event receiver closed"))?;
                         }
