@@ -1,0 +1,193 @@
+{
+  "schema": "phoenix.third_party_devtools.v1",
+  "generated_utc": "2026-11-07",
+  "policy": "Clone sources read-only from authenticated public GitHub into isolated E:\\PhoenixTooling; no automatic third-party install scripts, global hooks, services, VM, GPU drivers or trading integration.",
+  "source_of_truth": "https://github.com/Armaan-Mohapatra/kalshi15m-market-data",
+  "notes": "Names from previous user screenshot discussion plus developer tools. Some old screenshots remain unavailable; identity candidates are flagged. Cloning is NOT activating/installing dependencies.",
+  "repos": [
+    {
+      "repo": "DeusData/codebase-memory-mcp",
+      "url": "https://github.com/DeusData/codebase-memory-mcp.git",
+      "slug": "codebase-memory-mcp",
+      "category": "code_graph",
+      "activation": "staged_activate",
+      "notes": "Index only source checkouts, exclude secrets, production roots, caches and databases"
+    },
+    {
+      "repo": "DietrichGebert/ponytail",
+      "url": "https://github.com/DietrichGebert/ponytail.git",
+      "slug": "ponytail",
+      "category": "agent_quality",
+      "activation": "review_before_hooks",
+      "notes": "Install Codex plugin only after reviewing hooks and scope"
+    },
+    {
+      "repo": "affaan-m/ECC",
+      "url": "https://github.com/affaan-m/ECC.git",
+      "slug": "ECC",
+      "category": "agent_quality",
+      "activation": "review_before_hooks",
+      "notes": "Official source; choose only nonoverlapping skill subset; do not replace global Codex config"
+    },
+    {
+      "repo": "trailhq/Trail-Code",
+      "url": "https://github.com/trailhq/Trail-Code.git",
+      "slug": "Trail-Code",
+      "category": "code_graph",
+      "activation": "trial_separately",
+      "notes": "Do not auto-init or import private sessions; compare against codebase-memory first"
+    },
+    {
+      "repo": "nkaz001/hftbacktest",
+      "url": "https://github.com/nkaz001/hftbacktest.git",
+      "slug": "hftbacktest",
+      "category": "quant_research",
+      "activation": "research_only",
+      "notes": "Isolated backtest; no live adapters, no exchange orders"
+    },
+    {
+      "repo": "msitarzewski/agency-agents",
+      "url": "https://github.com/msitarzewski/agency-agents.git",
+      "slug": "agency-agents",
+      "category": "agent_templates",
+      "activation": "selected_personas_only",
+      "notes": "Do not globally install all agents or overwrite Codex policies"
+    },
+    {
+      "repo": "TauricResearch/TradingAgents",
+      "url": "https://github.com/TauricResearch/TradingAgents.git",
+      "slug": "TradingAgents",
+      "category": "quant_research",
+      "activation": "research_only",
+      "notes": "No broker APIs or keys; paper simulations only"
+    },
+    {
+      "repo": "Tencent/WeKnora",
+      "url": "https://github.com/Tencent/WeKnora.git",
+      "slug": "WeKnora",
+      "category": "knowledge_base",
+      "activation": "clone_only_heavy",
+      "notes": "No Docker/VM/daemon without resource headroom review"
+    },
+    {
+      "repo": "Tencent/BrowserSkill",
+      "url": "https://github.com/Tencent/BrowserSkill.git",
+      "slug": "BrowserSkill",
+      "category": "browser_automation",
+      "activation": "review_before_activation",
+      "notes": "Do not grant browser sessions or profiles without separate approval"
+    },
+    {
+      "repo": "ooandychen/vibe-trading",
+      "url": "https://github.com/ooandychen/vibe-trading.git",
+      "slug": "vibe-trading",
+      "category": "quant_research",
+      "activation": "research_only",
+      "notes": "No trading execution or credentials"
+    },
+    {
+      "repo": "career-ops-hq/career-ops",
+      "url": "https://github.com/career-ops-hq/career-ops.git",
+      "slug": "career-ops",
+      "category": "personal",
+      "activation": "clone_only",
+      "notes": "Separate from Phoenix; no automatic access to personal accounts"
+    },
+    {
+      "repo": "toeverything/AFFiNE",
+      "url": "https://github.com/toeverything/AFFiNE.git",
+      "slug": "AFFiNE",
+      "category": "personal",
+      "activation": "clone_only_heavy",
+      "notes": "Large service; do not start Docker/VM/daemon on capture laptop"
+    },
+    {
+      "repo": "NandhaKishorM/laya",
+      "url": "https://github.com/NandhaKishorM/laya.git",
+      "slug": "laya",
+      "category": "experimental_models",
+      "activation": "clone_only",
+      "notes": "Do not place model inference on live collection critical path"
+    },
+    {
+      "repo": "browser-use/jev-ultrafast",
+      "url": "https://github.com/browser-use/jev-ultrafast.git",
+      "slug": "jev-ultrafast",
+      "category": "browser_automation",
+      "activation": "clone_only",
+      "notes": "Web-agent experiments only; no logged-in browser access"
+    },
+    {
+      "repo": "HKUDS/DeepTutor",
+      "url": "https://github.com/HKUDS/DeepTutor.git",
+      "slug": "DeepTutor",
+      "category": "personal",
+      "activation": "clone_only_heavy",
+      "notes": "Educational app unrelated to Phoenix collector"
+    },
+    {
+      "repo": "SawyerHood/do-computer",
+      "url": "https://github.com/SawyerHood/do-computer.git",
+      "slug": "do-computer",
+      "category": "personal",
+      "activation": "review_identity",
+      "notes": "Candidate for prior Cloudflare Computer screenshot; verify exact identity before activating"
+    },
+    {
+      "repo": "JustVugg/colibri",
+      "url": "https://github.com/JustVugg/colibri.git",
+      "slug": "colibri",
+      "category": "experimental_models",
+      "activation": "clone_only_heavy",
+      "notes": "Resource-sensitive model backend; no GPU server or heavy model download during capture"
+    },
+    {
+      "repo": "Zagitta/gpu-unlock",
+      "url": "https://github.com/Zagitta/gpu-unlock.git",
+      "slug": "gpu-unlock",
+      "category": "unsupported_kernel",
+      "activation": "never_activate_windows",
+      "notes": "Linux kernel/GPU intervention; do not execute installers or drivers"
+    },
+    {
+      "repo": "oraios/serena",
+      "url": "https://github.com/oraios/serena.git",
+      "slug": "serena",
+      "category": "code_graph",
+      "activation": "staged_activate",
+      "notes": "Semantic code intelligence; scope to known source dirs only"
+    },
+    {
+      "repo": "ast-grep/ast-grep",
+      "url": "https://github.com/ast-grep/ast-grep.git",
+      "slug": "ast-grep",
+      "category": "developer_cli",
+      "activation": "staged_activate",
+      "notes": "Prefer release binary/install manager only after verification"
+    },
+    {
+      "repo": "yamadashy/repomix",
+      "url": "https://github.com/yamadashy/repomix.git",
+      "slug": "repomix",
+      "category": "developer_cli",
+      "activation": "staged_activate",
+      "notes": "Always use explicit exclude rules; no codebase dump of secrets"
+    },
+    {
+      "repo": "sharkdp/hyperfine",
+      "url": "https://github.com/sharkdp/hyperfine.git",
+      "slug": "hyperfine",
+      "category": "developer_cli",
+      "activation": "staged_activate",
+      "notes": "Bench only isolated fixtures; no production benchmarks"
+    },
+    {
+      "repo": "douglasmonsky/codex-usage-tracker",
+      "url": "https://github.com/douglasmonsky/codex-usage-tracker.git",
+      "slug": "codex-usage-tracker",
+      "category": "developer_cli",
+      "activation": "reuse_existing",
+      "notes": "Check existing pipx install before any update or reinstall"
+    }
+  ]
+}
