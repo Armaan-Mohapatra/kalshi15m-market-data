@@ -18,7 +18,7 @@ from kalshi15m.book import OrderBook
 from kalshi15m.config import Settings
 from kalshi15m.coverage import OpeningCoverage
 from kalshi15m.storage import Storage
-from kalshi15m.worker import Collector
+from kalshi15m.worker import Collector, classify_rest_reconciliation
 
 
 def event(key, payload):
@@ -349,6 +349,40 @@ class CaptureReliabilityTests(unittest.TestCase):
             )
             # Enqueued does not imply journaled or finalized in Parquet.
             collector.writer_pool.shutdown(wait=False)
+
+
+class RestHealthClassificationTests(unittest.TestCase):
+    def test_transient_prior_api_error_does_not_permanently_degrade_rest(self):
+        # The API lifetime error total may remain >0 after recovery.
+        # Only errors during the current reconcile should determine freshness.
+        self.assertEqual(
+            classify_rest_reconciliation(
+                interval_errors=0,
+                coverage_state="COMPLETE_CURRENT_AND_NEAR_TERM",
+            ),
+            ("READY", "RECENT_RECONCILIATION_SUCCEEDED"),
+        )
+        self.assertEqual(
+            classify_rest_reconciliation(
+                interval_errors=1,
+                coverage_state="COMPLETE_CURRENT_AND_NEAR_TERM",
+            ),
+            ("DEGRADED", "CURRENT_RECONCILIATION_API_ERRORS"),
+        )
+
+    def test_cached_partial_discovery_does_not_report_rest_ready(self):
+        self.assertEqual(
+            classify_rest_reconciliation(
+                interval_errors=0, coverage_state="PARTIAL",
+            ),
+            ("DEGRADED", "DISCOVERY_COVERAGE_NOT_CONFIRMED_COMPLETE"),
+        )
+        self.assertEqual(
+            classify_rest_reconciliation(
+                interval_errors=0, coverage_state="UNKNOWN",
+            ),
+            ("DEGRADED", "DISCOVERY_COVERAGE_NOT_CONFIRMED_COMPLETE"),
+        )
 
 
 class ApiReliabilityTests(unittest.TestCase):
