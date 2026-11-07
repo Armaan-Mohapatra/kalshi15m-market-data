@@ -8,6 +8,7 @@ import sqlite3
 import urllib.error
 import unittest
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, Mock, patch
