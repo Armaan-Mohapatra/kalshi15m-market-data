@@ -3,7 +3,7 @@ on:
   push:
     branches: [collector/rust-v1]
   pull_request:
-    branches: [main, collector/rust-v1]
+    branches: [main, collector/rust-v1, codex/rust-windows-integration]
   workflow_dispatch:
 concurrency:
   group: rust-collector-${{ github.head_ref || github.ref_name }}
