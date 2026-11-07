@@ -86,16 +86,30 @@ impl Event {
             // For deliberately supplied raw WS fixtures, retain the exact message
             // under payload, namespace with raw type and session. Real exchange
             // subscription semantics are parsed separately in websocket.rs.
-            let kind = value.get("type").and_then(Value::as_str).unwrap_or("unknown").to_string();
-            let ticker = value.get("msg")
+            let kind = value
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            let ticker = value
+                .get("msg")
                 .and_then(|m| m.get("market_ticker"))
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            let session = value.get("_fixture_session").and_then(Value::as_str).unwrap_or("unknown");
+            let session = value
+                .get("_fixture_session")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
             let sid = value.get("sid").and_then(Value::as_i64).unwrap_or(-1);
             let seq = value.get("seq").and_then(Value::as_i64).unwrap_or(-1);
             let identity = format!("ws-fixture|{session}|{sid}|{seq}|{kind}");
-            let mut event = Event::new("websocket_raw_fixture", &kind, ticker.as_deref(), value, Some(identity));
+            let mut event = Event::new(
+                "websocket_raw_fixture",
+                &kind,
+                ticker.as_deref(),
+                value,
+                Some(identity),
+            );
             event.exchange_ts = None;
             event.validate()?;
             Ok(event)
@@ -133,8 +147,8 @@ impl Event {
 
 /// Parse RFC3339 timestamps, normalizing to UTC for opening-window statistics.
 pub fn parse_utc(s: &str) -> Result<DateTime<Utc>> {
-    let parsed = DateTime::parse_from_rfc3339(s)
-        .with_context(|| format!("invalid timestamp {s}"))?;
+    let parsed =
+        DateTime::parse_from_rfc3339(s).with_context(|| format!("invalid timestamp {s}"))?;
     Ok(parsed.with_timezone(&Utc))
 }
 
@@ -143,17 +157,33 @@ mod tests {
     use super::*;
     #[test]
     fn canonical_hash_is_key_order_independent() {
-        let a = Event::new("rest", "market_metadata", Some("X"),
-            serde_json::from_str(r#"{"a":1,"b":2}"#).unwrap(), Some("k".into()));
-        let b = Event::new("rest", "market_metadata", Some("X"),
-            serde_json::from_str(r#"{"b":2,"a":1}"#).unwrap(), Some("k".into()));
+        let a = Event::new(
+            "rest",
+            "market_metadata",
+            Some("X"),
+            serde_json::from_str(r#"{"a":1,"b":2}"#).unwrap(),
+            Some("k".into()),
+        );
+        let b = Event::new(
+            "rest",
+            "market_metadata",
+            Some("X"),
+            serde_json::from_str(r#"{"b":2,"a":1}"#).unwrap(),
+            Some("k".into()),
+        );
         assert_eq!(a.payload_hash().unwrap(), b.payload_hash().unwrap());
         assert_eq!(a.key().unwrap(), b.key().unwrap());
     }
     #[test]
     fn raw_ws_fixture_namespaces_session() {
-        let a = Event::from_line(r#"{"type":"orderbook_delta","sid":2,"seq":3,"_fixture_session":"one"}"#).unwrap();
-        let b = Event::from_line(r#"{"type":"orderbook_delta","sid":2,"seq":3,"_fixture_session":"two"}"#).unwrap();
+        let a = Event::from_line(
+            r#"{"type":"orderbook_delta","sid":2,"seq":3,"_fixture_session":"one"}"#,
+        )
+        .unwrap();
+        let b = Event::from_line(
+            r#"{"type":"orderbook_delta","sid":2,"seq":3,"_fixture_session":"two"}"#,
+        )
+        .unwrap();
         assert_ne!(a.key().unwrap(), b.key().unwrap());
     }
     #[test]

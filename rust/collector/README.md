@@ -11,9 +11,11 @@ This crate is a **runnable, isolated Rust ingestion prototype**, not yet a produ
 - Durable journal rows before acknowledgment; same-key different-payload variants, persistent event fingerprints, fsynced emergency spool and restart replay.
 - Arrow/Parquet archive parts, bounded reconciliation from SQLite, independent manifest hashes and explicit clean/unverified shutdown.
 - Public GET-only one-shot REST collector with 2-second minimum pacing, bounded 429/5xx/timeouts, discovery of open and unopened 900-second markets, REST book sampling, paginated public trades and incomplete-source telemetry.
+- Authenticated Kalshi WebSocket transport with Ed25519/RSA-PSS handshake signing, explicit subscriptions, connection-qualified raw frames, sequence-gap invalidation, bounded backpressure, reconnect/resubscribe, fresh-snapshot recovery, malformed-frame evidence and graceful cancellation.
+- Structured health separates process/REST/WebSocket state, queue and disk pressure, SQLite journal acknowledgments, and Parquet manifest-committed acknowledgments. WebSocket telemetry distinguishes raw frames from derived health records, tracks order-book deltas as observed/applied/rejected/journaled/spooled/archived, and scopes sequence-gap and archive counts by market and connection-qualified subscription session/SID. These runtime counters are process-scoped while the manifest remains authoritative across restarts. Graceful shutdown drains and verifies a bounded archive tail before publishing clean status.
 - CI build, Rust unit tests and smoke replay on Windows and Linux.
 
-**Limitations:** This branch is not an authenticated live WebSocket client or a complete continuously scheduled replacement of the Python strategy/paper runtime. WebSocket exchange messages are accepted from replay fixtures; real authenticated WSS activation requires a separate protocol/auth fixture and authorization. REST snapshots cannot reconstruct lost intermediate orderbook deltas. The Rust journal uses staging-specific reconciliation tables and **must never target the production Python SQLite/WAL**. The Rust Parquet schema is explicitly checked by a separate Python compatibility test before any migration decision.
+**Limitations:** WebSocket signing and transport are validated offline only; no authenticated exchange connection has been attempted. The CLI requires `capture-websocket --allow-websocket true` and explicitly supplied credentials; never use it during routine staging validation while Phoenix collection is active. The continuous Rust runtime is not yet an independently accepted replacement for the Python strategy/paper runtime. REST snapshots cannot reconstruct lost intermediate orderbook deltas. The Rust journal uses staging-specific reconciliation tables and **must never target the production Python SQLite/WAL**. The Rust Parquet schema is explicitly checked by a separate Python compatibility test before any migration decision.
 
 ## Build and run — offline by default
 
@@ -39,11 +41,55 @@ cargo run -- --home "$stage" capture-once --allow-network --ticker KXBTC15M-EXAM
 
 This mode never places orders and does not install a service, configure Task Scheduler, activate WSS or change the active Windows collector.
 
+### Continuous REST scheduler (network-gated)
+
+`run-continuous` can take optional `--series` overrides. If no series are supplied, the runtime reads the public `/series` catalog and rotates through at most four metadata-confirmed 15-minute candidates per discovery cycle. It remains network-disabled unless `--allow-network true` is supplied, and must not be run against live Kalshi during ordinary Phoenix staging validation.
+
+### Authenticated WebSocket staging mode (NOT automatically run)
+
+The source includes authenticated WebSocket streaming for explicit market tickers. It writes only to the isolated `--home` journal/archive. Running it connects to Kalshi and requires a separate explicit operational decision; ordinary tests and staging validation must use local signing/protocol fixtures. Never point it at a production key path.
+
+```powershell
+# Syntax only. Do not run during ordinary staging validation.
+cargo run -- --home "$stage" capture-websocket --allow-websocket true --key-id STAGING_KEY_ID --private-key "C:\staging\key.pem" --ticker KXBTC15M-EXAMPLE
+```
+
 ## Data contract and recovery
 
-The journal is authoritative. Parquet parts are staged to `.partial` and renamed after a complete writer close/fsync. The manifest is then committed in the journal along with event fingerprints. A crash between SQLite commit and Parquet finalization leaves unarchived records; a crash after the Parquet rename but before the manifest commit leaves a finalized orphan part. On the next staging startup, hashes are checked, finalized orphan parts are registered, and missing journal entries are replayed into new Parquet parts. Neither case rewrites source events. Corrupt part hashes are a fail-closed error, not silent success.
+The journal is authoritative. Parquet parts are staged to `.partial` and renamed after a complete writer close/fsync. The manifest is then committed in the journal along with event fingerprints. A crash between SQLite commit and Parquet finalization leaves unarchived records; a crash after the Parquet rename but before the manifest commit leaves a finalized orphan part. On the next staging startup, hashes are checked, finalized orphan parts are registered, and missing journal entries are replayed into new Parquet parts. Neither case rewrites source events. Corrupt part hashes are a fail-closed error, not silent success. The health output does not count archive rows until both the finalized part and manifest/index commit succeed; it reports archive failure separately from already-durable SQLite events.
 
 Both the archive and the journal live under an isolated staging root. Python keeps responsibility for research/backtesting and any separately authorized PAPER strategy runtime.
+
+### Replay a finalized Phoenix WebSocket Parquet segment
+
+`tools/convert_recorded_ws_parquet.py` is a bounded, read-only adapter for finalized Phoenix Parquet exports. It verifies an adjacent source sidecar when present, preserves numeric-subscription raw protocol messages in source order, injects source-time/session replay metadata, excludes non-WebSocket rows, and writes a SHA-256 provenance manifest next to a new staging NDJSON file. It refuses to overwrite converter outputs or write under protected Phoenix/runtime roots. Never point `--output` into the source export tree.
+
+```powershell
+python tools/convert_recorded_ws_parquet.py `
+  --input E:\TradingNextData\kalshi\parquet\segment-00000186.parquet `
+  --output C:\Users\dakin\Projects\Kalshi15mRustStageResearch\segment186\segment186-ws.ndjson
+```
+
+Then replay the emitted raw frames with the offline `replay` command and an isolated `--home`. The adapter preserves all selected subscription frames so sequence checks are not computed from ticker-filtered fragments. Its output is a lossy projection of the source table: REST-only rows and source columns not needed by the WebSocket replay remain documented in the converter manifest and are not represented as WebSocket frames.
+
+### Replay finalized TNEVENT v2 segments
+
+`tools/convert_tnevent_v2_segments.py` handles finalized `.ready` directories containing `events.bin`, `manifest.json`, and `segment.json`. It verifies source hashes, manifest byte/event counts, each compressed block's declared sizes and CRC-32, and record metadata before writing. The v2 block/record framing is validated from the finalized file itself; this is an observed format contract, not a claim that an upstream public specification was found. Unknown markers, versions, record identities, unresolved trade connection generations, and oversized inputs fail closed.
+
+Pass adjacent segments in ascending ID order. The converter retains the original `run...:gN` connection identity across segment boundaries, keeps all numeric-subscription WebSocket frames in the time interval (not only the target ticker), and writes full non-WebSocket discovery rows to a separate `.discovery.jsonl` file. Its manifest records source hashes, output hashes, event counts, target-window coverage, connection-qualified sequence findings, and the mapping from replay lines to source records. It refuses overwrite and protected output locations.
+
+```powershell
+python tools/convert_tnevent_v2_segments.py `
+  --input E:\TradingNextData\kalshi\raw\segment-00000462.ready `
+  --input E:\TradingNextData\kalshi\raw\segment-00000463.ready `
+  --output C:\Users\dakin\Projects\Kalshi15mRustStageResearch\opening-window\opening.ndjson `
+  --start-utc 2026-10-31T10:30:00Z `
+  --end-utc 2026-10-31T10:33:00Z `
+  --target-market KXBTC15M-26OCT310645-45 `
+  --max-source-events 500000
+```
+
+Offline replay reports the final per-market synchronized state and best bid/ask prices and sizes, alongside event, duplicate, and sequence-gap counts. It does not make exchange requests.
 
 ## Verification gates
 

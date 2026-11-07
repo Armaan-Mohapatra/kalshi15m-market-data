@@ -3,7 +3,7 @@ on:
   push:
     branches: [collector/rust-v1]
   pull_request:
-    branches: [main]
+    branches: [main, collector/rust-v1, codex/rust-windows-integration]
   workflow_dispatch:
 concurrency:
   group: rust-collector-${{ github.head_ref || github.ref_name }}
@@ -27,15 +27,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust/collector
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Check lint warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
       - name: Build offline replay and bounded REST CLI
-        run: cargo build --all-targets --verbose
+        run: cargo build --all-targets --locked --verbose
       - name: Run deterministic unit and integration tests
-        run: cargo test --all-targets -- --nocapture
+        run: cargo test --all-targets --locked -- --nocapture
       - uses: actions/setup-python@v5
         with:
           python-version: '3.14'
       - name: Install Python Parquet compatibility reader
         run: python -m pip install pyarrow==24.0.0
+      - name: Test finalized WebSocket segment converter
+        run: python -m unittest discover -s tools/tests -p "test_*.py"
       - name: Validate offline replay -> SQLite/Parquet
         shell: pwsh
         run: |

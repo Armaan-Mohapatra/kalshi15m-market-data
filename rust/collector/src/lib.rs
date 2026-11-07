@@ -8,5 +8,6 @@ pub mod book;
 pub mod discovery;
 pub mod event;
 pub mod replay;
+pub mod runtime;
 pub mod storage;
 pub mod websocket;
