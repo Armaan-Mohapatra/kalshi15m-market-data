@@ -9,7 +9,7 @@ use std::time::Duration;
 #[command(name="kalshi15m-rust", version, about="Isolated read-only Rust Kalshi market-data replay and staging capture")]
 struct Cli {
     /// REQUIRED isolated staging directory; never point at live Python/Phoenix files.
-    #[arg(long, global=true)]
+    #[arg(long)]
     home: PathBuf,
     #[command(subcommand)]
     action: Commands,
