@@ -673,6 +673,43 @@ mod tests {
     }
 
     #[test]
+    fn readonly_archive_verification_fails_for_missing_or_corrupt_parts() {
+        for corrupt in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let mut writer = Journal::open(home.path()).unwrap();
+            let event = Event::new(
+                "rest",
+                "trade",
+                Some("ARCHIVE-TEST"),
+                json!({"id":"integrity"}),
+                Some("archive-integrity-test".into()),
+            );
+            assert_eq!(writer.ingest(&event).unwrap(), IngestResult::Inserted);
+            writer.close().unwrap();
+
+            let archive_root = home.path().join("data").join("market_data");
+            let parts = archive::list_final_parts(&archive_root, 10).unwrap();
+            assert_eq!(parts.len(), 1);
+            if corrupt {
+                let mut bytes = fs::read(&parts[0]).unwrap();
+                bytes[0] ^= 0x01;
+                fs::write(&parts[0], bytes).unwrap();
+            } else {
+                fs::remove_file(&parts[0]).unwrap();
+            }
+
+            let readonly = Journal::open_readonly(home.path()).unwrap();
+            assert!(!readonly.verify_archive().unwrap());
+            assert_eq!(
+                readonly.audit().unwrap()["archive_marker"],
+                "CLEAN_ARCHIVE_VERIFIED"
+            );
+            drop(readonly);
+            assert_eq!(parts[0].exists(), corrupt);
+        }
+    }
+
+    #[test]
     fn journal_retains_conflicts_and_archives_exactly_once() {
         let home = tempfile::tempdir().unwrap();
         let mut store = Journal::open(home.path()).unwrap();
