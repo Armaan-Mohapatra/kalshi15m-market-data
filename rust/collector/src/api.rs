@@ -171,6 +171,55 @@ impl PublicRest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn mock_http_server(
+        responses: Vec<(u16, Value)>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/trade-api/v2", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut paths = Vec::new();
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert_ne!(count, 0, "client closed before sending request headers");
+                    request.extend_from_slice(&buffer[..count]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .expect("HTTP request target")
+                    .to_owned();
+                paths.push(path);
+                let body = body.to_string();
+                let reason = match status {
+                    200 => "OK",
+                    429 => "Too Many Requests",
+                    503 => "Service Unavailable",
+                    _ => "Fixture Response",
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+            paths
+        });
+        (base, server)
+    }
+
     #[test]
     fn rejects_nonread_routes_and_unapproved_endpoint() {
         assert!(PublicRest::new("https://evil.invalid/api", Duration::ZERO).is_err());
@@ -182,5 +231,77 @@ mod tests {
         assert!(runtime
             .block_on(client.get("/portfolio/orders", &[]))
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn trade_pagination_uses_cursor_and_stops_on_empty_cursor() {
+        let (base, server) = mock_http_server(vec![
+            (
+                200,
+                json!({"trades":[{"trade_id":"a"}],"cursor":"next-page"}),
+            ),
+            (200, json!({"trades":[{"trade_id":"b"}],"cursor":""})),
+        ])
+        .await;
+        let client = PublicRest::new(&base, Duration::ZERO).unwrap();
+        let (items, metadata) = client
+            .pages("/markets/trades", "trades", &[], 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            items,
+            vec![json!({"trade_id":"a"}), json!({"trade_id":"b"})]
+        );
+        assert_eq!(metadata.len(), 2);
+        let paths = server.await.unwrap();
+        assert_eq!(paths.len(), 2);
+        assert!(paths[0].contains("/markets/trades?"));
+        assert!(paths[1].contains("cursor=next-page"));
+    }
+
+    #[tokio::test]
+    async fn pagination_rejects_repeated_cursor_and_saturated_page_limit() {
+        let (base, server) = mock_http_server(vec![
+            (200, json!({"trades":[],"cursor":"same"})),
+            (200, json!({"trades":[],"cursor":"same"})),
+        ])
+        .await;
+        let repeated = PublicRest::new(&base, Duration::ZERO).unwrap();
+        assert!(repeated
+            .pages("/markets/trades", "trades", &[], 4)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("cursor repeated"));
+        assert_eq!(server.await.unwrap().len(), 2);
+
+        let (base, server) = mock_http_server(vec![
+            (200, json!({"trades":[],"cursor":"one"})),
+            (200, json!({"trades":[],"cursor":"two"})),
+        ])
+        .await;
+        let saturated = PublicRest::new(&base, Duration::ZERO).unwrap();
+        assert!(saturated
+            .pages("/markets/trades", "trades", &[], 2)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("cannot be certified complete"));
+        assert_eq!(server.await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn retries_http_429_and_503_before_returning_success() {
+        let (base, server) = mock_http_server(vec![
+            (429, json!({"error":"rate limited"})),
+            (503, json!({"error":"temporary service issue"})),
+            (200, json!({"trades":[],"cursor":""})),
+        ])
+        .await;
+        let client = PublicRest::new(&base, Duration::ZERO).unwrap();
+        let response = client.get("/markets/trades", &[]).await.unwrap();
+        assert_eq!(response.body, json!({"trades":[],"cursor":""}));
+        assert_eq!(response.metadata["http_status"], 200);
+        assert_eq!(server.await.unwrap().len(), 3);
     }
 }
