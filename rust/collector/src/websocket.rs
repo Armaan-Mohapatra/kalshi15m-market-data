@@ -578,6 +578,7 @@ impl AuthenticatedWebSocket {
 #[derive(Debug, Default)]
 pub struct SubscriptionState {
     last_seq: Option<i64>,
+    registered: bool,
     configured_markets: Vec<String>,
     book_markets: Vec<String>,
     gap: Option<(i64, i64)>,
@@ -619,6 +620,7 @@ impl WebsocketEngine {
     }
     pub fn register_orderbook_subscription(&mut self, sid: i64, markets: &[String]) {
         let state = self.subscriptions.entry(sid).or_default();
+        state.registered = true;
         for market in markets {
             if !state.configured_markets.contains(market) {
                 state.configured_markets.push(market.clone());
@@ -677,10 +679,14 @@ impl WebsocketEngine {
         let membership = match (sid, ticker.as_deref()) {
             (_, None) => "NO_MARKET_TICKER",
             (Some(sid), Some(ticker)) => match self.subscriptions.get(&sid) {
-                Some(state) if state.configured_markets.iter().any(|x| x == ticker) => {
+                Some(state)
+                    if !state.registered
+                        || state.configured_markets.iter().any(|x| x == ticker) =>
+                {
                     "SUBSCRIBED_TICKER"
                 }
-                Some(_) => "UNSUBSCRIBED_TICKER",
+                Some(state) if state.registered => "UNSUBSCRIBED_TICKER",
+                Some(_) => "UNKNOWN_SUBSCRIPTION",
                 None => "UNKNOWN_SUBSCRIPTION",
             },
             (None, Some(_)) => "MISSING_SUBSCRIPTION_ID",
