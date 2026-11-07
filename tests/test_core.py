@@ -536,7 +536,10 @@ class ClassificationTests(unittest.TestCase):
 
 class FrozenStrategyTests(unittest.TestCase):
     def setUp(self):
-        self.config, self.config_hash = load_frozen_strategy(Path(__file__).resolve().parents[1])
+        source_root = Path(__file__).resolve().parents[1]
+        if not (source_root / "strategy" / "reflex_vnext_frozen_config.json").is_file():
+            self.skipTest("requires private frozen strategy authority omitted from sanitized GitHub snapshot")
+        self.config, self.config_hash = load_frozen_strategy(source_root)
         self.now = datetime.now(timezone.utc)
         self.market = {
             "ticker": "KXBTC15M-SAMPLE",
