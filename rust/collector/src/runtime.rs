@@ -406,7 +406,7 @@ impl ContinuousRuntime {
 
         let mut due_markets: Vec<Market> = self
             .discovery
-            .near_open(now, config.opening_pre_seconds, config.opening_post_seconds)
+            .scheduled(now, config.opening_pre_seconds, config.opening_post_seconds)
             .into_iter()
             .cloned()
             .collect();
@@ -430,16 +430,6 @@ impl ContinuousRuntime {
                     Some(format!("market-open|{ticker}|{}", market.open.timestamp())),
                 ));
             }
-            if market.close <= now && previous_open == Some(true) {
-                pending.push(Event::new(
-                    "market_lifecycle",
-                    "market_closed_observed",
-                    Some(ticker),
-                    json!({"scheduled_close_utc":market.close.to_rfc3339(),"observed_utc":now.to_rfc3339()}),
-                    Some(format!("market-close|{ticker}|{}", market.close.timestamp())),
-                ));
-            }
-
             self.market_health
                 .entry(ticker.to_string())
                 .or_insert_with(|| MarketHealth {
@@ -627,6 +617,36 @@ impl ContinuousRuntime {
             if !pending.is_empty() {
                 let batch = std::mem::take(&mut pending);
                 self.commit_bounded(journal, health, batch).await?;
+            }
+        }
+
+        // Active-market polling ends at close_time, so detect close transitions
+        // from the small set of markets known open on the prior cycle.
+        let newly_closed = self
+            .last_open_state
+            .iter()
+            .filter(|(ticker, was_open)| {
+                **was_open
+                    && self
+                        .discovery
+                        .get(ticker)
+                        .is_some_and(|market| market.close <= now)
+            })
+            .map(|(ticker, _)| ticker.clone())
+            .collect::<Vec<_>>();
+        for ticker in newly_closed {
+            if let Some(market) = self.discovery.get(&ticker) {
+                pending.push(Event::new(
+                    "market_lifecycle",
+                    "market_closed_observed",
+                    Some(&ticker),
+                    json!({"scheduled_close_utc":market.close.to_rfc3339(),"observed_utc":now.to_rfc3339()}),
+                    Some(format!("market-close|{ticker}|{}", market.close.timestamp())),
+                ));
+            }
+            self.last_open_state.remove(&ticker);
+            if let Some(item) = self.market_health.get_mut(&ticker) {
+                item.market_state = "CLOSED".into();
             }
         }
 
@@ -918,6 +938,59 @@ mod tests {
         assert_eq!(health.markets["KXTEST15M-ONE"].trades_complete, Some(true));
         assert!(journal.verify_archive().unwrap());
         assert_eq!(journal.audit().unwrap()["canonical_events"], 6);
+        journal.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn scheduler_polls_active_market_after_opening_window_and_records_close() {
+        let home = tempfile::tempdir().unwrap();
+        let open = Utc.with_ymd_and_hms(2026, 11, 7, 12, 0, 0).unwrap();
+        let close = open + ChronoDuration::seconds(900);
+        let source = MockSource {
+            market: json!({"ticker":"KXTEST15M-ACTIVE","status":"open",
+                "open_time":open.to_rfc3339(),"close_time":close.to_rfc3339()}),
+            books: Mutex::new(vec![Some(json!({"yes_dollars_fp":[],"no_dollars_fp":[]}))]),
+            trade_complete: true,
+        };
+        let mut runtime = ContinuousRuntime::default();
+        let mut journal = Journal::open(home.path()).unwrap();
+        let mut health = RuntimeHealth::new(config().queue_capacity);
+
+        // Six minutes after opening is beyond the three-minute opening
+        // priority window, but the contract remains active for nine more.
+        let active = open + ChronoDuration::seconds(360);
+        let sampled = runtime
+            .run_cycle(&source, &mut journal, &config(), &mut health, active)
+            .await
+            .unwrap();
+        assert_eq!(sampled.book_polls, 1);
+        assert_eq!(sampled.trade_polls, 1);
+        assert_eq!(health.markets["KXTEST15M-ACTIVE"].market_state, "OPEN");
+
+        // After scheduled close the market is no longer polled, but its
+        // lifecycle transition is still durably observed.
+        let closed = runtime
+            .run_cycle(
+                &source,
+                &mut journal,
+                &config(),
+                &mut health,
+                close + ChronoDuration::seconds(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(closed.book_polls, 0);
+        assert_eq!(closed.trade_polls, 0);
+        assert_eq!(health.markets["KXTEST15M-ACTIVE"].market_state, "CLOSED");
+        let close_events: i64 = journal
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM market_events WHERE kind='market_closed_observed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(close_events, 1);
         journal.close().unwrap();
     }
 

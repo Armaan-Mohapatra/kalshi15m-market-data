@@ -178,8 +178,29 @@ impl Discovery {
             .collect()
     }
 
+    /// Markets that need periodic sampling: every active contract plus the
+    /// bounded pre/post opening window for upcoming and recently opened rows.
+    pub fn scheduled(&self, now: DateTime<Utc>, pre: i64, post: i64) -> Vec<&Market> {
+        self.markets
+            .values()
+            .filter(|market| {
+                let seconds = market.seconds_to_open(now);
+                let in_opening_window = seconds <= pre && seconds >= -post;
+                let active = market.open <= now
+                    && now < market.close
+                    && ["open", "active", "unopened", "initialized"]
+                        .contains(&market.status.as_str());
+                active || in_opening_window
+            })
+            .collect()
+    }
+
     pub fn all(&self) -> Vec<&Market> {
         self.markets.values().collect()
+    }
+
+    pub fn get(&self, ticker: &str) -> Option<&Market> {
+        self.markets.get(ticker)
     }
 }
 
@@ -198,6 +219,7 @@ mod tests {
         assert_eq!(d.all().len(), 2);
         assert_eq!(d.active(now).len(), 1);
         assert_eq!(d.near_open(now, 600, 120).len(), 2);
+        assert_eq!(d.scheduled(now, 600, 120).len(), 2);
         assert!(events
             .iter()
             .any(|x| x.payload.get("floor_strike").is_some()));
