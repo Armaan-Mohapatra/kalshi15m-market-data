@@ -2446,46 +2446,133 @@ class Collector:
             self._update_paper_status()
 
     async def collect_rest_depth(self) -> None:
+        """Capture sampled REST book states and independently record per-market coverage."""
         tickers = sorted(self.open_tickers)
         poll_started = utc_now()
-        request_count = 0
-        successful_request_count = 0
-        rows_received = 0
+        request_count = successful_request_count = rows_received = errors = 0
         markets_with_data: set[str] = set()
-        errors = 0
         for start in range(0, len(tickers), 100):
             batch = tickers[start : start + 100]
-            received = utc_now()
+            requested_utc = utc_now()
+            began = time.perf_counter()
             request_count += 1
             try:
                 payload = await self.api.get("/markets/orderbooks", {"tickers": batch})
+                observed_utc = utc_now()
                 successful_request_count += 1
-                orderbooks = payload.get("orderbooks") or []
+                orderbooks = payload.get("orderbooks")
+                if not isinstance(orderbooks, list):
+                    raise ValueError("orderbooks response does not contain an array")
                 rows_received += len(orderbooks)
+                returned: set[str] = set()
+                valid: set[str] = set()
                 for item in orderbooks:
-                    ticker = str(item.get("ticker", ""))
-                    book = item.get("orderbook_fp") or {}
-                    if ticker:
-                        markets_with_data.add(ticker)
+                    if not isinstance(item, dict):
+                        errors += 1
+                        continue
+                    ticker = str(item.get("ticker") or "")
+                    if not ticker:
+                        errors += 1
+                        continue
+                    returned.add(ticker)
+                    book_payload = item.get("orderbook_fp") or item.get("orderbook")
+                    validation = "INVALID"
+                    quotes: dict[str, Any] = {}
+                    try:
+                        if not isinstance(book_payload, dict):
+                            raise ValueError("missing orderbook object")
+                        diagnostic_book = OrderBook()
+                        diagnostic_book.snapshot({"orderbook_fp": book_payload})
+                        quotes = diagnostic_book.quotes()
+                        validation = "VALID_EMPTY" if not (diagnostic_book.yes or diagnostic_book.no) else "VALID_WITH_LIQUIDITY"
+                        if ticker in batch:
+                            valid.add(ticker)
+                            markets_with_data.add(ticker)
+                            self.status.mark_channel("rest_orderbook")
+                            last_seen = dict(self.status.data.get("rest_book_last_observed_utc_by_ticker", {}))
+                            last_seen[ticker] = observed_utc
+                            self.status.update(rest_book_last_observed_utc_by_ticker=last_seen)
+                    except (ValueError, TypeError, KeyError) as exc:
+                        errors += 1
+                        validation = "INVALID_" + type(exc).__name__
                     await self.emit(
                         "rest_orderbook",
                         "orderbook_snapshot",
                         {
                             "source": "Kalshi public REST",
-                            "rest_request_started_utc": received,
+                            "rest_request_started_utc": requested_utc,
+                            "rest_response_observed_utc": observed_utc,
+                            "validation": validation,
                             **item,
-                            "executable_quotes": executable_quotes({"orderbook_fp": book}),
+                            "executable_quotes": quotes,
                         },
-                        ticker or None,
+                        ticker,
                         None,
-                        f"rest-book|{ticker}|{received}",
+                        f"rest-book|{ticker}|{requested_utc}",
                     )
-                    self.status.mark_channel("rest_orderbook")
+                    if ticker in valid and ticker not in self.first_rest_books:
+                        self.first_rest_books.add(ticker)
+                        await self.emit(
+                            "coverage",
+                            "first_book_observed",
+                            {
+                                "ticker": ticker, "source": "REST_SAMPLED_NOT_WS_SYNCHRONIZED",
+                                "scheduled_open_utc": self.markets.get(ticker, {}).get("open_time"),
+                                "observed_utc": observed_utc, "validation": validation,
+                                "run_id": self.run_id,
+                            },
+                            ticker,
+                            dedupe_key=f"first-rest-book|{ticker}",
+                        )
+                    if (ticker in valid and ticker not in self.first_executable_quotes
+                            and any(value is not None for value in quotes.values())):
+                        self.first_executable_quotes.add(ticker)
+                        await self.emit(
+                            "coverage", "first_executable_quote_observed",
+                            {
+                                "ticker": ticker, "source": "REST_SAMPLED",
+                                "scheduled_open_utc": self.markets.get(ticker, {}).get("open_time"),
+                                "observed_utc": observed_utc, "quotes": quotes, "run_id": self.run_id,
+                            },
+                            ticker,
+                            dedupe_key=f"first-executable-quote|{ticker}",
+                        )
+                missing = sorted(set(batch) - valid)
+                await self.emit(
+                    "rest_diagnostics", "rest_poll_result",
+                    {
+                        "channel": "rest_orderbook",
+                        "run_id": self.run_id,
+                        "started_utc": requested_utc,
+                        "completed_utc": observed_utc,
+                        "rtt_ms": round((time.perf_counter() - began) * 1000, 3),
+                        "http_status": 200,
+                        "requested_tickers": batch,
+                        "returned_tickers": sorted(returned),
+                        "valid_tickers": sorted(valid),
+                        "missing_or_invalid_tickers": missing,
+                        "coverage": "COMPLETE" if not missing else "INCOMPLETE",
+                        "server_date_header": None,
+                        "server_clock_offset_state": "NOT_MEASURED",
+                    },
+                    dedupe_key=f"rest-poll|{self.run_id}|{requested_utc}|rest_orderbook",
+                )
             except Exception as exc:
                 errors += 1
                 self.status.update(
                     error_count=self.status.data.get("error_count", 0) + 1,
                     last_error=f"orderbook REST failed: {type(exc).__name__}",
+                )
+                await self.emit(
+                    "rest_diagnostics", "rest_poll_result",
+                    {
+                        "channel": "rest_orderbook", "run_id": self.run_id,
+                        "started_utc": requested_utc, "completed_utc": utc_now(),
+                        "rtt_ms": round((time.perf_counter() - began) * 1000, 3),
+                        "http_status": None, "error_type": type(exc).__name__,
+                        "requested_tickers": batch, "coverage": "INCOMPLETE",
+                    },
+                    dedupe_key=f"rest-poll|{self.run_id}|{requested_utc}|rest_orderbook",
                 )
                 LOG.warning("REST orderbook reconciliation failed: %s", type(exc).__name__)
         self.status.mark_rest_poll(
@@ -2500,42 +2587,111 @@ class Collector:
         )
 
     async def collect_recent_trades(self) -> None:
-        # The wider pre-open subscription window must not multiply the
-        # per-market trade-history requests; collect those for active markets.
+        """Page historical public trades; advance overlap watermark only on completion."""
         tickers = sorted(self.active_tickers or self.open_tickers)
         poll_started = utc_now()
-        request_count = 0
-        successful_request_count = 0
-        rows_received = 0
+        request_count = successful_request_count = rows_received = errors = 0
         markets_with_data: set[str] = set()
-        errors = 0
         for ticker in tickers:
-            request_count += 1
+            market_open = parse_time(self.markets.get(ticker, {}).get("open_time"))
+            # A restarted worker must not assume any earlier poll completed.
+            initial_since = int((market_open - timedelta(seconds=60)).timestamp()) if market_open else int(time.time()) - 3600
+            since = self.trade_poll_since_by_ticker.get(ticker, initial_since)
+            since = max(initial_since, since)
+            requested_utc = utc_now()
+            began = time.perf_counter()
+            cursor: str | None = None
+            seen_cursors: set[str] = set()
+            pages = trades_seen = 0
+            complete = False
+            request_error: str | None = None
             try:
-                payload = await self.api.get("/markets/trades", {"ticker": ticker, "limit": 100})
-                successful_request_count += 1
-                trades = payload.get("trades") or []
-                rows_received += len(trades)
-                if trades:
-                    markets_with_data.add(ticker)
-                for trade in trades:
-                    trade_id = str(trade.get("trade_id", ""))
+                for _ in range(20):
+                    params: dict[str, Any] = {"ticker": ticker, "limit": 1000, "min_ts": since}
+                    if cursor:
+                        params["cursor"] = cursor
+                    request_count += 1
+                    payload = await self.api.get("/markets/trades", params)
+                    successful_request_count += 1
+                    trades = payload.get("trades")
+                    if not isinstance(trades, list):
+                        raise ValueError("trades response does not contain an array")
+                    pages += 1
+                    rows_received += len(trades)
+                    trades_seen += len(trades)
+                    if trades:
+                        markets_with_data.add(ticker)
+                    for trade in trades:
+                        if not isinstance(trade, dict):
+                            raise ValueError("trade response contains a non-object")
+                        trade_id = str(trade.get("trade_id") or "")
+                        exchange_ts = trade.get("created_time")
+                        await self.emit(
+                            "rest_public_trades", "public_trade",
+                            {"source": "Kalshi public REST", **trade},
+                            ticker,
+                            exchange_ts,
+                            f"trade|{trade_id}" if trade_id else None,
+                        )
+                        self.status.mark_channel("rest_public_trades", exchange_ts)
+                        if ticker not in self.first_trades:
+                            self.first_trades.add(ticker)
+                            await self.emit(
+                                "coverage", "first_trade_observed",
+                                {
+                                    "ticker": ticker, "source": "REST_PUBLIC_TRADES",
+                                    "scheduled_open_utc": self.markets.get(ticker, {}).get("open_time"),
+                                    "observed_utc": utc_now(), "exchange_trade_utc": exchange_ts,
+                                    "first_observed_not_first_exchange_trade": True,
+                                    "run_id": self.run_id,
+                                },
+                                ticker, exchange_ts,
+                                f"first-trade-observed|{ticker}",
+                            )
+                    next_cursor = payload.get("cursor") or None
+                    if not next_cursor:
+                        complete = True
+                        break
+                    if next_cursor == cursor or str(next_cursor) in seen_cursors:
+                        raise ValueError("trade pagination cursor repeated")
+                    seen_cursors.add(str(next_cursor))
+                    cursor = str(next_cursor)
+                if not complete:
+                    errors += 1
+                    request_error = "PAGE_LIMIT_REACHED"
                     await self.emit(
-                        "rest_public_trades",
-                        "public_trade",
-                        {"source": "Kalshi public REST", **trade},
-                        ticker,
-                        trade.get("created_time"),
-                        f"trade|{trade_id}" if trade_id else None,
+                        "rest_diagnostics", "trade_poll_saturated",
+                        {"ticker": ticker, "min_ts": since, "page_limit": 20, "cursor_remaining": bool(cursor)},
+                        ticker, dedupe_key=f"trade-saturated|{self.run_id}|{ticker}|{requested_utc}",
                     )
-                    self.status.mark_channel("rest_public_trades", trade.get("created_time"))
+                else:
+                    # Overlap handles delayed exchange trade publication.
+                    self.trade_poll_since_by_ticker[ticker] = max(
+                        since, int(datetime.fromisoformat(requested_utc).timestamp()) - 180
+                    )
             except Exception as exc:
                 errors += 1
-                LOG.info("trade reconciliation failed for one market: %s", type(exc).__name__)
+                request_error = type(exc).__name__
                 self.status.update(
                     error_count=self.status.data.get("error_count", 0) + 1,
                     last_error=f"trade REST failed: {type(exc).__name__}",
                 )
+                LOG.warning("public trade reconciliation incomplete for %s: %s", ticker, type(exc).__name__)
+            await self.emit(
+                "rest_diagnostics", "rest_poll_result",
+                {
+                    "channel": "rest_public_trades", "run_id": self.run_id,
+                    "ticker": ticker, "started_utc": requested_utc,
+                    "completed_utc": utc_now(),
+                    "elapsed_ms": round((time.perf_counter() - began) * 1000, 3),
+                    "min_ts": since, "page_count": pages,
+                    "row_count": trades_seen, "complete": complete,
+                    "error": request_error,
+                    "server_date_header": None, "server_clock_offset_state": "NOT_MEASURED",
+                },
+                ticker,
+                dedupe_key=f"trade-poll|{self.run_id}|{ticker}|{requested_utc}",
+            )
         self.status.mark_rest_poll(
             "rest_public_trades",
             started_utc=poll_started,
