@@ -24,6 +24,14 @@ pub struct PublicRest {
 
 impl PublicRest {
     pub fn new(base: &str, min_spacing: Duration) -> Result<Self> {
+        Self::new_with_timeout(base, min_spacing, Duration::from_secs(25))
+    }
+
+    fn new_with_timeout(
+        base: &str,
+        min_spacing: Duration,
+        request_timeout: Duration,
+    ) -> Result<Self> {
         let clean = base.trim_end_matches('/');
         let official = clean == DEFAULT_BASE;
         let loopback =
@@ -33,7 +41,7 @@ impl PublicRest {
         }
         let client = Client::builder()
             .user_agent("phoenix-kalshi15m-rust-staging/0.1 read-only")
-            .timeout(Duration::from_secs(25))
+            .timeout(request_timeout)
             .build()?;
         Ok(Self {
             base: clean.to_owned(),
@@ -272,6 +280,37 @@ mod tests {
         assert_eq!(paths.len(), 2);
         assert!(paths[0].contains("/markets/trades"));
         assert!(paths[1].contains("cursor=next-page"));
+    }
+
+    #[tokio::test]
+    async fn incomplete_trade_page_fails_instead_of_claiming_empty_success() {
+        let (base, server) = mock_http_server(vec![(200, json!({"cursor":""}), None)]).await;
+        let client = PublicRest::new(&base, Duration::ZERO).unwrap();
+        let error = client
+            .pages("/markets/trades", "trades", &[], 3)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("missing trades array"));
+        assert_eq!(server.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn request_timeout_retries_are_bounded_and_report_transport_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/trade-api/v2", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 1024];
+                assert!(stream.read(&mut request).await.unwrap() > 0);
+                tokio::time::sleep(Duration::from_millis(80)).await;
+            }
+        });
+        let client =
+            PublicRest::new_with_timeout(&base, Duration::ZERO, Duration::from_millis(20)).unwrap();
+        let error = client.get("/markets/trades", &[]).await.unwrap_err();
+        assert!(format!("{error:#}").contains("REST network timeout/transport"));
+        server.await.unwrap();
     }
 
     #[tokio::test]
