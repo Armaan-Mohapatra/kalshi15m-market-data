@@ -696,6 +696,32 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_capacity_volume_fails_explicitly_and_preserves_journaled_data() {
+        let home = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(home.path()).unwrap();
+        let event = Event::new(
+            "websocket_orderbook",
+            "orderbook_delta",
+            Some("KXBTC15M-DISK-MOCK"),
+            json!({"seq":31}),
+            Some("disk-capacity-probe-mock".into()),
+        );
+        assert_eq!(journal.ingest(&event).unwrap(), IngestResult::Inserted);
+
+        let original_home = std::mem::replace(
+            &mut journal.home,
+            home.path().join("unavailable-volume-mount"),
+        );
+        assert!(
+            journal.capacity_snapshot().is_err(),
+            "an unavailable capacity path must never look like normal free space"
+        );
+        journal.home = original_home;
+        assert_eq!(journal.audit().unwrap()["canonical_events"], 1);
+        journal.close().unwrap();
+    }
+
+    #[test]
     fn readonly_audit_preserves_clean_marker_and_does_not_replay_spool() {
         let home = tempfile::tempdir().unwrap();
         let mut writer = Journal::open(home.path()).unwrap();
