@@ -2320,7 +2320,7 @@ class StorageTests(unittest.TestCase):
             connection = sqlite3.connect(cfg.ledger_path)
             try:
                 connection.execute(
-                    """CREATE TABLE market_event_versions (
+                    """CREATE TABLE IF NOT EXISTS market_event_versions (
                         source_generation TEXT NOT NULL,
                         row_sha256 TEXT NOT NULL,
                         captured_utc TEXT NOT NULL,
