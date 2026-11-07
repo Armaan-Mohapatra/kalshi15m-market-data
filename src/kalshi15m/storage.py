@@ -369,6 +369,7 @@ class Storage:
 
     def recover_parquet_archive(self) -> int:
         """Rebuild missing Parquet event variants from the durable SQLite journal."""
+        self.corrupt_parquet_parts = []
         if self.connection is None:
             raise RuntimeError("Storage is not open")
         if self.parquet_bytes >= self.cfg.raw_data_budget_bytes:
@@ -427,6 +428,7 @@ class Storage:
                     else None
                 )
                 try:
+                    fingerprint_db.execute("SAVEPOINT parquet_part")
                     for batch in parquet_file.iter_batches(columns=columns, batch_size=5000):
                         fingerprints = []
                         for row in batch.to_pylist():
@@ -435,8 +437,11 @@ class Storage:
                             if row.get("dedupe_key") is not None:
                                 fingerprints.append((event_archive_fingerprint(row),))
                         fingerprint_db.executemany(insert_fingerprint, fingerprints)
+                    fingerprint_db.execute("RELEASE SAVEPOINT parquet_part")
                     fingerprint_db.commit()
                 except Exception as exc:
+                    fingerprint_db.execute("ROLLBACK TO SAVEPOINT parquet_part")
+                    fingerprint_db.execute("RELEASE SAVEPOINT parquet_part")
                     self.corrupt_parquet_parts.append(str(path))
                     LOG.error("unreadable Parquet row group: %s (%s)", path, type(exc).__name__)
                     continue
@@ -793,6 +798,14 @@ class Storage:
             prepared.append((event, dedupe, digest, raw))
 
         keys = list(dict.fromkeys(item[1] for item in prepared))
+        # Prior versions are already committed; do not rearchive them on
+        # overlapping REST observations, even though the canonical key differs.
+        prior_versions = {
+            str(row[0]) for row in self.connection.execute(
+                "SELECT row_sha256 FROM market_event_versions WHERE source_generation = ?",
+                ("collector-runtime",),
+            )
+        }
         existing: dict[str, str] = {}
         seen: dict[str, str] = {}
         for start in range(0, len(keys), 500):
@@ -827,6 +840,9 @@ class Storage:
                 version_hash = hashlib.sha256(
                     (dedupe + "|" + digest).encode("utf-8")
                 ).hexdigest()
+                if version_hash in prior_versions:
+                    continue
+                prior_versions.add(version_hash)
                 version_rows.append(
                     ("collector-runtime", version_hash, datetime.now(timezone.utc).isoformat(), *row)
                 )
