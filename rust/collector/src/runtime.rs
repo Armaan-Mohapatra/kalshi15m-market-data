@@ -828,6 +828,7 @@ impl ContinuousRuntime {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use rusqlite::{Connection, TransactionBehavior};
     use std::sync::Mutex;
 
     struct MockSource {
@@ -981,6 +982,52 @@ mod tests {
         assert_eq!(recovered.audit().unwrap()["canonical_events"], 3);
         assert_eq!(recovered.audit().unwrap()["pending_spool_entries"], 0);
         assert_eq!(recovered.stats.spool_replayed, 3);
+        recovered.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn sqlite_lock_spools_unacknowledged_event_and_restart_recovers_it() {
+        let home = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(home.path()).unwrap();
+        journal
+            .conn
+            .busy_timeout(Duration::from_millis(25))
+            .unwrap();
+        let database = home.path().join("data/paper_ledger.sqlite3");
+        let mut competing_writer = Connection::open(database).unwrap();
+        let lock = competing_writer
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+
+        let mut runtime = ContinuousRuntime::default();
+        let mut health = RuntimeHealth::new(2);
+        let event = Event::new(
+            "rest",
+            "trade",
+            Some("LOCK-TEST"),
+            json!({"id":"must-not-be-acknowledged-early"}),
+            Some("sqlite-lock-spool-test".into()),
+        );
+        let error = runtime
+            .commit_bounded(&mut journal, &mut health, vec![event])
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("SQLite write failed; event spooled"));
+        assert_eq!(health.events_acknowledged, 0);
+        assert_eq!(health.sqlite_state, "DEGRADED_SPOOLED");
+        assert_eq!(journal.audit().unwrap()["canonical_events"], 0);
+        assert_eq!(journal.audit().unwrap()["pending_spool_entries"], 1);
+
+        drop(lock);
+        drop(competing_writer);
+        drop(journal);
+
+        let recovered = Journal::open(home.path()).unwrap();
+        assert_eq!(recovered.audit().unwrap()["canonical_events"], 1);
+        assert_eq!(recovered.audit().unwrap()["pending_spool_entries"], 0);
+        assert_eq!(recovered.stats.spool_replayed, 1);
         recovered.close().unwrap();
     }
 }
