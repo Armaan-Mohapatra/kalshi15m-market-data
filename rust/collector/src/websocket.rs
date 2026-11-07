@@ -70,6 +70,31 @@ fn sign_rsa(key: &RsaPrivateKey, message: &[u8]) -> Result<String> {
     Ok(BASE64.encode(signature))
 }
 
+fn malformed_frame_event(
+    engine: &WebsocketEngine,
+    raw: &[u8],
+    encoding: &str,
+    error: &str,
+) -> Event {
+    Event::new(
+        "websocket_raw",
+        "malformed_frame",
+        None,
+        json!({
+            "session_id":engine.session(),
+            "received_utc":utc_now(),
+            "encoding":encoding,
+            "raw_hex":hex::encode(raw),
+            "parse_error":error,
+        }),
+        Some(format!(
+            "ws-malformed|{}|{}",
+            engine.session(),
+            hash_bytes(raw)
+        )),
+    )
+}
+
 #[derive(Clone, Debug)]
 pub struct WebSocketConfigStage {
     pub url: String,
@@ -217,7 +242,14 @@ impl AuthenticatedWebSocket {
                 }
                 next = socket.next() => match next {
                     Some(Ok(Message::Text(raw))) => {
-                        let mut parsed: Value = serde_json::from_str(&raw).context("invalid WebSocket JSON frame")?;
+                        let mut parsed: Value = match serde_json::from_str(&raw) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                let event = malformed_frame_event(engine, raw.as_bytes(), "utf8", &error.to_string());
+                                events.send(event).await.map_err(|_| anyhow!("WebSocket event receiver closed"))?;
+                                return Err(error).context("invalid WebSocket JSON frame");
+                            }
+                        };
                         if let Some(object) = parsed.as_object_mut() {
                             object.insert("_collector_received_utc".into(), json!(utc_now()));
                         }
@@ -226,7 +258,14 @@ impl AuthenticatedWebSocket {
                         }
                     }
                     Some(Ok(Message::Binary(raw))) => {
-                        let mut parsed: Value = serde_json::from_slice(&raw).context("invalid binary WebSocket JSON frame")?;
+                        let mut parsed: Value = match serde_json::from_slice(&raw) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                let event = malformed_frame_event(engine, &raw, "binary", &error.to_string());
+                                events.send(event).await.map_err(|_| anyhow!("WebSocket event receiver closed"))?;
+                                return Err(error).context("invalid binary WebSocket JSON frame");
+                            }
+                        };
                         if let Some(object) = parsed.as_object_mut() {
                             object.insert("_collector_received_utc".into(), json!(utc_now()));
                         }
@@ -510,5 +549,15 @@ mod tests {
         enabled.allow_network = true;
         enabled.url = "wss://attacker.invalid/trade-api/ws/v2".to_owned();
         assert!(AuthenticatedWebSocket::new(enabled).is_err());
+    }
+
+    #[test]
+    fn malformed_frames_retain_bytes_and_connection_identity() {
+        let engine = WebsocketEngine::with_session("fixture-connection");
+        let event = malformed_frame_event(&engine, b"{bad", "utf8", "test parse failure");
+        assert_eq!(event.kind, "malformed_frame");
+        assert_eq!(event.payload["raw_hex"], "7b626164");
+        assert_eq!(event.payload["session_id"], "fixture-connection");
+        assert!(event.dedupe_key.unwrap().contains("fixture-connection"));
     }
 }
