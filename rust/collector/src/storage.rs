@@ -162,6 +162,13 @@ impl Journal {
 
     /// Metadata-only capacity check for the isolated journal volume.
     pub fn capacity_snapshot(&self) -> Result<CapacitySnapshot> {
+        self.capacity_snapshot_with_probe(fs2::available_space)
+    }
+
+    fn capacity_snapshot_with_probe(
+        &self,
+        probe_available_space: impl FnOnce(&Path) -> std::io::Result<u64>,
+    ) -> Result<CapacitySnapshot> {
         let db = self.home.join("data").join("paper_ledger.sqlite3");
         let wal = self.home.join("data").join("paper_ledger.sqlite3-wal");
         let size = |path: &Path| -> Result<u64> {
@@ -171,7 +178,8 @@ impl Journal {
                 0
             })
         };
-        let disk_free_bytes = fs2::available_space(&self.home)?;
+        let disk_free_bytes = probe_available_space(&self.home)
+            .context("query available space for isolated staging volume")?;
         let sqlite_bytes = size(&db)?;
         let wal_bytes = size(&wal)?;
         Ok(CapacitySnapshot {
@@ -708,15 +716,10 @@ mod tests {
         );
         assert_eq!(journal.ingest(&event).unwrap(), IngestResult::Inserted);
 
-        let original_home = std::mem::replace(
-            &mut journal.home,
-            home.path().join("unavailable-volume-mount"),
-        );
-        assert!(
-            journal.capacity_snapshot().is_err(),
-            "an unavailable capacity path must never look like normal free space"
-        );
-        journal.home = original_home;
+        let capacity_error = journal
+            .capacity_snapshot_with_probe(|_| Err(std::io::Error::other("injected volume outage")))
+            .unwrap_err();
+        assert!(format!("{capacity_error:#}").contains("injected volume outage"));
         assert_eq!(journal.audit().unwrap()["canonical_events"], 1);
         journal.close().unwrap();
     }
