@@ -162,7 +162,9 @@ def convert_segment(
     requested_subscriptions = subscription_ids
     counts: Counter[str] = Counter()
     event_counts: Counter[str] = Counter()
-    seq_state: dict[int, int] = {}
+    # A Kalshi subscription ID may be reused after reconnection. Sequence
+    # continuity is meaningful only within the same connection generation.
+    seq_state: dict[tuple[str, int], int] = {}
     seq_breaks: Counter[str] = Counter()
     first_received: str | None = None
     last_received: str | None = None
@@ -199,10 +201,11 @@ def convert_segment(
                     expected_event_type=str(row["event_type"]),
                     source_id=source_sha256,
                 )
-                prior = seq_state.get(sid)
+                sequence_identity = (str(row["connection_generation"]), sid)
+                prior = seq_state.get(sequence_identity)
                 if prior is not None and message["seq"] != prior + 1:
                     seq_breaks[str(sid)] += 1
-                seq_state[sid] = message["seq"]
+                seq_state[sequence_identity] = message["seq"]
                 output.write(json.dumps(message, separators=(",", ":"), ensure_ascii=False))
                 output.write("\n")
                 written += 1
@@ -240,6 +243,7 @@ def convert_segment(
                 "Preserve numeric-subscription raw_payload JSON and source row order.",
                 "Exclude nonnumeric subscription_id rows such as REST:window.",
                 "Inject _fixture_session from source SHA-256 and connection_generation.",
+                "Check subscription sequence continuity only within the same source connection_generation.",
                 "Inject _collector_received_utc from source received_at.",
                 "Apply optional time and subscription filters without rewriting source data.",
             ],
