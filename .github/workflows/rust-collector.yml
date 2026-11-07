@@ -1,0 +1,65 @@
+name: Rust collector isolated validation
+on:
+  push:
+    branches: [collector/rust-v1]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+concurrency:
+  group: rust-collector-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  rust-build-test:
+    name: Rust build and tests / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        working-directory: rust/collector
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust/collector
+      - name: Build offline replay and bounded REST CLI
+        run: cargo build --all-targets --verbose
+      - name: Run deterministic unit and integration tests
+        run: cargo test --all-targets -- --nocapture
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Install Python Parquet compatibility reader
+        run: python -m pip install pyarrow==24.0.0
+      - name: Validate offline replay -> SQLite/Parquet
+        shell: pwsh
+        run: |
+          $stage = Join-Path "${{ runner.temp }}" 'Kalshi15mRustStage'
+          $input = Join-Path (Get-Location) 'fixtures/smoke.ndjson'
+          cargo run -- --home "$stage" replay --input "$input"
+          if ($LASTEXITCODE -ne 0) { throw 'Replay failed' }
+          cargo run -- --home "$stage" audit
+          if ($LASTEXITCODE -ne 0) { throw 'Audit failed' }
+          $db = Join-Path $stage 'data/paper_ledger.sqlite3'
+          if (-not (Test-Path -LiteralPath $db)) { throw 'Staging SQLite missing' }
+          $parts = Get-ChildItem -LiteralPath (Join-Path $stage 'data/market_data') -Filter '*.parquet' -Recurse
+          if (-not $parts) { throw 'No finalized Parquet generated' }
+          Write-Output "Verified staging files: $($parts.Count) Parquet parts"
+          python tools/check_python_parity.py "$stage"
+          if ($LASTEXITCODE -ne 0) { throw 'Python cross-language parity failed' }
+
+
+      - name: Publish tested Windows binary and lockfile for staging only
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-collector-windows-staging
+          path: |
+            rust/collector/target/debug/kalshi15m-rust.exe
+            rust/collector/Cargo.lock
+          if-no-files-found: error

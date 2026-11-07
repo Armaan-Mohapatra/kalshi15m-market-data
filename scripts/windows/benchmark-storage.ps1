@@ -1,5 +1,5 @@
 $ErrorActionPreference = 'Stop'
-$root = 'C:\Users\dakin\Projects\kalshi-15m-native'
+$root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $homePath = if ($env:KALSHI15M_HOME) { $env:KALSHI15M_HOME } else { Join-Path $env:LOCALAPPDATA 'Kalshi15mNative' }
 $sourceDb = Join-Path $homePath 'data\paper_ledger.sqlite3'
 $outputRoot = Join-Path $homePath 'benchmarks'

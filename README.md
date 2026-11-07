@@ -1,6 +1,6 @@
 # Kalshi 15m Native
 
-Independent native Windows project for read-only discovery and paper-only market research. Source lives in C:\Users\dakin\Projects\kalshi-15m-native. Runtime data and SQLite WAL ledger live under %LOCALAPPDATA%\Kalshi15mNative, outside OneDrive.
+Independent native Windows project for read-only discovery and paper-only market research. The repository checkout is relocatable; use the Git branch and checkout that passed isolated testing. The **default** runtime data and SQLite WAL ledger live under %LOCALAPPDATA%\Kalshi15mNative, outside OneDrive. Point KALSHI15M_HOME at an independent temporary path for tests; do not run a second collector against the live root.
 
 The worker has no exchange write client. REST access is GET-only. Paper ledger records remain local and are never sent to Kalshi.
 
@@ -8,13 +8,19 @@ The worker has no exchange write client. REST access is GET-only. Paper ledger r
 
 - Native Windows project is isolated from the REFLEX checkout.
 - The original standalone PAPER-only REFLEX vNext config remains hash-frozen to `KXBTC15M`. A separately versioned cross-market PAPER profile inherits the exact entry and sizing rules and evaluates verified non-BTC binary 900-second contracts; its parent BTC config hash is pinned in its own authority manifest. Original executor parity is still unresolved.
-- Public REST discovery scans the full series/event inventory every six hours. Startup reuses a valid local discovery snapshot younger than six hours and reconciles scheduled current, next, and recent unsettled markets before collecting. Known upcoming contracts are prewarmed up to 180 seconds early, with a scheduled reconciliation before and just after their opening boundary.
-- REST request pacing is 0.5 seconds by default and retries HTTP 429 responses with bounded exponential backoff. Final API failures remain visible in status.
-- The broad REST orderbook batch runs every 15 seconds; public trades for active markets run every 120 seconds. Status separates observed event age from poll age and marks a channel `STALE` after two scheduled intervals without a successful poll.
+- Public REST discovery scans the full series/event inventory every six hours. Startup reuses a valid local discovery snapshot younger than six hours and reconciles scheduled current, next, and recent unsettled markets before collecting. Known upcoming contracts are prewarmed up to 300 seconds early, with a scheduled reconciliation before and just after their opening boundary; recent-open market scans address discovery gaps.
+- REST request pacing is 2.0 seconds by default, shared across public GET routes with priority given to order books and rollover reconciliation. It retries HTTP 429 and bounded transient 5xx/timeout errors. The 0.5-second figure in the original snapshot was stale documentation, not a safe rate-limit target. Final API failures remain visible in status.
+- The broad REST orderbook batch is scheduled every 15 seconds; public trades for active markets are scheduled every 120 seconds and fetched with bounded cursor pagination and an incomplete-result state. These intervals are scheduling targets, not guarantees under rate limiting or long discovery passes. Status separates observed event age from poll age, marks incomplete REST book batches `DEGRADED`, and ages both `READY` and `DEGRADED` polls to `STALE` when they stop updating. A quiet but healthy trade market may legitimately return zero trades.
 - Kalshi requires signed authentication for WebSocket sessions, including public ticker, trade, orderbook, and lifecycle channels. This worker reads only the explicitly namespaced `KALSHI15M_MARKETDATA_API_KEY_ID` and `KALSHI15M_MARKETDATA_PRIVATE_KEY_PATH` variables; generic exchange credential variables do not enable WSS. Provide an independently authorized key reference for this read-only collector. It creates no key and never stores or prints credentials. Without those namespaced references, WSS stays blocked and REST remains active.
 - Current market inventory is refreshed from series metadata, event/market APIs, and official rules. Classification does not use ticker text.
 - Underlying reference sources are metadata only. This project does not purchase or query Pyth or another paid feed; missing sources stay missing.
 - A timestamped operating and storage sample is in [reports/operational-sample-2026-10-14.md](reports/operational-sample-2026-10-14.md). The live endpoint remains the authority for current status.
+
+## Reliability v2 development status
+
+The `collector/reliability-v2` branch is a **development snapshot**, not an authorized production release. It introduces additive journal conflict versions, nondestructive quarantine diagnostics, opening coverage observations, priority-aware shared REST scheduling, and archive verification manifests. The active Windows environment is separate and has not been validated here. The source snapshot omits the private frozen strategy authority; isolated CI explicitly skips the tests that require it. Run the complete suite in a separate Windows checkout **only after** confirming the intended local authority and environment. See [the reliability development contract](docs/RELIABILITY_V2_PLAN.md).
+
+The collector remains GET-only and PAPER_ONLY; no WSS credentials are installed or activated. REST book snapshots are sampled observations and **do not prove continuous order-book replay**. Market strike/contract definition metadata is not an independently observed underlying price-index feed. Source-capture completeness and Parquet-after-SQLite archive completeness are distinct properties.
 
 ## Setup
 

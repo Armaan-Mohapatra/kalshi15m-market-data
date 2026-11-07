@@ -8,6 +8,8 @@ import os
 import shutil
 import threading
 import time
+import uuid
+import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -22,6 +24,7 @@ from .auth import ws_auth_headers
 from .book import OrderBook
 from .classify import executable_quotes, parse_time
 from .config import Settings, WS_URL, settings
+from .coverage import OpeningCoverage
 from .discovery import (
     candidate_series_tickers,
     discover,
@@ -125,6 +128,9 @@ class RuntimeStatus:
             "last_rest_poll_by_channel": {},
             "rest_poll_ages_seconds": {},
             "rest_poll_health": {},
+            "rest_book_last_observed_utc_by_ticker": {},
+            "rest_book_health_by_ticker": {},
+            "collection_quality_state": "UNKNOWN_PENDING_INITIAL_POLL",
             "strategy_orderbook_source_state": "UNINITIALIZED",
             "strategy_websocket_books_used": 0,
             "strategy_rest_fallback_markets_used": 0,
@@ -256,11 +262,17 @@ class RuntimeStatus:
     ) -> None:
         """Track successful REST polling separately from observed market data."""
         completed = utc_now()
+        # A successful trade poll may legitimately return zero trades. A book
+        # snapshot poll cannot claim full coverage when requested tickers
+        # are absent from the response, even if HTTP returned 200.
+        missing_market_count = max(0, requested_market_count - markets_with_data)
         poll_status = (
             "NO_MARKETS"
             if requested_market_count == 0
             else "DEGRADED"
-            if error_count
+            if error_count or (
+                channel == "rest_orderbook" and missing_market_count > 0
+            )
             else "READY"
         )
         record = {
@@ -270,6 +282,7 @@ class RuntimeStatus:
             "successful_request_count": successful_request_count,
             "requested_market_count": requested_market_count,
             "markets_with_data": markets_with_data,
+            "missing_market_count": missing_market_count,
             "rows_received": rows_received,
             "error_count": error_count,
             "status": poll_status,
@@ -332,7 +345,11 @@ class RuntimeStatus:
             thresholds = self.data.get("rest_poll_stale_thresholds_seconds", {})
             for channel, age in self.data["rest_poll_ages_seconds"].items():
                 threshold = thresholds.get(channel)
-                if threshold is not None and age > threshold and health.get(channel) == "READY":
+                if (
+                    threshold is not None
+                    and age > threshold
+                    and health.get(channel) in {"READY", "DEGRADED"}
+                ):
                     health[channel] = "STALE"
                     profile_health_field = {
                         "rest_strategy_orderbook": "strategy_rest_poll_health",
@@ -340,6 +357,44 @@ class RuntimeStatus:
                     }.get(channel)
                     if profile_health_field and self.data.get(profile_health_field) == "READY":
                         self.data[profile_health_field] = "STALE"
+            # Per-market observations prevent a healthy channel-wide average
+            # from hiding an entirely missing market. A quiet book remains a
+            # valid *sample*; lack of price changes is not feed failure.
+            active_tickers = [
+                str(ticker) for ticker in self.data.get("market_tickers", [])
+            ]
+            rest_book_last = self.data.get("rest_book_last_observed_utc_by_ticker", {})
+            book_threshold = max(1.0, float(self.cfg.book_poll_interval_seconds * 2))
+            book_states: dict[str, str] = {}
+            for ticker in active_tickers:
+                observed = rest_book_last.get(ticker)
+                if not observed:
+                    book_states[ticker] = "NEVER_OBSERVED"
+                    continue
+                try:
+                    age = (now - datetime.fromisoformat(str(observed))).total_seconds()
+                    book_states[ticker] = (
+                        "REST_SAMPLED_RECENT" if 0 <= age <= book_threshold
+                        else "REST_SAMPLE_STALE_OR_CLOCK_ERROR"
+                    )
+                except (ValueError, TypeError):
+                    book_states[ticker] = "TIMESTAMP_INVALID"
+            self.data["rest_book_health_by_ticker"] = book_states
+            book_poll_state = health.get("rest_orderbook")
+            storage_state = str(self.data.get("storage_write_state") or "")
+            if storage_state in {"FATAL_NOT_DURABLE", "DEGRADED_RETRYING", "RECOVERY_SPOOLED_STOPPING"}:
+                quality = "CRITICAL_PERSISTENCE_UNVERIFIED"
+            elif not active_tickers:
+                quality = "UNKNOWN_NO_ACTIVE_MARKETS"
+            elif book_poll_state in {"DEGRADED", "STALE"} or any(
+                state != "REST_SAMPLED_RECENT" for state in book_states.values()
+            ):
+                quality = "DEGRADED_PARTIAL_REST_COVERAGE"
+            elif book_poll_state == "READY":
+                quality = "REST_SAMPLED_RECENT_NOT_CONTINUOUS"
+            else:
+                quality = "UNKNOWN_WAITING_FOR_REST_POLL"
+            self.data["collection_quality_state"] = quality
             self.data["heartbeat_utc"] = now.isoformat()
             self._write_locked()
 
@@ -416,6 +471,17 @@ def status_server(status: RuntimeStatus, cfg: Settings) -> ThreadingHTTPServer:
 class Collector:
     def __init__(self, cfg: Settings = settings) -> None:
         self.cfg = cfg
+        self.run_id = uuid.uuid4().hex
+        self.websocket_session_id: str | None = None
+        self.ws_gap_start_by_ticker: dict[str, tuple[str, float]] = {}
+        self.ws_last_message_monotonic: float | None = None
+        self.first_seen_tickers: set[str] = set()
+        self.first_rest_books: set[str] = set()
+        self.first_executable_quotes: set[str] = set()
+        self.first_trades: set[str] = set()
+        self.trade_poll_since_by_ticker: dict[str, int] = {}
+        self.opening_coverage = OpeningCoverage()
+        self.first_ws_synced_books: set[str] = set()
         self.api = PublicKalshiAPI()
         self.status = RuntimeStatus(cfg)
         self.storage = Storage(cfg)
@@ -784,6 +850,7 @@ class Collector:
             )
             return flushed_rows
 
+        spool_only = False
         while not self.stopping.is_set() or not self.queue.empty():
             batch: list[dict[str, Any]] = []
             try:
@@ -797,14 +864,45 @@ class Collector:
                 except asyncio.QueueEmpty:
                     break
             retry_count = 0
+            batch_spooled = False
             while True:
                 try:
-                    await loop.run_in_executor(
-                        self.writer_pool, self.storage.append_batch, batch
-                    )
+                    if spool_only:
+                        await loop.run_in_executor(
+                            self.writer_pool, self.storage.spool_batch, batch
+                        )
+                        batch_spooled = True
+                    else:
+                        await loop.run_in_executor(
+                            self.writer_pool, self.storage.append_batch_resilient, batch
+                        )
                     break
                 except Exception as exc:
                     retry_count += 1
+                    if retry_count >= 8:
+                        # Do not retry the same batch forever. Spool a complete
+                        # JSON batch durably and exit normal capture. If the
+                        # spool also fails, explicitly report non-durability.
+                        try:
+                            await loop.run_in_executor(
+                                self.writer_pool, self.storage.spool_batch, batch
+                            )
+                            batch_spooled = True
+                            spool_only = True
+                            self.stopping.set()
+                            self.status.update(
+                                storage_write_state="RECOVERY_SPOOLED_STOPPING",
+                                storage_pending_batch_events=len(batch),
+                                last_error=f"journal unavailable; batch spooled: {type(exc).__name__}",
+                            )
+                            break
+                        except Exception as spool_exc:
+                            self.stopping.set()
+                            self.status.update(
+                                storage_write_state="FATAL_NOT_DURABLE",
+                                last_error=f"journal and emergency spool failed: {type(spool_exc).__name__}",
+                            )
+                            raise RuntimeError("unable to persist collector events") from spool_exc
                     delay = min(0.25 * (2 ** min(retry_count - 1, 7)), 30.0)
                     try:
                         self.status.update(
@@ -831,14 +929,15 @@ class Collector:
                 self.queue.task_done()
             try:
                 self.status.update(
-                    storage_write_state="HEALTHY",
-                    storage_pending_batch_events=0,
+                    storage_write_state=("RECOVERY_SPOOLED_STOPPING" if batch_spooled else "HEALTHY"),
+                    storage_pending_batch_events=(len(batch) if batch_spooled else 0),
                     storage_last_write_error=None,
                     storage_last_write_retry_count=retry_count,
                 )
             except Exception:
                 LOG.exception("could not persist journal write status")
-            await flush_aged_buffer("BUSY_BUFFER_AGE")
+            if not spool_only:
+                await flush_aged_buffer("BUSY_BUFFER_AGE")
             storage_status = await loop.run_in_executor(
                 self.writer_pool, self.storage.connection_status
             )
@@ -873,7 +972,9 @@ class Collector:
         try:
             postopen_check_due = self._skip_upcoming_scan_for_postopen_reconcile()
             priority_tickers = set(self.rollover_priority_tickers)
-            postopen_series_scan_skipped = postopen_check_due or bool(priority_tickers)
+            # Recently opened, not-yet-discovered markets must still be scanned.
+            # Priority reconciliation and rotating discovery are independent.
+            postopen_series_scan_skipped = False
             full_refresh = (
                 self.inventory_snapshot is None
                 or time.monotonic() - self.last_full_inventory_monotonic
@@ -1194,13 +1295,37 @@ class Collector:
             )
             for market in market_rows_to_emit:
                 ticker = str(market.get("ticker", ""))
+                if ticker and ticker not in self.first_seen_tickers:
+                    self.first_seen_tickers.add(ticker)
+                    await self.emit(
+                        "rest_reconciliation",
+                        "market_first_seen",
+                        {
+                            "ticker": ticker,
+                            "scheduled_open_utc": market.get("open_time"),
+                            "first_seen_utc": utc_now(),
+                            "run_id": self.run_id,
+                            "first_seen_is_api_response_time": False,
+                            "limitation": "observed after inventory pass; may lag first HTTP response",
+                        },
+                        ticker,
+                        dedupe_key=f"market-first-seen|{self.run_id}|{ticker}",
+                    )
                 await self.emit(
                     "rest_reconciliation",
                     "market_metadata",
                     market,
                     ticker,
                     market.get("updated_time"),
-                    f"market-meta|{ticker}|{market.get('market_status')}|{market.get('open_time')}|{market.get('close_time')}|{market.get('yes_bid_dollars')}|{market.get('no_bid_dollars')}",
+                    "market-meta|" + ticker + "|" + hashlib.sha256(
+                        json.dumps(
+                            market.get("market_api_raw") or market,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            ensure_ascii=False,
+                            default=str,
+                        ).encode("utf-8")
+                    ).hexdigest(),
                 )
             await self.emit(
                 "rest_reconciliation",
@@ -1212,7 +1337,7 @@ class Collector:
                     "active_15m_market_rows": snapshot["active_15m_market_rows"],
                     "market_event_rows": snapshot["market_event_rows"],
                 },
-                dedupe_key=f"inventory|{snapshot['snapshot_utc']}",
+                dedupe_key=f"inventory-observed|{self.run_id}|{utc_now()}",
             )
             if self.paper_positions:
                 await self.settle_paper_positions()
@@ -2282,8 +2407,13 @@ class Collector:
             return
         profile_key = "crossmarket" if crossmarket else "btc"
         now_monotonic = time.monotonic()
-        last_poll = self.last_settlement_poll_monotonic.get(profile_key, 0.0)
-        if now_monotonic - last_poll < self.cfg.paper_settlement_poll_interval_seconds:
+        last_poll = self.last_settlement_poll_monotonic.get(profile_key)
+        # The first reconciliation must run even when monotonic uptime is
+        # shorter than the polling interval (e.g. fresh CI/Windows boot).
+        if (
+            last_poll is not None
+            and now_monotonic - last_poll < self.cfg.paper_settlement_poll_interval_seconds
+        ):
             return
         self.last_settlement_poll_monotonic[profile_key] = now_monotonic
         tickers = sorted(positions)
@@ -2400,46 +2530,153 @@ class Collector:
             self._update_paper_status()
 
     async def collect_rest_depth(self) -> None:
+        """Capture sampled REST book states and independently record per-market coverage."""
         tickers = sorted(self.open_tickers)
         poll_started = utc_now()
-        request_count = 0
-        successful_request_count = 0
-        rows_received = 0
+        for ticker in tickers:
+            self.opening_coverage.track(
+                ticker, self.markets.get(ticker, {}).get("open_time"), poll_started
+            )
+        request_count = successful_request_count = rows_received = errors = 0
         markets_with_data: set[str] = set()
-        errors = 0
         for start in range(0, len(tickers), 100):
             batch = tickers[start : start + 100]
-            received = utc_now()
+            requested_utc = utc_now()
+            began = time.perf_counter()
             request_count += 1
             try:
                 payload = await self.api.get("/markets/orderbooks", {"tickers": batch})
+                http_metadata = getattr(payload, "response_metadata", {})
+                observed_utc = utc_now()
                 successful_request_count += 1
-                orderbooks = payload.get("orderbooks") or []
+                orderbooks = payload.get("orderbooks")
+                if not isinstance(orderbooks, list):
+                    raise ValueError("orderbooks response does not contain an array")
                 rows_received += len(orderbooks)
+                returned: set[str] = set()
+                valid: set[str] = set()
+                executable: set[str] = set()
                 for item in orderbooks:
-                    ticker = str(item.get("ticker", ""))
-                    book = item.get("orderbook_fp") or {}
-                    if ticker:
-                        markets_with_data.add(ticker)
+                    if not isinstance(item, dict):
+                        errors += 1
+                        continue
+                    ticker = str(item.get("ticker") or "")
+                    if not ticker:
+                        errors += 1
+                        continue
+                    returned.add(ticker)
+                    book_payload = item.get("orderbook_fp") or item.get("orderbook")
+                    validation = "INVALID"
+                    quotes: dict[str, Any] = {}
+                    try:
+                        if not isinstance(book_payload, dict):
+                            raise ValueError("missing orderbook object")
+                        diagnostic_book = OrderBook()
+                        diagnostic_book.snapshot({"orderbook_fp": book_payload})
+                        quotes = diagnostic_book.quotes()
+                        validation = "VALID_EMPTY" if not (diagnostic_book.yes or diagnostic_book.no) else "VALID_WITH_LIQUIDITY"
+                        if ticker in batch:
+                            valid.add(ticker)
+                            markets_with_data.add(ticker)
+                            if diagnostic_book.yes or diagnostic_book.no:
+                                executable.add(ticker)
+                            self.status.mark_channel("rest_orderbook")
+                            last_seen = dict(self.status.data.get("rest_book_last_observed_utc_by_ticker", {}))
+                            last_seen[ticker] = observed_utc
+                            self.status.update(rest_book_last_observed_utc_by_ticker=last_seen)
+                    except (ValueError, TypeError, KeyError) as exc:
+                        errors += 1
+                        validation = "INVALID_" + type(exc).__name__
                     await self.emit(
                         "rest_orderbook",
                         "orderbook_snapshot",
                         {
                             "source": "Kalshi public REST",
-                            "rest_request_started_utc": received,
+                            "rest_request_started_utc": requested_utc,
+                            "rest_response_observed_utc": observed_utc,
+                            "validation": validation,
                             **item,
-                            "executable_quotes": executable_quotes({"orderbook_fp": book}),
+                            "executable_quotes": quotes,
                         },
-                        ticker or None,
+                        ticker,
                         None,
-                        f"rest-book|{ticker}|{received}",
+                        f"rest-book|{ticker}|{requested_utc}",
                     )
-                    self.status.mark_channel("rest_orderbook")
+                    if ticker in valid and ticker not in self.first_rest_books:
+                        self.first_rest_books.add(ticker)
+                        await self.emit(
+                            "coverage",
+                            "first_book_observed",
+                            {
+                                "ticker": ticker, "source": "REST_SAMPLED_NOT_WS_SYNCHRONIZED",
+                                "scheduled_open_utc": self.markets.get(ticker, {}).get("open_time"),
+                                "observed_utc": observed_utc, "validation": validation,
+                                "run_id": self.run_id,
+                            },
+                            ticker,
+                            dedupe_key=f"first-rest-book|{self.run_id}|{ticker}",
+                        )
+                    if (ticker in valid and ticker not in self.first_executable_quotes
+                            and any(value is not None for value in quotes.values())):
+                        self.first_executable_quotes.add(ticker)
+                        await self.emit(
+                            "coverage", "first_executable_quote_observed",
+                            {
+                                "ticker": ticker, "source": "REST_SAMPLED",
+                                "scheduled_open_utc": self.markets.get(ticker, {}).get("open_time"),
+                                "observed_utc": observed_utc, "quotes": quotes, "run_id": self.run_id,
+                            },
+                            ticker,
+                            dedupe_key=f"first-executable-quote|{self.run_id}|{ticker}",
+                        )
+                missing = sorted(set(batch) - valid)
+                for expected_ticker in batch:
+                    self.opening_coverage.rest_book(
+                        expected_ticker, observed_utc,
+                        valid=(expected_ticker in valid),
+                        executable=(expected_ticker in executable),
+                    )
+                await self.emit(
+                    "rest_diagnostics", "rest_poll_result",
+                    {
+                        "channel": "rest_orderbook",
+                        "run_id": self.run_id,
+                        "started_utc": requested_utc,
+                        "completed_utc": observed_utc,
+                        "rtt_ms": round((time.perf_counter() - began) * 1000, 3),
+                        "http_status": 200,
+                        "requested_tickers": batch,
+                        "returned_tickers": sorted(returned),
+                        "valid_tickers": sorted(valid),
+                        "missing_or_invalid_tickers": missing,
+                        "coverage": "COMPLETE" if not missing else "INCOMPLETE",
+                        "server_date_header": http_metadata.get("server_date_header"),
+                        "server_clock_offset_state": http_metadata.get("server_date_offset_quality", "NOT_MEASURED"),
+                        "server_date_offset_approx_seconds": http_metadata.get("server_date_offset_approx_seconds"),
+                    },
+                    dedupe_key=f"rest-poll|{self.run_id}|{requested_utc}|rest_orderbook",
+                )
             except Exception as exc:
                 errors += 1
+                failed_utc = utc_now()
+                for expected_ticker in batch:
+                    self.opening_coverage.rest_book(
+                        expected_ticker, failed_utc, valid=False, executable=False,
+                    )
                 self.status.update(
                     error_count=self.status.data.get("error_count", 0) + 1,
                     last_error=f"orderbook REST failed: {type(exc).__name__}",
+                )
+                await self.emit(
+                    "rest_diagnostics", "rest_poll_result",
+                    {
+                        "channel": "rest_orderbook", "run_id": self.run_id,
+                        "started_utc": requested_utc, "completed_utc": utc_now(),
+                        "rtt_ms": round((time.perf_counter() - began) * 1000, 3),
+                        "http_status": None, "error_type": type(exc).__name__,
+                        "requested_tickers": batch, "coverage": "INCOMPLETE",
+                    },
+                    dedupe_key=f"rest-poll|{self.run_id}|{requested_utc}|rest_orderbook",
                 )
                 LOG.warning("REST orderbook reconciliation failed: %s", type(exc).__name__)
         self.status.mark_rest_poll(
@@ -2454,42 +2691,124 @@ class Collector:
         )
 
     async def collect_recent_trades(self) -> None:
-        # The wider pre-open subscription window must not multiply the
-        # per-market trade-history requests; collect those for active markets.
+        """Page historical public trades; advance overlap watermark only on completion."""
         tickers = sorted(self.active_tickers or self.open_tickers)
         poll_started = utc_now()
-        request_count = 0
-        successful_request_count = 0
-        rows_received = 0
+        request_count = successful_request_count = rows_received = errors = 0
         markets_with_data: set[str] = set()
-        errors = 0
         for ticker in tickers:
-            request_count += 1
+            market_open = parse_time(self.markets.get(ticker, {}).get("open_time"))
+            # A restarted worker must not assume any earlier poll completed.
+            initial_since = int((market_open - timedelta(seconds=60)).timestamp()) if market_open else int(time.time()) - 3600
+            since = self.trade_poll_since_by_ticker.get(ticker, initial_since)
+            since = max(initial_since, since)
+            requested_utc = utc_now()
+            began = time.perf_counter()
+            cursor: str | None = None
+            seen_cursors: set[str] = set()
+            pages = trades_seen = 0
+            complete = False
+            request_error: str | None = None
+            http_date_samples: list[dict[str, Any]] = []
             try:
-                payload = await self.api.get("/markets/trades", {"ticker": ticker, "limit": 100})
-                successful_request_count += 1
-                trades = payload.get("trades") or []
-                rows_received += len(trades)
-                if trades:
-                    markets_with_data.add(ticker)
-                for trade in trades:
-                    trade_id = str(trade.get("trade_id", ""))
+                for _ in range(20):
+                    params: dict[str, Any] = {"ticker": ticker, "limit": 1000, "min_ts": since}
+                    if cursor:
+                        params["cursor"] = cursor
+                    request_count += 1
+                    payload = await self.api.get("/markets/trades", params)
+                    http_meta = getattr(payload, "response_metadata", {})
+                    if http_meta:
+                        http_date_samples.append({
+                            "server_date_header": http_meta.get("server_date_header"),
+                            "server_date_offset_approx_seconds": http_meta.get("server_date_offset_approx_seconds"),
+                            "quality": http_meta.get("server_date_offset_quality", "NOT_MEASURED"),
+                        })
+                    successful_request_count += 1
+                    trades = payload.get("trades")
+                    if not isinstance(trades, list):
+                        raise ValueError("trades response does not contain an array")
+                    pages += 1
+                    rows_received += len(trades)
+                    trades_seen += len(trades)
+                    if trades:
+                        markets_with_data.add(ticker)
+                    for trade in trades:
+                        if not isinstance(trade, dict):
+                            raise ValueError("trade response contains a non-object")
+                        trade_id = str(trade.get("trade_id") or "")
+                        exchange_ts = trade.get("created_time")
+                        self.opening_coverage.track(
+                            ticker, self.markets.get(ticker, {}).get("open_time"), utc_now()
+                        )
+                        self.opening_coverage.rest_trade(ticker, exchange_ts, utc_now())
+                        await self.emit(
+                            "rest_public_trades", "public_trade",
+                            {"source": "Kalshi public REST", **trade},
+                            ticker,
+                            exchange_ts,
+                            f"trade|{trade_id}" if trade_id else None,
+                        )
+                        self.status.mark_channel("rest_public_trades", exchange_ts)
+                        if ticker not in self.first_trades:
+                            self.first_trades.add(ticker)
+                            await self.emit(
+                                "coverage", "first_trade_observed",
+                                {
+                                    "ticker": ticker, "source": "REST_PUBLIC_TRADES",
+                                    "scheduled_open_utc": self.markets.get(ticker, {}).get("open_time"),
+                                    "observed_utc": utc_now(), "exchange_trade_utc": exchange_ts,
+                                    "first_observed_not_first_exchange_trade": True,
+                                    "run_id": self.run_id,
+                                },
+                                ticker, exchange_ts,
+                                f"first-trade-observed|{self.run_id}|{ticker}",
+                            )
+                    next_cursor = payload.get("cursor") or None
+                    if not next_cursor:
+                        complete = True
+                        break
+                    if next_cursor == cursor or str(next_cursor) in seen_cursors:
+                        raise ValueError("trade pagination cursor repeated")
+                    seen_cursors.add(str(next_cursor))
+                    cursor = str(next_cursor)
+                if not complete:
+                    errors += 1
+                    request_error = "PAGE_LIMIT_REACHED"
                     await self.emit(
-                        "rest_public_trades",
-                        "public_trade",
-                        {"source": "Kalshi public REST", **trade},
-                        ticker,
-                        trade.get("created_time"),
-                        f"trade|{trade_id}" if trade_id else None,
+                        "rest_diagnostics", "trade_poll_saturated",
+                        {"ticker": ticker, "min_ts": since, "page_limit": 20, "cursor_remaining": bool(cursor)},
+                        ticker, dedupe_key=f"trade-saturated|{self.run_id}|{ticker}|{requested_utc}",
                     )
-                    self.status.mark_channel("rest_public_trades", trade.get("created_time"))
+                else:
+                    # Overlap handles delayed exchange trade publication.
+                    self.trade_poll_since_by_ticker[ticker] = max(
+                        since, int(datetime.fromisoformat(requested_utc).timestamp()) - 180
+                    )
             except Exception as exc:
                 errors += 1
-                LOG.info("trade reconciliation failed for one market: %s", type(exc).__name__)
+                request_error = type(exc).__name__
                 self.status.update(
                     error_count=self.status.data.get("error_count", 0) + 1,
                     last_error=f"trade REST failed: {type(exc).__name__}",
                 )
+                LOG.warning("public trade reconciliation incomplete for %s: %s", ticker, type(exc).__name__)
+            await self.emit(
+                "rest_diagnostics", "rest_poll_result",
+                {
+                    "channel": "rest_public_trades", "run_id": self.run_id,
+                    "ticker": ticker, "started_utc": requested_utc,
+                    "completed_utc": utc_now(),
+                    "elapsed_ms": round((time.perf_counter() - began) * 1000, 3),
+                    "min_ts": since, "page_count": pages,
+                    "row_count": trades_seen, "complete": complete,
+                    "error": request_error,
+                    "http_date_samples": http_date_samples,
+                    "server_clock_offset_state": "COARSE_DIAGNOSTIC_ONLY",
+                },
+                ticker,
+                dedupe_key=f"trade-poll|{self.run_id}|{ticker}|{requested_utc}",
+            )
         self.status.mark_rest_poll(
             "rest_public_trades",
             started_utc=poll_started,
@@ -2503,6 +2822,7 @@ class Collector:
 
     async def websocket_loop(self) -> None:
         reconnect_delay = 1.0
+        connected_at: float | None = None
         while not self.stopping.is_set():
             self._invalidate_websocket_books()
             try:
@@ -2536,7 +2856,14 @@ class Collector:
                         websocket_state="READY",
                         reconnect_count=self.status.data.get("reconnect_count", 0) + 1,
                     )
-                    reconnect_delay = 1.0
+                    connected_at = time.monotonic()
+                    self.websocket_session_id = uuid.uuid4().hex
+                    await self.emit(
+                        "websocket",
+                        "ws_session_started",
+                        {"session_id": self.websocket_session_id, "run_id": self.run_id},
+                        dedupe_key=f"ws-session-start|{self.websocket_session_id}",
+                    )
                     self._reset_websocket_subscriptions()
                     self.orderbook_sequence_by_sid.clear()
                     self._publish_orderbook_sequence_state(connected=True)
@@ -2591,6 +2918,13 @@ class Collector:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                if self.websocket_session_id:
+                    await self.emit(
+                        "websocket",
+                        "ws_session_interrupted",
+                        {"session_id": self.websocket_session_id, "reason": type(exc).__name__},
+                        dedupe_key=f"ws-session-interrupted|{self.websocket_session_id}",
+                    )
                 self._invalidate_websocket_books()
                 self.status.update(
                     websocket_state="RECONNECTING",
@@ -2598,11 +2932,20 @@ class Collector:
                     last_error=f"WebSocket connection ended: {type(exc).__name__}",
                 )
                 LOG.warning("WebSocket disconnected: %s", type(exc).__name__)
+                # Only reset exponential backoff after a stable connection;
+                # rapid resynchronization flaps must back off.
+                if connected_at is not None and time.monotonic() - connected_at >= 60:
+                    reconnect_delay = 1.0
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(30.0, reconnect_delay * 2)
+                connected_at = None
+        self.websocket_session_id = None
         self.status.update(websocket_state="STOPPED")
 
     def _invalidate_websocket_books(self) -> None:
+        for ticker, book in self.books.items():
+            if book.synchronized and ticker not in self.ws_gap_start_by_ticker:
+                self.ws_gap_start_by_ticker[ticker] = (utc_now(), time.monotonic())
         self._publish_orderbook_sequence_state(connected=False)
         self.last_seq.clear()
         self.book_received_monotonic.clear()
@@ -2891,11 +3234,27 @@ class Collector:
 
     async def _receive_ws(self, ws: Any) -> None:
         async for message in ws:
+            received_wall = utc_now()
+            received_mono_ns = time.perf_counter_ns()
+            self.ws_last_message_monotonic = time.monotonic()
             try:
                 outer = json.loads(message)
             except json.JSONDecodeError:
                 await self.emit("websocket", "malformed_message", {"raw": str(message)[:2048]})
                 continue
+            # Preserve the original payload and record a separate ingest timing
+            # envelope. Millisecond exchange send time is diagnostic, not an
+            # exact wall-clock synchronization guarantee.
+            if not isinstance(outer, dict):
+                await self.emit("websocket", "malformed_message", {"raw_type": type(outer).__name__})
+                continue
+            outer["_collector_received"] = {
+                "run_id": self.run_id,
+                "websocket_session_id": self.websocket_session_id,
+                "received_utc": received_wall,
+                "received_monotonic_ns": received_mono_ns,
+                "sending_ts_ms": outer.get("sending_ts_ms"),
+            }
             kind = str(outer.get("type", "unknown"))
             if kind in {"subscribed", "unsubscribed", "ok", "error"}:
                 self._handle_subscription_response(outer)
@@ -2941,7 +3300,7 @@ class Collector:
                         {"sid": sid, "prior_seq": prior, "current_seq": seq, "market_ticker": ticker},
                         str(ticker),
                         exchange_ts,
-                        f"snapshot-gap|{sid}|{prior}|{seq}",
+                        f"snapshot-gap|{self.websocket_session_id}|{sid}|{prior}|{seq}",
                     )
                     await ws.close(code=1011, reason="snapshot missing sequence metadata")
                     return
@@ -2949,8 +3308,57 @@ class Collector:
                 self._record_orderbook_sequence(sid, seq, snapshot=True)
                 if str(ticker) in self.open_tickers:
                     book = self.books.setdefault(str(ticker), OrderBook())
-                    book.snapshot(payload)
+                    try:
+                        book.snapshot(payload)
+                    except ValueError as exc:
+                        book.invalidate()
+                        await self.emit(
+                            "websocket_orderbook", "invalid_snapshot",
+                            {"raw": outer, "reason": type(exc).__name__},
+                            str(ticker), exchange_ts,
+                            f"invalid-snapshot|{self.websocket_session_id}|{sid}|{seq}",
+                        )
+                        self._record_orderbook_sequence_failure(sid, "invalid snapshot content")
+                        await ws.close(code=1011, reason="invalid snapshot; resync required")
+                        return
+                    gap = self.ws_gap_start_by_ticker.pop(str(ticker), None)
+                    if gap is not None:
+                        await self.emit(
+                            "websocket_orderbook", "capture_gap_ended",
+                            {
+                                "ticker": str(ticker),
+                                "disconnected_utc": gap[0],
+                                "resynchronized_utc": received_wall,
+                                "elapsed_monotonic_seconds": round(time.monotonic() - gap[1], 3),
+                                "recovery": "FRESH_WS_SNAPSHOT",
+                                "intermediate_orderbook_deltas": "UNRECOVERED",
+                                "session_id": self.websocket_session_id,
+                            },
+                            str(ticker), exchange_ts,
+                            f"ws-gap-ended|{self.websocket_session_id}|{ticker}|{seq}",
+                        )
                     self.book_received_monotonic[str(ticker)] = time.monotonic()
+                    self.opening_coverage.track(
+                        str(ticker), self.markets.get(str(ticker), {}).get("open_time"),
+                        received_wall,
+                    )
+                    self.opening_coverage.ws_book(str(ticker), received_wall)
+                    if str(ticker) not in self.first_ws_synced_books:
+                        self.first_ws_synced_books.add(str(ticker))
+                        await self.emit(
+                            "coverage", "first_synchronized_book_observed",
+                            {
+                                "ticker": str(ticker),
+                                "source": "WSS_SEQUENCE_SNAPSHOT",
+                                "scheduled_open_utc": self.markets.get(str(ticker), {}).get("open_time"),
+                                "observed_utc": received_wall,
+                                "session_id": self.websocket_session_id,
+                                "subscription_id": sid, "seq": seq,
+                                "run_id": self.run_id,
+                            },
+                            str(ticker), exchange_ts,
+                            f"first-ws-book|{self.run_id}|{ticker}",
+                        )
                     self._mark_orderbook_quote(str(ticker))
                     await self.emit(
                         "websocket_orderbook",
@@ -2958,7 +3366,7 @@ class Collector:
                         {"raw": outer, "synchronized": book.synchronized, "executable_quotes": book.quotes()},
                         str(ticker),
                         exchange_ts,
-                        f"ws|{sid}|{seq}",
+                        f"ws|{self.websocket_session_id}|{channel}|{sid}|{seq}",
                     )
             elif kind == "orderbook_delta" and ticker:
                 prior = self.last_seq.get(sid) if isinstance(sid, int) else None
@@ -2985,7 +3393,7 @@ class Collector:
                         {"sid": sid, "prior_seq": prior, "current_seq": seq, "market_ticker": ticker},
                         str(ticker),
                         exchange_ts,
-                        f"gap|{sid}|{prior}|{seq}",
+                        f"gap|{self.websocket_session_id}|{sid}|{prior}|{seq}",
                     )
                     await ws.close(code=1011, reason="sequence invalid; reconnect for fresh snapshots")
                     return
@@ -3031,7 +3439,7 @@ class Collector:
                     },
                     str(ticker),
                     exchange_ts,
-                    f"ws|{sid}|{seq}" if sid is not None and seq is not None else None,
+                    f"ws|{self.websocket_session_id}|{channel}|{sid}|{seq}" if sid is not None and seq is not None else None,
                 )
             else:
                 await self.emit(
@@ -3040,7 +3448,7 @@ class Collector:
                     outer,
                     str(ticker) if ticker else None,
                     exchange_ts,
-                    f"ws|{sid}|{seq}" if sid is not None and seq is not None else None,
+                    f"ws|{self.websocket_session_id}|{channel}|{sid}|{seq}" if sid is not None and seq is not None else None,
                 )
             self.status.mark_channel(channel, exchange_ts)
             if kind == "trade":
@@ -3093,6 +3501,12 @@ class Collector:
         configure_logging(self.cfg)
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(self.writer_pool, self.storage.open)
+        # Replay only previously fsynced emergency batches before accepting
+        # any new market data; failures leave the originals on disk.
+        replayed = await loop.run_in_executor(
+            self.writer_pool, self.storage.replay_spooled_batches
+        )
+        self.status.update(emergency_spool_replayed_events=replayed)
         storage_status = await loop.run_in_executor(
             self.writer_pool, self.storage.connection_status
         )
@@ -3126,7 +3540,10 @@ class Collector:
         self.stop_file.unlink(missing_ok=True)
         writer = asyncio.create_task(self.writer_loop(), name="sqlite-parquet-writer")
         heartbeat = asyncio.create_task(self.heartbeat_loop(), name="runtime-heartbeat")
-        await self.refresh_inventory()
+        # Start potentially long discovery without blocking the ingest loop.
+        inventory_task: asyncio.Task[None] | None = asyncio.create_task(
+            self.refresh_inventory(), name="startup-inventory-discovery"
+        )
         ws_task = asyncio.create_task(self.websocket_loop(), name="kalshi-websocket")
         await self.emit(
             "runtime",
@@ -3144,14 +3561,56 @@ class Collector:
         next_trades = time.monotonic()
         next_strategy = time.monotonic()
         next_capture_resume_check = time.monotonic()
-        inventory_task: asyncio.Task[None] | None = None
         trades_task: asyncio.Task[None] | None = None
+        depth_task: asyncio.Task[None] | None = None
         try:
             while not self.stopping.is_set():
                 if self.stop_file.exists():
                     self.stopping.set()
                     break
                 now = time.monotonic()
+                sampled_utc = utc_now()
+                for ticker, market in self.markets.items():
+                    if market.get("is_15m_confirmed"):
+                        self.opening_coverage.track(
+                            ticker, market.get("open_time"), sampled_utc
+                        )
+                for completed in self.opening_coverage.finalize_due(sampled_utc):
+                    completed["run_id"] = self.run_id
+                    await self.emit(
+                        "coverage", "opening_coverage_finalized",
+                        completed,
+                        completed["ticker"],
+                        dedupe_key=(
+                            f"opening-coverage|{self.run_id}|{completed['ticker']}|"
+                            f"{completed['scheduled_open_utc']}"
+                        ),
+                    )
+                if inventory_task is not None and inventory_task.done():
+                    try:
+                        inventory_task.result()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        LOG.exception("inventory background discovery failed")
+                        self.status.update(
+                            error_count=self.status.data.get("error_count", 0) + 1,
+                            last_error=f"inventory discovery failed: {type(exc).__name__}",
+                            discovery_coverage_state="INCOMPLETE_EXCEPTION",
+                        )
+                    inventory_task = None
+                for background_task, kind in ((trades_task, "trades"), (depth_task, "depth")):
+                    if background_task is not None and background_task.done():
+                        try:
+                            background_task.result()
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            LOG.exception("background %s collection failed", kind)
+                            self.status.update(
+                                error_count=self.status.data.get("error_count", 0) + 1,
+                                last_error=f"{kind} collection failed: {type(exc).__name__}",
+                            )
                 rollover_check_due = (
                     self.pending_rollover_check is not None
                     and datetime.now(timezone.utc) >= self.pending_rollover_check[1]
@@ -3201,21 +3660,10 @@ class Collector:
                         # Do not queue overlapping discovery calls; retry as soon as
                         # the existing rate-limited reconciliation has completed.
                         next_reconcile = time.monotonic() + 1.0
-                if rollover_check_due and inventory_task is not None:
-                    try:
-                        await inventory_task
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        LOG.exception("rollover priority inventory reconcile failed")
-                        self.status.update(
-                            error_count=self.status.data.get("error_count", 0) + 1,
-                            last_error="rollover priority inventory reconcile failed",
-                        )
-                    finally:
-                        inventory_task = None
-                    next_reconcile = time.monotonic() + self._next_inventory_reconcile_delay()
-                    continue
+                # Never await a long inventory scan inside the opening-window
+                # scheduler. The shared API priority gate serves book requests
+                # ahead of bulk scans, and the finished inventory is harvested
+                # at the next scheduler iteration.
                 # Keep the frozen strategy poll ahead of broad, slower collection.
                 if now >= next_strategy:
                     await self.collect_strategy_inputs()
@@ -3226,16 +3674,18 @@ class Collector:
                         and datetime.now(timezone.utc) >= self.pending_rollover_check[1]
                     ):
                         continue
-                if now >= next_depth:
-                    await self.collect_rest_depth()
+                if now >= next_depth and (depth_task is None or depth_task.done()):
+                    depth_task = asyncio.create_task(
+                        self.collect_rest_depth(), name="background-rest-book-poll"
+                    )
                     next_depth = time.monotonic() + self.cfg.book_poll_interval_seconds
-                    if (
-                        self.pending_rollover_check is not None
-                        and datetime.now(timezone.utc) >= self.pending_rollover_check[1]
-                    ):
-                        continue
                 if now >= next_trades and (trades_task is None or trades_task.done()):
-                    rollover_deferral = self._public_trade_poll_rollover_deferral()
+                    # Do not blacklist active contracts' opening trades.
+                    # Prioritized GET pacing protects opening book requests.
+                    rollover_deferral = (
+                        None if self.active_tickers
+                        else self._public_trade_poll_rollover_deferral()
+                    )
                     if rollover_deferral is not None:
                         delay, scheduled_open = rollover_deferral
                         next_trades = time.monotonic() + delay
@@ -3328,17 +3778,24 @@ class Collector:
             except asyncio.CancelledError:
                 pass
             background_tasks = [
-                task for task in (inventory_task, trades_task) if task is not None
+                task for task in (inventory_task, trades_task, depth_task) if task is not None
             ]
             for task in background_tasks:
                 if not task.done():
                     task.cancel()
             if background_tasks:
                 await asyncio.gather(*background_tasks, return_exceptions=True)
-            await self.queue.join()
-            await writer
+            writer_failed = None
+            if writer.done():
+                try:
+                    writer.result()
+                except Exception as exc:
+                    writer_failed = f"{type(exc).__name__}: writer exited without durable acknowledgement"
+            if writer_failed is None:
+                await self.queue.join()
+                await writer
             metrics: dict[str, Any] = {}
-            storage_error = None
+            storage_error = writer_failed
             try:
                 await loop.run_in_executor(
                     self.writer_pool,
@@ -3357,7 +3814,7 @@ class Collector:
                     if storage_error is None:
                         storage_error = "Parquet or SQLite close failed"
                 self.status.update(
-                    service_state="STOPPED",
+                    service_state=("STOPPED" if storage_error is None else "STOPPED_STORAGE_UNVERIFIED"),
                     final_storage_metrics=metrics,
                     final_storage_error=storage_error,
                     parquet_archive_recovery_state=self.storage.parquet_recovery_state,

@@ -1,7 +1,30 @@
-param([switch]$InstallDependencies,[switch]$KeepSupervisorPaused)
+param(
+    [switch]$InstallDependencies,
+    [switch]$KeepSupervisorPaused,
+    [switch]$AllowDevelopmentBranchNetwork
+)
 $ErrorActionPreference = 'Stop'
-$root = 'C:\Users\dakin\Projects\kalshi-15m-native'
+$root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $homePath = if ($env:KALSHI15M_HOME) { $env:KALSHI15M_HOME } else { Join-Path $env:LOCALAPPDATA 'Kalshi15mNative' }
+# A development-branch checkout must never silently become a second live
+# REST collector. Normal approved production releases are merged to main.
+$headFile = Join-Path $root '.git\HEAD'
+$headText = if (Test-Path -LiteralPath $headFile -PathType Leaf) {
+    (Get-Content -LiteralPath $headFile -Raw).Trim()
+} else { '' }
+$isReliabilityDevelopment = $headText -like 'ref: refs/heads/collector/reliability-*'
+if ($isReliabilityDevelopment -and -not $AllowDevelopmentBranchNetwork) {
+    throw 'Development branch is offline-test-only. Do not start a second network collector; promote an approved release to main first.'
+}
+if ($isReliabilityDevelopment -and $AllowDevelopmentBranchNetwork) {
+    $defaultHome = [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'Kalshi15mNative'))
+    if (-not $env:KALSHI15M_HOME -or
+        [IO.Path]::GetFullPath($homePath).Equals($defaultHome, [StringComparison]::OrdinalIgnoreCase) -or
+        (-not $env:KALSHI15M_STATUS_PORT) -or
+        [int]$env:KALSHI15M_STATUS_PORT -eq 8768) {
+        throw 'Explicit isolated KALSHI15M_HOME and nonproduction port are required for any authorized development-branch network test.'
+    }
+}
 $statusPort = if ($env:KALSHI15M_STATUS_PORT) { [int]$env:KALSHI15M_STATUS_PORT } else { 8768 }
 $venvPython = Join-Path $root '.venv\Scripts\python.exe'
 # Check the live listener before touching this shell's runtime directory. A

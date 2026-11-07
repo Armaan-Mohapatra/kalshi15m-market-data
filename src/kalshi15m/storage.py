@@ -115,6 +115,10 @@ class Storage:
         self.sqlite_bytes = 0
         self.events_inserted = 0
         self.events_duplicate = 0
+        self.events_key_conflict = 0
+        self.events_quarantined = 0
+        self.events_spooled = 0
+        self.events_replayed = 0
         self.parquet_buffer: list[dict[str, Any]] = []
         self.parquet_buffer_bytes_estimate = 0
         self.parquet_buffer_started_monotonic: float | None = None
@@ -124,15 +128,26 @@ class Storage:
         self.parquet_last_flush_utc: str | None = None
         self.parquet_last_flush_rows = 0
         self.parquet_last_flush_reason: str | None = None
+        # Lifetime omission count remains immutable for audit. Outstanding
+        # omissions can return to zero only after a full successful replay.
         self.parquet_dropped_rows = self.previous_parquet_dropped_rows
+        self.parquet_unrecovered_rows = self.previous_parquet_dropped_rows
         self.parquet_recovery_state = "NOT_RUN"
         self.parquet_recovery_rows = 0
+        self.corrupt_parquet_parts: list[str] = []
+        self.orphaned_partial_parts = 0
         self.persistence_audit_interval_seconds = 15.0
         self.persistence_audit_last_monotonic = 0.0
         self.persistence_audit_cache: dict[str, Any] = {}
 
     def open(self) -> None:
-        self.connection = sqlite3.connect(self.cfg.ledger_path, timeout=15)
+        # Production serializes writes through one worker executor. The
+        # standalone fixture harness may open from one thread and flush
+        # manifests from its executor; do not rely on SQLite's thread affinity
+        # as the serialization mechanism.
+        self.connection = sqlite3.connect(
+            self.cfg.ledger_path, timeout=15, check_same_thread=False
+        )
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA synchronous=FULL")
         self.connection.execute("PRAGMA busy_timeout=15000")
@@ -146,6 +161,59 @@ class Storage:
                 market_ticker TEXT,
                 raw_json TEXT NOT NULL,
                 payload_sha256 TEXT NOT NULL
+            )"""
+        )
+        self.connection.execute(
+            """CREATE TABLE IF NOT EXISTS market_event_versions (
+                source_generation TEXT NOT NULL,
+                row_sha256 TEXT NOT NULL,
+                captured_utc TEXT NOT NULL,
+                dedupe_key TEXT NOT NULL,
+                received_utc TEXT NOT NULL,
+                exchange_ts TEXT,
+                channel TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                market_ticker TEXT,
+                raw_json BLOB NOT NULL,
+                payload_sha256 TEXT NOT NULL,
+                PRIMARY KEY (source_generation, row_sha256)
+            ) WITHOUT ROWID"""
+        )
+        self.connection.execute(
+            """CREATE TABLE IF NOT EXISTS archive_manifests (
+                part_path TEXT PRIMARY KEY,
+                row_count INTEGER NOT NULL,
+                byte_count INTEGER NOT NULL,
+                sha256 TEXT NOT NULL,
+                committed_utc TEXT NOT NULL
+            )"""
+        )
+        self.connection.execute(
+            """CREATE TABLE IF NOT EXISTS archive_manifest_history (
+                observation_id TEXT PRIMARY KEY,
+                part_path TEXT NOT NULL,
+                prior_row_count INTEGER NOT NULL,
+                prior_byte_count INTEGER NOT NULL,
+                prior_sha256 TEXT NOT NULL,
+                observed_utc TEXT NOT NULL,
+                reason TEXT NOT NULL
+            )"""
+        )
+        self.connection.execute(
+            """CREATE TABLE IF NOT EXISTS collector_markers (
+                marker TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_utc TEXT NOT NULL
+            )"""
+        )
+        self.connection.execute(
+            """CREATE TABLE IF NOT EXISTS quarantined_market_events (
+                quarantine_id TEXT PRIMARY KEY,
+                captured_utc TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                original_dedupe_key TEXT,
+                event_diagnostic_json TEXT NOT NULL,
+                original_payload_fidelity TEXT NOT NULL
             )"""
         )
         self.connection.execute(
@@ -187,14 +255,28 @@ class Storage:
         self.latest_market_event_received_utc = str(latest_event[0]) if latest_event else None
         self.parquet_bytes = self._parquet_directory_size()
         self.sqlite_bytes = self._sqlite_size()
-        previous_capture_incomplete = (
-            self.previous_parquet_dropped_rows > 0
-            or self.previous_raw_capture_state not in (None, "ENABLED")
+        # A status.json label is not an archival commit marker. The previous
+        # process must have durably verified its final archive before skip is
+        # allowed. Missing/old schemas always go through reconciliation.
+        previous_marker = self.connection.execute(
+            "SELECT value FROM collector_markers WHERE marker = 'archive_shutdown'"
+        ).fetchone()
+        self.connection.execute(
+            "INSERT OR REPLACE INTO collector_markers VALUES (?, ?, ?)",
+            ("archive_shutdown", "RUNNING_UNVERIFIED", datetime.now(timezone.utc).isoformat()),
+        )
+        self.connection.commit()
+        self.orphaned_partial_parts = sum(
+            1 for _ in self.cfg.parquet_dir.rglob("*.partial")
         )
         if (
-            self.previous_service_state
-            and self.previous_service_state != "STOPPED"
-        ) or previous_capture_incomplete:
+            previous_marker
+            and previous_marker[0] == "CLEAN_ARCHIVE_VERIFIED"
+            and self._archive_manifest_files_present()
+        ):
+            self.parquet_recovery_state = "SKIPPED_VERIFIED_SHUTDOWN_MARKER"
+            self.parquet_unrecovered_rows = 0
+        else:
             try:
                 self.parquet_recovery_rows = self.recover_parquet_archive()
                 if self.parquet_recovery_state == "NOT_RUN":
@@ -202,8 +284,6 @@ class Storage:
             except Exception as exc:
                 self.parquet_recovery_state = f"FAILED_{type(exc).__name__}"
                 LOG.exception("Parquet archive recovery failed; SQLite journal remains available")
-        else:
-            self.parquet_recovery_state = "SKIPPED_PREVIOUS_RUN_STOPPED"
 
     @staticmethod
     def _file_identity(path: Path) -> tuple[int, int] | None:
@@ -254,7 +334,19 @@ class Storage:
             "storage_latest_market_event_received_utc": self.latest_market_event_received_utc,
             **disk_audit,
             "sqlite_bytes": self.sqlite_bytes,
+            "sqlite_growth_warning": self.sqlite_bytes >= 8 * 1024**3,
             "parquet_bytes": self.parquet_bytes,
+            "events_key_conflict": self.events_key_conflict,
+            "events_quarantined": self.events_quarantined,
+            "parquet_unrecovered_rows": self.parquet_unrecovered_rows,
+            "events_spooled": self.events_spooled,
+            "events_replayed": self.events_replayed,
+            "spool_pending_batch_count": sum(
+                1 for _ in self.pending_spool_dir.glob("pending-*.json")
+            ),
+            "archive_corrupt_part_count": len(self.corrupt_parquet_parts),
+            "archive_corrupt_part_paths": [Path(path).name for path in self.corrupt_parquet_parts[:20]],
+            "archive_orphaned_partial_count": self.orphaned_partial_parts,
             "parquet_buffered_rows": len(self.parquet_buffer),
             "parquet_buffer_estimated_bytes": self.parquet_buffer_bytes_estimate,
             "parquet_flush_count": self.parquet_flush_count,
@@ -310,8 +402,42 @@ class Storage:
 
     def recover_parquet_archive(self) -> int:
         """Rebuild missing Parquet event variants from the durable SQLite journal."""
+        self.corrupt_parquet_parts = []
         if self.connection is None:
             raise RuntimeError("Storage is not open")
+        # Never treat a missing or changed file's original manifest as active.
+        # Preserve its original size/digest in durable history, then allow a
+        # replacement Parquet part to be reconciled from the SQLite journal.
+        previous_parts = self.connection.execute(
+            "SELECT part_path, row_count, byte_count, sha256 FROM archive_manifests"
+        ).fetchall()
+        invalid = []
+        for name, rows, size, digest in previous_parts:
+            source = self.cfg.parquet_dir / str(name)
+            try:
+                if not source.is_file() or source.stat().st_size != int(size):
+                    invalid.append((name, rows, size, digest, "MISSING_OR_RESIZED"))
+                    continue
+            except OSError:
+                invalid.append((name, rows, size, digest, "UNREADABLE_STAT"))
+        if invalid:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                for name, rows, size, digest, reason in invalid:
+                    self.connection.execute(
+                        "INSERT INTO archive_manifest_history VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            uuid.uuid4().hex, name, int(rows), int(size), digest,
+                            datetime.now(timezone.utc).isoformat(), reason,
+                        ),
+                    )
+                    self.connection.execute(
+                        "DELETE FROM archive_manifests WHERE part_path = ?", (name,)
+                    )
+                self.connection.commit()
+            except Exception:
+                self.connection.rollback()
+                raise
         if self.parquet_bytes >= self.cfg.raw_data_budget_bytes:
             self.raw_capture_enabled = False
             self.parquet_recovery_state = "SKIPPED_RAW_BUDGET"
@@ -340,7 +466,13 @@ class Storage:
             )
             insert_fingerprint = "INSERT OR IGNORE INTO archived_fingerprints VALUES (?)"
             for path in self.cfg.parquet_dir.rglob("*.parquet"):
-                parquet_file = pq.ParquetFile(path)
+                try:
+                    parquet_file = pq.ParquetFile(path)
+                except Exception as exc:
+                    # Preserve source files intact; the journal is canonical.
+                    self.corrupt_parquet_parts.append(str(path))
+                    LOG.error("unreadable Parquet part recorded for repair: %s (%s)", path, type(exc).__name__)
+                    continue
                 names = set(parquet_file.schema_arrow.names)
                 columns = [
                     name
@@ -361,15 +493,48 @@ class Storage:
                     if path.parent.name.startswith("kind=")
                     else None
                 )
-                for batch in parquet_file.iter_batches(columns=columns, batch_size=5000):
-                    fingerprints = []
-                    for row in batch.to_pylist():
-                        if "kind" not in row:
-                            row["kind"] = partition_kind
-                        if row.get("dedupe_key") is not None:
-                            fingerprints.append((event_archive_fingerprint(row),))
-                    fingerprint_db.executemany(insert_fingerprint, fingerprints)
-                fingerprint_db.commit()
+                try:
+                    fingerprint_db.execute("SAVEPOINT parquet_part")
+                    observed_rows = 0
+                    for batch in parquet_file.iter_batches(columns=columns, batch_size=5000):
+                        fingerprints = []
+                        for row in batch.to_pylist():
+                            if "kind" not in row:
+                                row["kind"] = partition_kind
+                            if row.get("dedupe_key") is not None:
+                                fingerprints.append((event_archive_fingerprint(row),))
+                        observed_rows += len(fingerprints)
+                        fingerprint_db.executemany(insert_fingerprint, fingerprints)
+                    fingerprint_db.execute("RELEASE SAVEPOINT parquet_part")
+                    fingerprint_db.commit()
+                    # Existing finalized files may predate the manifest feature.
+                    # Register only after a complete readable scan; stream the
+                    # digest in bounded blocks and keep the files untouched.
+                    if self.connection.execute(
+                        "SELECT 1 FROM archive_manifests WHERE part_path = ?",
+                        (str(path.relative_to(self.cfg.parquet_dir)),),
+                    ).fetchone() is None:
+                        digest = hashlib.sha256()
+                        with path.open("rb") as archive_file:
+                            for block in iter(lambda: archive_file.read(1024 * 1024), b""):
+                                digest.update(block)
+                        self.connection.execute(
+                            "INSERT INTO archive_manifests VALUES (?, ?, ?, ?, ?)",
+                            (
+                                str(path.relative_to(self.cfg.parquet_dir)),
+                                observed_rows,
+                                path.stat().st_size,
+                                digest.hexdigest(),
+                                datetime.now(timezone.utc).isoformat(),
+                            ),
+                        )
+                        self.connection.commit()
+                except Exception as exc:
+                    fingerprint_db.execute("ROLLBACK TO SAVEPOINT parquet_part")
+                    fingerprint_db.execute("RELEASE SAVEPOINT parquet_part")
+                    self.corrupt_parquet_parts.append(str(path))
+                    LOG.error("unreadable Parquet row group: %s (%s)", path, type(exc).__name__)
+                    continue
 
             assert self.connection is not None
             tables = ["market_events"]
@@ -430,8 +595,12 @@ class Storage:
         self.parquet_bytes = sum(
             path.stat().st_size for path in self.cfg.parquet_dir.rglob("*.parquet")
         )
-        if self.parquet_recovery_state == "NOT_RUN":
+        if self.corrupt_parquet_parts:
+            self.parquet_recovery_state = "REPAIRED_WITH_CORRUPT_PARTS_STILL_PRESENT"
+        elif self.parquet_recovery_state == "NOT_RUN":
             self.parquet_recovery_state = "RECOVERED_MISSING_ROWS" if recovered else "VERIFIED_NO_GAP"
+        if self.parquet_recovery_state in {"RECOVERED_MISSING_ROWS", "VERIFIED_NO_GAP"}:
+            self.parquet_unrecovered_rows = 0
         return recovered
 
     def resume_raw_capture_if_safe(self) -> bool:
@@ -491,9 +660,85 @@ class Storage:
                 continue
         return total
 
+    def _archive_manifest_files_present(self) -> bool:
+        """Cheap restart guard: reject removed/resized parts and new journal rows.
+
+        The verified shutdown marker attests to full SHA-256 checks at exit.
+        This fast check does not replace a periodic full integrity audit.
+        """
+        if self.connection is None:
+            return False
+        expected = int(self.connection.execute("SELECT COUNT(*) FROM market_events").fetchone()[0])
+        expected += int(self.connection.execute("SELECT COUNT(*) FROM market_event_versions").fetchone()[0])
+        rows = self.connection.execute(
+            "SELECT part_path, row_count, byte_count FROM archive_manifests"
+        ).fetchall()
+        if sum(int(row[1]) for row in rows) != expected:
+            return False
+        for part_path, _count, size in rows:
+            path = self.cfg.parquet_dir / str(part_path)
+            try:
+                if not path.is_file() or path.stat().st_size != int(size):
+                    return False
+            except OSError:
+                return False
+        return True
+
+    def verify_archive_manifest(self) -> bool:
+        """Bounded-memory, full-file integrity check before marking a clean shutdown.
+
+        The existing journal remains canonical. A verified marker is only
+        committed if *all* event versions are represented in archive manifests,
+        and every referenced archive part has the expected size and hash.
+        """
+        if self.connection is None:
+            return False
+        self.orphaned_partial_parts = sum(1 for _ in self.cfg.parquet_dir.rglob("*.partial"))
+        if (
+            self.parquet_buffer or not self.raw_capture_enabled
+            or self.parquet_unrecovered_rows > 0
+            or any(self.pending_spool_dir.glob("pending-*.json"))
+            or self.corrupt_parquet_parts or self.orphaned_partial_parts > 0
+        ):
+            return False
+        expected = int(self.connection.execute(
+            "SELECT COUNT(*) FROM market_events"
+        ).fetchone()[0])
+        expected += int(self.connection.execute(
+            "SELECT COUNT(*) FROM market_event_versions"
+        ).fetchone()[0])
+        manifest_rows = self.connection.execute(
+            "SELECT part_path, row_count, byte_count, sha256 FROM archive_manifests"
+        ).fetchall()
+        if sum(int(row[1]) for row in manifest_rows) != expected:
+            return False
+        for name, _count, byte_count, checksum in manifest_rows:
+            path = self.cfg.parquet_dir / str(name)
+            try:
+                if not path.is_file() or path.stat().st_size != int(byte_count):
+                    return False
+                digest = hashlib.sha256()
+                with path.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                if digest.hexdigest() != checksum:
+                    return False
+            except OSError:
+                return False
+        return True
+
     def close(self) -> None:
         self.flush_parquet(reason="SHUTDOWN")
         if self.connection is not None:
+            verified = self.verify_archive_manifest()
+            self.connection.execute(
+                "INSERT OR REPLACE INTO collector_markers VALUES (?, ?, ?)",
+                (
+                    "archive_shutdown",
+                    "CLEAN_ARCHIVE_VERIFIED" if verified else "CLOSED_WITH_ARCHIVE_UNVERIFIED",
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
             self.connection.commit()
             self.connection.close()
             self.connection = None
@@ -505,6 +750,7 @@ class Storage:
         if not self.raw_capture_enabled:
             count = len(self.parquet_buffer)
             self.parquet_dropped_rows += count
+            self.parquet_unrecovered_rows += count
             self.parquet_buffer.clear()
             self.parquet_buffer_bytes_estimate = 0
             self.parquet_buffer_started_monotonic = None
@@ -612,94 +858,236 @@ class Storage:
             for row in rows
         ]
 
+    @property
+    def pending_spool_dir(self) -> Path:
+        return self.cfg.data_dir / "pending_market_batches"
+
+    def spool_batch(self, events: list[dict[str, Any]]) -> Path:
+        """Durable last-resort spool for a temporarily unavailable journal.
+
+        This is not a successful journal commit. Callers must report degraded
+        state and stop normal capture. The spool uses exclusive, atomically
+        finalized files and cannot silently overwrite another batch.
+        """
+        directory = self.pending_spool_dir
+        directory.mkdir(parents=True, exist_ok=True)
+        raw = json.dumps(
+            events,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        output = directory / f"pending-{uuid.uuid4().hex}.json"
+        temporary = output.with_suffix(".partial")
+        with temporary.open("xb") as handle:
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, output)
+        self.events_spooled += len(events)
+        return output
+
+    def replay_spooled_batches(self) -> int:
+        """Idempotently replay fully serialized batches after SQLite is available.
+
+        Never remove source spool data until its append (including conflict
+        version handling) returns without an exception.
+        """
+        directory = self.pending_spool_dir
+        if not directory.exists():
+            return 0
+        recovered = 0
+        for path in sorted(directory.glob("pending-*.json")):
+            with path.open("rb") as source:
+                payload = json.loads(source.read())
+            if not isinstance(payload, list) or not all(isinstance(item, dict) for item in payload):
+                raise ValueError(f"spooled event batch is malformed: {path.name}")
+            self.append_batch_resilient(payload)
+            path.unlink()
+            recovered += len(payload)
+        self.events_replayed += recovered
+        return recovered
+
+    def _quarantine_invalid_event(self, event: dict[str, Any], exc: Exception) -> None:
+        """Durably preserve the diagnostic representation before acknowledging an invalid event.
+
+        This is not a lossless capture of arbitrary unserializable Python objects.
+        The diagnostic explicitly marks that limitation rather than claiming the
+        original market event has been archived.
+        """
+        if self.connection is None:
+            raise RuntimeError("storage is not open")
+        diagnostic = json.dumps(
+            event,
+            sort_keys=True,
+            ensure_ascii=True,
+            default=lambda item: {"unserializable_type": type(item).__name__, "repr": repr(item)},
+        )
+        cursor = self.connection.execute(
+            "INSERT OR IGNORE INTO quarantined_market_events VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                hashlib.sha256(diagnostic.encode("utf-8")).hexdigest(),
+                datetime.now(timezone.utc).isoformat(),
+                type(exc).__name__,
+                str(event.get("dedupe_key") or ""),
+                diagnostic,
+                "DIAGNOSTIC_ONLY_NOT_ORIGINAL_EVENT",
+            ),
+        )
+        self.connection.commit()
+        self.events_quarantined += max(0, cursor.rowcount)
+
+    def append_batch_resilient(self, events: list[dict[str, Any]]) -> int:
+        """Isolate unencodable input; never misclassify a DB/disk failure as poison.
+
+        Persistent I/O errors propagate to the worker and must not be
+        acknowledged. Only individual, proven encoding failures are
+        quarantined into the same durable SQLite store.
+        """
+        valid: list[dict[str, Any]] = []
+        for event in events:
+            try:
+                _, _, raw = self._normalized(event)
+                encode_journal_payload(raw)
+            except (TypeError, ValueError, UnicodeError, OverflowError) as exc:
+                self._quarantine_invalid_event(event, exc)
+                continue
+            valid.append(event)
+        return self.append_batch(valid) if valid else 0
+
     def append_batch(self, events: list[dict[str, Any]]) -> int:
         if self.connection is None:
             self.open()
         assert self.connection is not None
-        rows: list[tuple[Any, ...]] = []
-        parquet_rows: list[dict[str, Any]] = []
-        prepared: list[tuple[dict[str, Any], str, str | None, str | None]] = []
+        # Serialize before opening the SQL transaction; partial input errors
+        # cannot leave a half-applied batch behind.
+        prepared: list[tuple[dict[str, Any], str, str, str]] = []
         for event in events:
-            supplied = event.get("dedupe_key")
-            if supplied:
-                prepared.append((event, str(supplied), None, None))
-            else:
-                dedupe, digest, raw = self._normalized(event)
-                prepared.append((event, dedupe, digest, raw))
+            dedupe, digest, raw = self._normalized(event)
+            prepared.append((event, dedupe, digest, raw))
 
         keys = list(dict.fromkeys(item[1] for item in prepared))
-        existing: set[str] = set()
-        seen: set[str] = set()
+        existing: dict[str, str] = {}
+        seen: dict[str, str] = {}
         for start in range(0, len(keys), 500):
             batch_keys = keys[start : start + 500]
             placeholders = ",".join("?" for _ in batch_keys)
             existing.update(
-                row[0]
+                (str(row[0]), str(row[1]))
                 for row in self.connection.execute(
-                    f"SELECT dedupe_key FROM market_events WHERE dedupe_key IN ({placeholders})",
+                    f"SELECT dedupe_key, payload_sha256 FROM market_events WHERE dedupe_key IN ({placeholders})",
                     batch_keys,
                 )
             )
 
+        # Targeted indexed lookups only: never load all historical conflict
+        # versions into RAM on every batch.
+        candidates: set[str] = set()
+        hypothetical_new: dict[str, str] = {}
+        for _event, key, digest, _raw in prepared:
+            canonical = existing.get(key, hypothetical_new.get(key))
+            if canonical is None:
+                hypothetical_new[key] = digest
+            elif canonical != digest:
+                candidates.add(hashlib.sha256(
+                    (key + "|" + digest).encode("utf-8")
+                ).hexdigest())
+        prior_versions: set[str] = set()
+        candidate_list = sorted(candidates)
+        for offset in range(0, len(candidate_list), 400):
+            page = candidate_list[offset : offset + 400]
+            marks = ",".join("?" for _ in page)
+            prior_versions.update(str(row[0]) for row in self.connection.execute(
+                f"SELECT row_sha256 FROM market_event_versions "
+                f"WHERE source_generation = ? AND row_sha256 IN ({marks})",
+                ["collector-runtime", *page],
+            ))
+
+        rows: list[tuple[Any, ...]] = []
+        version_rows: list[tuple[Any, ...]] = []
         new_parquet_rows: list[dict[str, Any]] = []
+        archived_candidates: set[tuple[str, str]] = set()
         for event, dedupe, digest, raw in prepared:
-            if dedupe in existing or dedupe in seen:
+            canonical = existing.get(dedupe, seen.get(dedupe))
+            if canonical == digest:
                 continue
-            seen.add(dedupe)
-            if digest is None or raw is None:
-                _, digest, raw = self._normalized(event)
             received = str(event.get("received_utc") or datetime.now(timezone.utc).isoformat())
-            rows.append(
-                (
-                    dedupe,
-                    received,
-                    event.get("exchange_ts"),
-                    str(event.get("channel", "unknown")),
-                    str(event.get("kind", "unknown")),
-                    event.get("market_ticker"),
-                    encode_journal_payload(raw),
-                    digest,
+            exchange_ts = event.get("exchange_ts")
+            channel = str(event.get("channel", "unknown"))
+            kind = str(event.get("kind", "unknown"))
+            ticker = event.get("market_ticker")
+            encoded = encode_journal_payload(raw)
+            row = (dedupe, received, exchange_ts, channel, kind, ticker, encoded, digest)
+            if canonical is not None:
+                # Deduplicate the conflicting version by source key and payload,
+                # not by time of this observation.
+                version_hash = hashlib.sha256(
+                    (dedupe + "|" + digest).encode("utf-8")
+                ).hexdigest()
+                if version_hash in prior_versions:
+                    continue
+                prior_versions.add(version_hash)
+                version_rows.append(
+                    ("collector-runtime", version_hash, datetime.now(timezone.utc).isoformat(), *row)
                 )
-            )
+            else:
+                seen[dedupe] = digest
+                rows.append(row)
+            pair = (dedupe, digest)
+            if pair in archived_candidates:
+                continue
+            archived_candidates.add(pair)
             new_parquet_rows.append(
                 {
                     "dedupe_key": dedupe,
                     "received_utc": received,
-                    "exchange_ts": event.get("exchange_ts"),
-                    "channel": str(event.get("channel", "unknown")),
-                    "kind": str(event.get("kind", "unknown")),
-                    "market_ticker": event.get("market_ticker"),
+                    "exchange_ts": exchange_ts,
+                    "channel": channel,
+                    "kind": kind,
+                    "market_ticker": ticker,
                     "payload_sha256": digest,
                     "raw_json": raw,
                 }
             )
 
-        cursor = None
+        inserted = 0
+        inserted_versions = 0
         try:
-            if rows:
+            if rows or version_rows:
                 self.connection.execute("BEGIN IMMEDIATE")
-                cursor = self.connection.executemany(
-                    "INSERT OR IGNORE INTO market_events VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    rows,
-                )
+                if rows:
+                    inserted = max(0, int(self.connection.executemany(
+                        "INSERT OR IGNORE INTO market_events VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        rows,
+                    ).rowcount))
+                if version_rows:
+                    inserted_versions = max(0, int(self.connection.executemany(
+                        "INSERT OR IGNORE INTO market_event_versions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        version_rows,
+                    ).rowcount))
                 self.connection.commit()
         except Exception:
-            try:
-                self.connection.rollback()
-            except Exception:
-                pass
+            self.connection.rollback()
             raise
-        inserted = int(
-            cursor.rowcount if cursor is not None and cursor.rowcount >= 0 else len(rows)
-        )
+
         self.events_inserted += inserted
-        self.events_duplicate += max(0, len(events) - inserted)
+        self.events_key_conflict += inserted_versions
+        self.events_duplicate += max(0, len(events) - inserted - inserted_versions)
         self.sqlite_bytes = self._sqlite_size()
         latest_event = self.connection.execute(
             "SELECT received_utc FROM market_events ORDER BY rowid DESC LIMIT 1"
         ).fetchone()
         self.latest_market_event_received_utc = str(latest_event[0]) if latest_event else None
 
+        # All candidates have stable archive fingerprints, but only committed
+        # canonical/variant rows should enter Parquet.
+        committed = set((row[0], row[7]) for row in rows)
+        committed.update((row[3], row[10]) for row in version_rows)
+        new_parquet_rows = [
+            row for row in new_parquet_rows
+            if (row["dedupe_key"], row["payload_sha256"]) in committed
+        ]
         if self.raw_capture_enabled and new_parquet_rows:
             incoming_estimate = sum(
                 len(row["raw_json"].encode("utf-8")) + 192 for row in new_parquet_rows
@@ -709,6 +1097,7 @@ class Storage:
             if self.parquet_bytes + incoming_estimate > self.cfg.raw_data_budget_bytes:
                 self.raw_capture_enabled = False
                 self.parquet_dropped_rows += len(new_parquet_rows)
+                self.parquet_unrecovered_rows += len(new_parquet_rows)
                 LOG.warning("raw Parquet budget reached; SQLite critical journal remains enabled")
             else:
                 if not self.parquet_buffer:
@@ -719,7 +1108,8 @@ class Storage:
                     self.flush_parquet(reason="ROW_THRESHOLD")
         elif new_parquet_rows:
             self.parquet_dropped_rows += len(new_parquet_rows)
-        return inserted
+            self.parquet_unrecovered_rows += len(new_parquet_rows)
+        return inserted + inserted_versions
 
     def _write_partitioned_parquet(self, rows: list[dict[str, Any]]) -> None:
         groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
@@ -752,9 +1142,27 @@ class Storage:
                     os.fsync(handle.fileno())
                 os.replace(temporary, output)
             except Exception:
-                temporary.unlink(missing_ok=True)
+                # Leave the .partial file for forensic recovery; never silently
+                # remove evidence of an interrupted archive commit.
                 raise
-            self.parquet_bytes += output.stat().st_size
+            size = output.stat().st_size
+            digest = hashlib.sha256()
+            with output.open("rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            if self.connection is not None:
+                self.connection.execute(
+                    "INSERT OR REPLACE INTO archive_manifests VALUES (?, ?, ?, ?, ?)",
+                    (
+                        str(output.relative_to(self.cfg.parquet_dir)),
+                        len(batch),
+                        size,
+                        digest.hexdigest(),
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+                self.connection.commit()
+            self.parquet_bytes += size
 
     def integrity_check(self) -> str:
         if self.connection is None:

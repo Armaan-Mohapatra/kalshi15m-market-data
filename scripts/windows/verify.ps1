@@ -1,5 +1,5 @@
 $ErrorActionPreference = 'Stop'
-$root = [IO.Path]::GetFullPath('C:\Users\dakin\Projects\kalshi-15m-native').TrimEnd('\')
+$root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..')).TrimEnd('\')
 $statusPort = if ($env:KALSHI15M_STATUS_PORT) { [int]$env:KALSHI15M_STATUS_PORT } else { 8768 }
 $checks = [System.Collections.Generic.List[object]]::new()
 $python = Join-Path $root '.venv\Scripts\python.exe'
