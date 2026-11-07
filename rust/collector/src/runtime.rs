@@ -37,12 +37,12 @@ fn websocket_subscription_identity(event: &Event) -> Option<(String, i64, String
     Some((session_id, sid, key))
 }
 
-fn subscription_health_mut(
-    health: &mut RuntimeHealth,
+fn subscription_health_mut<'a>(
+    health: &'a mut RuntimeHealth,
     session_id: &str,
     sid: i64,
     key: String,
-) -> &mut WebSocketSubscriptionHealth {
+) -> &'a mut WebSocketSubscriptionHealth {
     if !health.websocket_subscriptions.contains_key(&key)
         && health.websocket_subscriptions.len() >= MAX_WEBSOCKET_SUBSCRIPTION_HEALTH_ROWS
     {

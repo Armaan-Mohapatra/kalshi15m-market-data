@@ -512,7 +512,7 @@ impl Journal {
                         market.latest_event_received_utc = Some(row.received_utc.clone());
                     }
                 }
-                if let Some((session_id, sid)) = archive_subscription_identity(row) {
+                if let Some((session_id, sid)) = Self::archive_subscription_identity(row) {
                     let key = format!("{session_id}:{sid}");
                     let subscription = summary.by_subscription.entry(key).or_insert_with(|| {
                         SubscriptionArchiveSummary {
