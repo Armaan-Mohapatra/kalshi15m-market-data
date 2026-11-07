@@ -6,7 +6,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$root = 'C:\Users\dakin\Projects\kalshi-15m-native'
+$root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $statusUrl = 'http://127.0.0.1:8768/api/v1/status'
 
 if ($DurationSeconds -lt 60) { throw 'DurationSeconds must be at least 60.' }

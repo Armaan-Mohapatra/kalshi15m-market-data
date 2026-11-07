@@ -12,6 +12,7 @@ $logPath = Join-Path $homePath 'logs\supervisor.log'
 $startPath = Join-Path $root 'scripts\windows\start.ps1'
 $lastLoggedState = $null
 $lastHealthyPid = $null
+$lastCaptureQuality = $null
 
 New-Item -ItemType Directory -Path (Split-Path -Parent $logPath),(Split-Path -Parent $pidPath) -Force | Out-Null
 
@@ -83,6 +84,7 @@ function Test-StandaloneWorker {
             return [pscustomobject]@{
                 healthy = $true; can_start = $false; reason = 'HEALTHY'
                 pid = $statusPid; state = [string]$status.service_state; identity_verified = $true
+                capture_quality = [string](Get-StatusValue $status 'collection_quality_state')
             }
         }
         return [pscustomobject]@{
@@ -122,7 +124,7 @@ function Test-StandaloneWorker {
 
 if ($CheckOnly) {
     $check = Test-StandaloneWorker
-    [pscustomobject]@{ healthy = $check.healthy; reason = $check.reason; pid = $check.pid; state = $check.state; identity_verified = $check.identity_verified; exchange_writes = 0 } | ConvertTo-Json -Compress
+    [pscustomobject]@{ healthy = $check.healthy; reason = $check.reason; pid = $check.pid; state = $check.state; identity_verified = $check.identity_verified; capture_quality = $check.capture_quality; exchange_writes = 0 } | ConvertTo-Json -Compress
     if ($check.healthy) { exit 0 }
     exit 1
 }
@@ -153,7 +155,11 @@ while ($true) {
     $check = Test-StandaloneWorker
     if ($check.healthy) {
         if ($lastHealthyPid -ne $check.pid) {
-            Write-SupervisorLog "HEALTHY worker_pid=$($check.pid) mode=PAPER_ONLY exchange_write_calls=0"
+            Write-SupervisorLog "HEALTHY_PROCESS worker_pid=$($check.pid) mode=PAPER_ONLY exchange_write_calls=0"
+        }
+        if ($lastCaptureQuality -ne $check.capture_quality) {
+            Write-SupervisorLog "CAPTURE_QUALITY_CHANGED worker_pid=$($check.pid) quality=$($check.capture_quality)"
+            $lastCaptureQuality = $check.capture_quality
         }
         $lastHealthyPid = $check.pid
         $lastLoggedState = 'HEALTHY'

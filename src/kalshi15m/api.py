@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import heapq
 import json
 import time
+from email.utils import parsedate_to_datetime
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -20,6 +22,14 @@ class PaginationLimitExceeded(RuntimeError):
         super().__init__(f"Pagination exceeded configured maximum of {pages} pages")
 
 
+class ObservedPayload(dict):
+    """Dict-compatible REST response with independent HTTP timing evidence."""
+
+    def __init__(self, data: dict[str, Any], metadata: dict[str, Any]) -> None:
+        super().__init__(data)
+        self.response_metadata = metadata
+
+
 class PublicKalshiAPI:
     """Public, GET-only Kalshi API client with one shared request budget."""
 
@@ -31,6 +41,9 @@ class PublicKalshiAPI:
         )
         self._next_request_at = 0.0
         self._lock = asyncio.Lock()
+        self._gate = asyncio.Condition()
+        self._request_ticket = 0
+        self._waiting_requests: list[tuple[int, int, object]] = []
         self.requests = 0
         self.attempts = 0
         self.errors = 0
@@ -45,17 +58,52 @@ class PublicKalshiAPI:
         self.last_error: str | None = None
         self.last_request_rtt_ms: float | None = None
 
-    async def _throttle(self) -> None:
-        async with self._lock:
-            now = time.monotonic()
-            wait = self._next_request_at - now
-            if wait > 0:
-                await asyncio.sleep(wait)
-            self._next_request_at = time.monotonic() + self.min_interval
+    @staticmethod
+    def _priority(path: str, params: dict[str, Any] | None) -> int:
+        """Static GET-only scheduling: prices/opening first, bulk inventory last."""
+        if "orderbook" in path:
+            return 0
+        if path == "/markets" and params and params.get("tickers"):
+            return 1
+        if path == "/markets" and params and params.get("status") in {"unopened", "open", "active"}:
+            return 2
+        if path == "/markets/trades":
+            return 3
+        return 5
+
+    async def _throttle(self, priority: int = 5) -> None:
+        # Preserve the observed 2-second rate budget while allowing a request
+        # that arrived later to pass bulk inventory work waiting in the queue.
+        marker = object()
+        async with self._gate:
+            self._request_ticket += 1
+            ticket = (priority, self._request_ticket, marker)
+            heapq.heappush(self._waiting_requests, ticket)
+            try:
+                while True:
+                    if self._waiting_requests[0] != ticket:
+                        await self._gate.wait()
+                        continue
+                    remaining = self._next_request_at - time.monotonic()
+                    if remaining > 0:
+                        try:
+                            await asyncio.wait_for(self._gate.wait(), timeout=remaining)
+                        except TimeoutError:
+                            pass
+                        continue
+                    heapq.heappop(self._waiting_requests)
+                    self._next_request_at = time.monotonic() + self.min_interval
+                    self._gate.notify_all()
+                    return
+            finally:
+                if ticket in self._waiting_requests:
+                    self._waiting_requests.remove(ticket)
+                    heapq.heapify(self._waiting_requests)
+                    self._gate.notify_all()
 
     async def _schedule_rate_limit_backoff(self, path: str) -> None:
-        """Pause every shared REST caller after a 429, not only the retrying task."""
-        async with self._lock:
+        """Throttle all REST requests after 429 while preserving scheduling priority."""
+        async with self._gate:
             now = time.monotonic()
             if (
                 self._last_rate_limit_monotonic is None
@@ -71,6 +119,7 @@ class PublicKalshiAPI:
             self.rate_limit_backoff_scheduled_seconds += delay
             self.last_rate_limit_path = path
             self.last_rate_limit_utc = datetime.now(timezone.utc).isoformat()
+            self._gate.notify_all()
 
     def _get_sync(self, path: str, params: dict[str, Any] | None) -> dict[str, Any]:
         if not path.startswith("/") or ".." in path or path.startswith("//"):
@@ -92,21 +141,42 @@ class PublicKalshiAPI:
             method="GET",
             headers={"Accept": "application/json", "User-Agent": "kalshi-15m-native/0.1"},
         )
+        request_sent_utc = datetime.now(timezone.utc)
         with urllib.request.urlopen(request, timeout=25) as response:
             if response.status != 200:
                 raise RuntimeError(f"Kalshi GET returned HTTP {response.status}")
+            date_header = response.headers.get("Date")
             raw = response.read(settings.max_response_bytes + 1)
             if len(raw) > settings.max_response_bytes:
                 raise RuntimeError("Kalshi response exceeded configured 64 MiB limit")
+        response_received_utc = datetime.now(timezone.utc)
         payload = json.loads(raw)
         if not isinstance(payload, dict):
             raise RuntimeError("Kalshi response was not a JSON object")
-        return payload
+        offset = None
+        if date_header:
+            try:
+                server_date = parsedate_to_datetime(date_header)
+                if server_date.tzinfo is not None:
+                    midpoint = request_sent_utc + (response_received_utc - request_sent_utc) / 2
+                    offset = round((server_date - midpoint).total_seconds(), 3)
+            except (TypeError, ValueError, OverflowError):
+                pass
+        return ObservedPayload(payload, {
+            "request_sent_utc": request_sent_utc.isoformat(),
+            "response_received_utc": response_received_utc.isoformat(),
+            "http_status": 200,
+            "server_date_header": date_header,
+            "server_date_offset_approx_seconds": offset,
+            "server_date_offset_quality": (
+                "COARSE_HTTP_DATE_DIAGNOSTIC" if offset is not None else "NOT_MEASURED"
+            ),
+        })
 
     async def get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         self.requests += 1
         for retry in range(4):
-            await self._throttle()
+            await self._throttle(self._priority(path, params))
             self.attempts += 1
             request_started = time.perf_counter()
             try:
@@ -117,10 +187,20 @@ class PublicKalshiAPI:
                     await self._schedule_rate_limit_backoff(path)
                     if retry < 3:
                         continue
+                elif 500 <= exc.code < 600 and retry < 3:
+                    await asyncio.sleep(min(3.0, 0.25 * (2 ** retry)))
+                    continue
                 self.errors += 1
                 self.last_error = f"{type(exc).__name__}: HTTP {exc.code}"
                 raise
-            except (urllib.error.URLError, TimeoutError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
+            except (urllib.error.URLError, TimeoutError) as exc:
+                if retry < 3:
+                    await asyncio.sleep(min(3.0, 0.25 * (2 ** retry)))
+                    continue
+                self.errors += 1
+                self.last_error = f"{type(exc).__name__}: {exc}"
+                raise
+            except (ValueError, RuntimeError, json.JSONDecodeError) as exc:
                 self.errors += 1
                 self.last_error = f"{type(exc).__name__}: {exc}"
                 raise

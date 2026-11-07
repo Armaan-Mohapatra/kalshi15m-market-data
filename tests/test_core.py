@@ -398,6 +398,47 @@ class RuntimeStatusTests(unittest.TestCase):
             self.assertEqual(snapshot["rest_poll_health"]["rest_orderbook"], "DEGRADED")
             self.assertEqual(snapshot["last_rest_poll_by_channel"]["rest_orderbook"]["error_count"], 1)
 
+    def test_rest_orderbook_partial_success_is_degraded(self):
+        with TemporaryDirectory() as root:
+            status = RuntimeStatus(Settings(home=Path(root)))
+            status.mark_rest_poll(
+                "rest_orderbook",
+                started_utc=datetime.now(timezone.utc).isoformat(),
+                request_count=1,
+                successful_request_count=1,
+                requested_market_count=3,
+                markets_with_data=2,
+                rows_received=2,
+                error_count=0,
+            )
+            snapshot = status.snapshot()
+            self.assertEqual(snapshot["rest_poll_health"]["rest_orderbook"], "DEGRADED")
+            self.assertEqual(
+                snapshot["last_rest_poll_by_channel"]["rest_orderbook"]["missing_market_count"],
+                1,
+            )
+
+    def test_degraded_rest_book_poll_becomes_stale(self):
+        with TemporaryDirectory() as root:
+            status = RuntimeStatus(Settings(home=Path(root), book_poll_interval_seconds=15))
+            status.mark_rest_poll(
+                "rest_orderbook",
+                started_utc=datetime.now(timezone.utc).isoformat(),
+                request_count=1,
+                successful_request_count=1,
+                requested_market_count=3,
+                markets_with_data=2,
+                rows_received=2,
+                error_count=0,
+            )
+            status.data["last_rest_poll_by_channel"]["rest_orderbook"][
+                "completed_utc"
+            ] = (datetime.now(timezone.utc) - timedelta(seconds=31)).isoformat()
+            status.refresh_ages()
+            self.assertEqual(
+                status.snapshot()["rest_poll_health"]["rest_orderbook"], "STALE"
+            )
+
     def test_rest_orderbook_poll_health_marks_stale_after_two_intervals(self):
         with TemporaryDirectory() as root:
             status = RuntimeStatus(
@@ -495,7 +536,10 @@ class ClassificationTests(unittest.TestCase):
 
 class FrozenStrategyTests(unittest.TestCase):
     def setUp(self):
-        self.config, self.config_hash = load_frozen_strategy(Path(__file__).resolve().parents[1])
+        source_root = Path(__file__).resolve().parents[1]
+        if not (source_root / "strategy" / "reflex_vnext_frozen_config.json").is_file():
+            self.skipTest("requires private frozen strategy authority omitted from sanitized GitHub snapshot")
+        self.config, self.config_hash = load_frozen_strategy(source_root)
         self.now = datetime.now(timezone.utc)
         self.market = {
             "ticker": "KXBTC15M-SAMPLE",
@@ -1320,7 +1364,7 @@ class ApiTests(unittest.TestCase):
 
         self.assertEqual(next_cursor, 4)
         self.assertEqual(added, 4)
-        self.assertEqual(len(api.market_series_calls), 4)
+        self.assertEqual(len(api.market_series_calls), 8)
         self.assertEqual(len(api.event_calls), 1)
         self.assertEqual(len(snapshot["markets"]), 4)
         self.assertTrue(all(row["duration_seconds"] == 900 for row in snapshot["markets"]))
@@ -1977,7 +2021,7 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(pq.ParquetFile(parquet_files[0]).read().num_rows, 1)
             self.assertEqual(pq.ParquetFile(parquet_files[0]).metadata.row_group(0).column(0).compression, "ZSTD")
 
-    def test_existing_deduplicated_events_skip_payload_normalization(self):
+    def test_existing_deduplicated_events_are_hash_checked(self):
         with TemporaryDirectory() as temporary:
             store = Storage(Settings(home=Path(temporary)))
             store.open()
@@ -1991,12 +2035,9 @@ class StorageTests(unittest.TestCase):
             }
             self.assertEqual(store.append_batch([event]), 1)
 
-            with patch.object(
-                store,
-                "_normalized",
-                side_effect=AssertionError("duplicate payload was normalized"),
-            ):
+            with patch.object(store, "_normalized", wraps=store._normalized) as normalized:
                 self.assertEqual(store.append_batch([event]), 0)
+            self.assertGreater(normalized.call_count, 0)
 
             self.assertEqual(store.events_duplicate, 1)
             self.assertEqual(len(store.parquet_buffer), 1)
@@ -2103,7 +2144,7 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(recovered.integrity_check(), "ok")
             recovered.close()
 
-    def test_clean_stopped_capture_skips_parquet_recovery(self):
+    def test_status_only_does_not_skip_archive_recovery(self):
         with TemporaryDirectory() as temporary:
             cfg = Settings(home=Path(temporary), min_free_bytes=0)
             cfg.runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -2121,7 +2162,7 @@ class StorageTests(unittest.TestCase):
             store = Storage(cfg)
             store.open()
 
-            self.assertEqual(store.parquet_recovery_state, "SKIPPED_PREVIOUS_RUN_STOPPED")
+            self.assertEqual(store.parquet_recovery_state, "VERIFIED_NO_GAP")
             self.assertEqual(store.parquet_recovery_rows, 0)
             store.close()
 
@@ -2279,7 +2320,7 @@ class StorageTests(unittest.TestCase):
             connection = sqlite3.connect(cfg.ledger_path)
             try:
                 connection.execute(
-                    """CREATE TABLE market_event_versions (
+                    """CREATE TABLE IF NOT EXISTS market_event_versions (
                         source_generation TEXT NOT NULL,
                         row_sha256 TEXT NOT NULL,
                         captured_utc TEXT NOT NULL,
@@ -2546,7 +2587,10 @@ class WriterLoopTests(unittest.IsolatedAsyncioTestCase):
             writer = asyncio.create_task(collector.writer_loop())
             try:
                 deadline = asyncio.get_running_loop().time() + 3
-                while store.parquet_buffer and asyncio.get_running_loop().time() < deadline:
+                while (
+                    (store.parquet_buffer or collector.status.data.get("parquet_last_flush_reason") != "IDLE_BUFFER_AGE")
+                    and asyncio.get_running_loop().time() < deadline
+                ):
                     await asyncio.sleep(0.05)
 
                 self.assertEqual(store.parquet_buffer, [])
