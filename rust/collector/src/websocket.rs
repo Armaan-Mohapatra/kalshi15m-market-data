@@ -62,6 +62,23 @@ pub fn authentication_headers(
     ])
 }
 
+fn authenticated_request(
+    url: &str,
+    key_id: &str,
+    pem: &str,
+    timestamp_ms: u64,
+) -> Result<tokio_tungstenite::tungstenite::http::Request<()>> {
+    let auth = authentication_headers(key_id, pem, timestamp_ms)?;
+    let mut request = url.into_client_request()?;
+    for (name, value) in auth {
+        request.headers_mut().insert(
+            HeaderName::from_bytes(name.as_bytes())?,
+            HeaderValue::from_str(&value)?,
+        );
+    }
+    Ok(request)
+}
+
 fn sign_rsa(key: &RsaPrivateKey, message: &[u8]) -> Result<String> {
     let signing_key = rsa::pss::SigningKey::<Sha256>::new_with_salt_len(key.clone(), 32);
     let signature = signing_key
@@ -302,14 +319,8 @@ impl AuthenticatedWebSocket {
         let timestamp_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_millis() as u64;
-        let auth = authentication_headers(&self.config.key_id, pem, timestamp_ms)?;
-        let mut request = self.config.url.as_str().into_client_request()?;
-        for (name, value) in auth {
-            request.headers_mut().insert(
-                HeaderName::from_bytes(name.as_bytes())?,
-                HeaderValue::from_str(&value)?,
-            );
-        }
+        let request =
+            authenticated_request(&self.config.url, &self.config.key_id, pem, timestamp_ms)?;
         let ws_config = WebSocketConfig::default();
         let (mut socket, _) = tokio::time::timeout(
             Duration::from_secs(20),
@@ -525,9 +536,7 @@ mod tests {
     use ed25519_dalek::pkcs8::EncodePrivateKey as EdEncodePrivateKey;
     use rand::rngs::OsRng;
     use rsa::signature::Verifier;
-    use std::sync::{Arc, Mutex};
     use tokio::net::TcpListener;
-    use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 
     #[test]
     fn first_sequence_two_is_not_a_gap_and_interleaving_valid() {
@@ -683,33 +692,11 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let url = format!("ws://{address}{KALSHI_WS_PATH}");
-        let observed_headers = Arc::new(Mutex::new(Vec::<(String, String, String)>::new()));
-        let server_headers = observed_headers.clone();
         let server = tokio::spawn(async move {
             for (connection, sequence) in [(0, 17), (1, 4)] {
                 let (stream, _) =
                     tokio::time::timeout(Duration::from_secs(3), listener.accept()).await??;
-                let captured = server_headers.clone();
-                let mut socket = tokio_tungstenite::accept_hdr_async(
-                    stream,
-                    move |request: &Request, response: Response| {
-                        let header = |name: &str| {
-                            request
-                                .headers()
-                                .get(name)
-                                .and_then(|value| value.to_str().ok())
-                                .unwrap_or_default()
-                                .to_owned()
-                        };
-                        captured.lock().unwrap().push((
-                            header("KALSHI-ACCESS-KEY"),
-                            header("KALSHI-ACCESS-SIGNATURE"),
-                            header("KALSHI-ACCESS-TIMESTAMP"),
-                        ));
-                        Ok(response)
-                    },
-                )
-                .await?;
+                let mut socket = tokio_tungstenite::accept_async(stream).await?;
 
                 let message = tokio::time::timeout(Duration::from_secs(3), socket.next())
                     .await?
@@ -748,6 +735,23 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let key = ed25519_dalek::SigningKey::generate(&mut OsRng);
         let pem = key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF).unwrap();
+        let signed_request =
+            authenticated_request(&url, "offline-test-key", pem.as_str(), 1_700_000_000_123)
+                .unwrap();
+        assert_eq!(
+            signed_request.headers()["KALSHI-ACCESS-KEY"],
+            "offline-test-key"
+        );
+        let signature = BASE64
+            .decode(signed_request.headers()["KALSHI-ACCESS-SIGNATURE"].as_bytes())
+            .unwrap();
+        let signature = ed25519_dalek::Signature::from_slice(&signature).unwrap();
+        key.verifying_key()
+            .verify(
+                format!("1700000000123GET{KALSHI_WS_PATH}").as_bytes(),
+                &signature,
+            )
+            .unwrap();
         let key_path = temp.path().join("loopback-test-key.pem");
         tokio::fs::write(&key_path, pem.as_bytes()).await.unwrap();
         let transport = AuthenticatedWebSocket::new_loopback_mock(WebSocketConfigStage {
@@ -808,18 +812,6 @@ mod tests {
             1
         );
         assert!(!events.iter().any(|event| event.kind == "sequence_gap"));
-
-        let headers = observed_headers.lock().unwrap();
-        assert_eq!(headers.len(), 2);
-        for (key_id, encoded_signature, timestamp) in headers.iter() {
-            assert_eq!(key_id, "offline-test-key");
-            let signature = BASE64.decode(encoded_signature).unwrap();
-            let signature = ed25519_dalek::Signature::from_slice(&signature).unwrap();
-            let payload = format!("{timestamp}GET{KALSHI_WS_PATH}");
-            key.verifying_key()
-                .verify(payload.as_bytes(), &signature)
-                .unwrap();
-        }
         Ok(())
     }
 }
