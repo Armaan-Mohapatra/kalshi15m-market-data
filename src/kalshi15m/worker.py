@@ -866,8 +866,6 @@ class Collector:
                 queue_depth=self.queue.qsize(),
                 events_inserted=self.storage.events_inserted,
                 events_duplicate=self.storage.events_duplicate,
-                events_key_conflict=self.storage.events_key_conflict,
-                events_quarantined=self.storage.events_quarantined,
                 raw_capture_state="ENABLED" if self.storage.raw_capture_enabled else "THROTTLED_BUDGET",
                 **storage_status,
             )
