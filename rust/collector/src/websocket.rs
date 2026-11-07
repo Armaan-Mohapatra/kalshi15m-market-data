@@ -36,7 +36,11 @@ impl WebsocketEngine {
     pub fn book(&self, ticker: &str) -> Option<&OrderBook> { self.books.get(ticker) }
 
     pub fn handle(&mut self, message: Value) -> Vec<Event> {
-        let observed = utc_now();
+        // Replay timestamps are source evidence, not the time the fixture
+        // happened to be reprocessed. Unknown historic times stay unknown.
+        let observed = message.get("_collector_received_utc")
+            .and_then(Value::as_str)
+            .unwrap_or("UNKNOWN_REPLAY_CAPTURE_TIME").to_string();
         let kind = message.get("type").and_then(Value::as_str).unwrap_or("unknown").to_string();
         let sid = message.get("sid").and_then(Value::as_i64);
         let seq = message.get("seq").and_then(Value::as_i64);
