@@ -22,6 +22,9 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 
 pub fn observe_websocket_event(health: &mut RuntimeHealth, event: &Event, queue_depth: usize) {
+    if event.channel.starts_with("websocket_") {
+        health.websocket_events_observed += 1;
+    }
     health.websocket_last_frame_utc = Some(event.received_utc.clone());
     health.queue_depth = queue_depth;
     if queue_depth.saturating_add(1) >= health.queue_capacity {
@@ -68,11 +71,22 @@ pub fn observe_websocket_event(health: &mut RuntimeHealth, event: &Event, queue_
                 book_source: "NOT_POLLED".into(),
                 book_state: "NOT_YET_OBSERVED".into(),
                 websocket_book_state: "NOT_YET_OBSERVED".into(),
+                websocket_events_observed: 0,
+                websocket_events_journaled: 0,
+                websocket_events_duplicate: 0,
+                websocket_events_spooled: 0,
+                websocket_events_unpersisted: 0,
+                last_websocket_journaled_event_utc: None,
+                last_websocket_journal_ack_utc: None,
+                last_websocket_spooled_event_utc: None,
                 last_trade_poll_utc: None,
                 trades_complete: None,
                 last_error: None,
             });
         market.last_websocket_frame_utc = Some(event.received_utc.clone());
+        if event.channel.starts_with("websocket_") {
+            market.websocket_events_observed += 1;
+        }
         match event.kind.as_str() {
             "orderbook_snapshot" | "orderbook_delta" => {
                 market.websocket_book_state = "FRAME_OBSERVED".into();
@@ -93,6 +107,62 @@ pub fn observe_websocket_event(health: &mut RuntimeHealth, event: &Event, queue_
             "delta_not_applied" => market.websocket_book_state = "UNSYNCHRONIZED".into(),
             "trade" => market.last_websocket_trade_utc = Some(event.received_utc.clone()),
             _ => {}
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WebSocketPersistenceOutcome {
+    Journaled,
+    Duplicate,
+    Spooled,
+    Failed,
+}
+
+/// Record persistence for a WebSocket event. Journaled means SQLite insert/version;
+/// Parquet archive completeness remains represented by the separate archive state.
+pub fn observe_websocket_persistence(
+    health: &mut RuntimeHealth,
+    event: &Event,
+    outcome: WebSocketPersistenceOutcome,
+) {
+    if !event.channel.starts_with("websocket_") {
+        return;
+    }
+    let market = event
+        .market_ticker
+        .as_deref()
+        .and_then(|ticker| health.markets.get_mut(ticker));
+    match outcome {
+        WebSocketPersistenceOutcome::Journaled => {
+            health.websocket_events_journaled += 1;
+            if let Some(market) = market {
+                market.websocket_events_journaled += 1;
+                market.last_websocket_journaled_event_utc = Some(event.received_utc.clone());
+                market.last_websocket_journal_ack_utc = Some(utc_now());
+            }
+        }
+        WebSocketPersistenceOutcome::Duplicate => {
+            health.websocket_events_duplicate += 1;
+            if let Some(market) = market {
+                market.websocket_events_duplicate += 1;
+                // An idempotent duplicate confirms the same event is already durable.
+                market.last_websocket_journaled_event_utc = Some(event.received_utc.clone());
+                market.last_websocket_journal_ack_utc = Some(utc_now());
+            }
+        }
+        WebSocketPersistenceOutcome::Spooled => {
+            health.websocket_events_spooled += 1;
+            if let Some(market) = market {
+                market.websocket_events_spooled += 1;
+                market.last_websocket_spooled_event_utc = Some(event.received_utc.clone());
+            }
+        }
+        WebSocketPersistenceOutcome::Failed => {
+            health.websocket_events_unpersisted += 1;
+            if let Some(market) = market {
+                market.websocket_events_unpersisted += 1;
+            }
         }
     }
 }
@@ -310,6 +380,14 @@ pub struct MarketHealth {
     pub book_source: String,
     pub book_state: String,
     pub websocket_book_state: String,
+    pub websocket_events_observed: u64,
+    pub websocket_events_journaled: u64,
+    pub websocket_events_duplicate: u64,
+    pub websocket_events_spooled: u64,
+    pub websocket_events_unpersisted: u64,
+    pub last_websocket_journaled_event_utc: Option<String>,
+    pub last_websocket_journal_ack_utc: Option<String>,
+    pub last_websocket_spooled_event_utc: Option<String>,
     pub last_trade_poll_utc: Option<String>,
     pub trades_complete: Option<bool>,
     pub last_error: Option<String>,
@@ -324,6 +402,11 @@ pub struct RuntimeHealth {
     pub websocket_sequence_gap_count: u64,
     pub websocket_malformed_frame_count: u64,
     pub websocket_last_frame_utc: Option<String>,
+    pub websocket_events_observed: u64,
+    pub websocket_events_journaled: u64,
+    pub websocket_events_duplicate: u64,
+    pub websocket_events_spooled: u64,
+    pub websocket_events_unpersisted: u64,
     pub sqlite_state: String,
     pub archive_state: String,
     pub queue_capacity: usize,
@@ -350,6 +433,11 @@ impl RuntimeHealth {
             websocket_sequence_gap_count: 0,
             websocket_malformed_frame_count: 0,
             websocket_last_frame_utc: None,
+            websocket_events_observed: 0,
+            websocket_events_journaled: 0,
+            websocket_events_duplicate: 0,
+            websocket_events_spooled: 0,
+            websocket_events_unpersisted: 0,
             sqlite_state: "OPEN".into(),
             archive_state: "UNVERIFIED".into(),
             queue_capacity,
@@ -509,6 +597,11 @@ impl ContinuousRuntime {
                             health.events_acknowledged += 1;
                             health.sqlite_state = "HEALTHY".into();
                             capacity_counter += 1;
+                            observe_websocket_persistence(
+                                &mut health,
+                                &item.event,
+                                WebSocketPersistenceOutcome::Journaled,
+                            );
                             if let Err(error) = item.acknowledge(Ok(())) {
                                 persist_error = Some(error.context("acknowledge durable WebSocket event"));
                                 break 'collect;
@@ -517,6 +610,11 @@ impl ContinuousRuntime {
                         Ok(IngestResult::Duplicate) => {
                             health.events_duplicate += 1;
                             capacity_counter += 1;
+                            observe_websocket_persistence(
+                                &mut health,
+                                &item.event,
+                                WebSocketPersistenceOutcome::Duplicate,
+                            );
                             if let Err(error) = item.acknowledge(Ok(())) {
                                 persist_error = Some(error.context("acknowledge duplicate durable event"));
                                 break 'collect;
@@ -525,8 +623,20 @@ impl ContinuousRuntime {
                         Err(error) => {
                             health.sqlite_state = "DEGRADED_SPOOLED".into();
                             let message = match journal.spool(&item.event) {
-                                Ok(spool) => format!("SQLite write failed; full event spooled at {}: {error}", spool.display()),
+                                Ok(spool) => {
+                                    observe_websocket_persistence(
+                                        &mut health,
+                                        &item.event,
+                                        WebSocketPersistenceOutcome::Spooled,
+                                    );
+                                    format!("SQLite write failed; full event spooled at {}: {error}", spool.display())
+                                }
                                 Err(spool_error) => {
+                                    observe_websocket_persistence(
+                                        &mut health,
+                                        &item.event,
+                                        WebSocketPersistenceOutcome::Failed,
+                                    );
                                     health.sqlite_state = "FAILED_UNSPOOLED_EVENT".into();
                                     format!("SQLite write failed ({error}); emergency spool also failed ({spool_error})")
                                 }
@@ -615,10 +725,20 @@ impl ContinuousRuntime {
                     Ok(_) => {
                         health.sqlite_state = "DEGRADED_SPOOLED".into();
                         health.events_acknowledged += 1;
+                        observe_websocket_persistence(
+                            &mut health,
+                            &item.event,
+                            WebSocketPersistenceOutcome::Spooled,
+                        );
                         let _ = item.acknowledge(Ok(()));
                     }
                     Err(error) => {
                         health.sqlite_state = "FAILED_UNSPOOLED_EVENT".into();
+                        observe_websocket_persistence(
+                            &mut health,
+                            &item.event,
+                            WebSocketPersistenceOutcome::Failed,
+                        );
                         let message =
                             format!("shutdown spool failed; event remains unacknowledged: {error}");
                         let _ = item.acknowledge(Err(message.clone()));
@@ -630,19 +750,41 @@ impl ContinuousRuntime {
             match journal.ingest(&item.event) {
                 Ok(IngestResult::Inserted | IngestResult::Versioned) => {
                     health.events_acknowledged += 1;
+                    observe_websocket_persistence(
+                        &mut health,
+                        &item.event,
+                        WebSocketPersistenceOutcome::Journaled,
+                    );
                     item.acknowledge(Ok(()))?;
                 }
                 Ok(IngestResult::Duplicate) => {
                     health.events_duplicate += 1;
+                    observe_websocket_persistence(
+                        &mut health,
+                        &item.event,
+                        WebSocketPersistenceOutcome::Duplicate,
+                    );
                     item.acknowledge(Ok(()))?;
                 }
                 Err(error) => {
                     let message = match journal.spool(&item.event) {
-                        Ok(path) => format!(
-                            "shutdown drain write failed; event spooled at {}: {error}",
-                            path.display()
-                        ),
+                        Ok(path) => {
+                            observe_websocket_persistence(
+                                &mut health,
+                                &item.event,
+                                WebSocketPersistenceOutcome::Spooled,
+                            );
+                            format!(
+                                "shutdown drain write failed; event spooled at {}: {error}",
+                                path.display()
+                            )
+                        }
                         Err(spool_error) => {
+                            observe_websocket_persistence(
+                                &mut health,
+                                &item.event,
+                                WebSocketPersistenceOutcome::Failed,
+                            );
                             health.sqlite_state = "FAILED_UNSPOOLED_EVENT".into();
                             format!("shutdown drain SQLite write failed ({error}); emergency spool also failed ({spool_error})")
                         }
@@ -842,6 +984,14 @@ impl ContinuousRuntime {
                     book_source: "REST_SAMPLED_NOT_WS_SYNCHRONIZED".into(),
                     book_state: "NOT_YET_OBSERVED".into(),
                     websocket_book_state: "NOT_YET_OBSERVED".into(),
+                    websocket_events_observed: 0,
+                    websocket_events_journaled: 0,
+                    websocket_events_duplicate: 0,
+                    websocket_events_spooled: 0,
+                    websocket_events_unpersisted: 0,
+                    last_websocket_journaled_event_utc: None,
+                    last_websocket_journal_ack_utc: None,
+                    last_websocket_spooled_event_utc: None,
                     last_trade_poll_utc: None,
                     trades_complete: None,
                     last_error: None,
@@ -1001,6 +1151,14 @@ impl ContinuousRuntime {
                     book_source: "REST_SAMPLED_NOT_WS_SYNCHRONIZED".into(),
                     book_state: "NOT_YET_OBSERVED".into(),
                     websocket_book_state: "NOT_YET_OBSERVED".into(),
+                    websocket_events_observed: 0,
+                    websocket_events_journaled: 0,
+                    websocket_events_duplicate: 0,
+                    websocket_events_spooled: 0,
+                    websocket_events_unpersisted: 0,
+                    last_websocket_journaled_event_utc: None,
+                    last_websocket_journal_ack_utc: None,
+                    last_websocket_spooled_event_utc: None,
                     last_trade_poll_utc: None,
                     trades_complete: None,
                     last_error: None,
@@ -1070,6 +1228,15 @@ impl ContinuousRuntime {
             market.last_websocket_frame_utc = websocket.last_websocket_frame_utc;
             market.last_websocket_trade_utc = websocket.last_websocket_trade_utc;
             market.websocket_book_state = websocket.websocket_book_state;
+            market.websocket_events_observed = websocket.websocket_events_observed;
+            market.websocket_events_journaled = websocket.websocket_events_journaled;
+            market.websocket_events_duplicate = websocket.websocket_events_duplicate;
+            market.websocket_events_spooled = websocket.websocket_events_spooled;
+            market.websocket_events_unpersisted = websocket.websocket_events_unpersisted;
+            market.last_websocket_journaled_event_utc =
+                websocket.last_websocket_journaled_event_utc;
+            market.last_websocket_journal_ack_utc = websocket.last_websocket_journal_ack_utc;
+            market.last_websocket_spooled_event_utc = websocket.last_websocket_spooled_event_utc;
         }
         let capacity = journal.capacity_snapshot()?;
         health.disk_free_bytes = capacity.disk_free_bytes;
@@ -1140,6 +1307,14 @@ impl ContinuousRuntime {
                 book_source: "REST_SAMPLED_NOT_WS_SYNCHRONIZED".into(),
                 book_state: "NOT_YET_OBSERVED".into(),
                 websocket_book_state: "NOT_YET_OBSERVED".into(),
+                websocket_events_observed: 0,
+                websocket_events_journaled: 0,
+                websocket_events_duplicate: 0,
+                websocket_events_spooled: 0,
+                websocket_events_unpersisted: 0,
+                last_websocket_journaled_event_utc: None,
+                last_websocket_journal_ack_utc: None,
+                last_websocket_spooled_event_utc: None,
                 last_trade_poll_utc: None,
                 trades_complete: None,
                 last_error: None,
@@ -1305,6 +1480,44 @@ mod tests {
         assert_eq!(
             rotating_series_batch(&[], &BTreeSet::new(), &mut cursor, 2),
             Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn websocket_status_separates_observed_journaled_duplicate_and_spooled_events() {
+        let mut health = RuntimeHealth::new(8);
+        let event = Event::new(
+            "websocket_orderbook",
+            "orderbook_delta",
+            Some("KXBTC15M-STATUS-MOCK"),
+            json!({"seq":12}),
+            Some("ws-status-12".into()),
+        );
+        observe_websocket_event(&mut health, &event, 0);
+        observe_websocket_persistence(&mut health, &event, WebSocketPersistenceOutcome::Journaled);
+        observe_websocket_persistence(&mut health, &event, WebSocketPersistenceOutcome::Duplicate);
+        observe_websocket_persistence(&mut health, &event, WebSocketPersistenceOutcome::Spooled);
+        observe_websocket_persistence(&mut health, &event, WebSocketPersistenceOutcome::Failed);
+
+        let market = &health.markets["KXBTC15M-STATUS-MOCK"];
+        assert_eq!(health.websocket_events_observed, 1);
+        assert_eq!(health.websocket_events_journaled, 1);
+        assert_eq!(health.websocket_events_duplicate, 1);
+        assert_eq!(health.websocket_events_spooled, 1);
+        assert_eq!(health.websocket_events_unpersisted, 1);
+        assert_eq!(market.websocket_events_observed, 1);
+        assert_eq!(market.websocket_events_journaled, 1);
+        assert_eq!(market.websocket_events_duplicate, 1);
+        assert_eq!(market.websocket_events_spooled, 1);
+        assert_eq!(market.websocket_events_unpersisted, 1);
+        assert_eq!(
+            market.last_websocket_journaled_event_utc.as_deref(),
+            Some(event.received_utc.as_str())
+        );
+        assert!(market.last_websocket_journal_ack_utc.is_some());
+        assert_eq!(
+            market.last_websocket_spooled_event_utc.as_deref(),
+            Some(event.received_utc.as_str())
         );
     }
 
@@ -1887,12 +2100,15 @@ mod tests {
                     if serde_json::from_slice::<Value>(&bytes)
                         .ok()
                         .and_then(|status| {
-                            status["markets"]["KXBTC15M-COORDINATOR-MOCK"]["websocket_book_state"]
-                                .as_str()
-                                .map(str::to_owned)
+                            let market = &status["markets"]["KXBTC15M-COORDINATOR-MOCK"];
+                            (market["websocket_book_state"].as_str() == Some("SYNCHRONIZED")
+                                && market["websocket_events_observed"].as_u64().unwrap_or(0) >= 2
+                                && market["websocket_events_journaled"].as_u64().unwrap_or(0) >= 2
+                                && market["last_websocket_journal_ack_utc"].is_string())
+                            .then(|| "SYNCHRONIZED_AND_JOURNALED".to_string())
                         })
                         .as_deref()
-                        == Some("SYNCHRONIZED")
+                        == Some("SYNCHRONIZED_AND_JOURNALED")
                     {
                         break;
                     }

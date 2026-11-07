@@ -4,7 +4,8 @@ use kalshi15m_rust::{
     api::{PublicRest, DEFAULT_BASE},
     replay::{collect_once, replay_file},
     runtime::{
-        observe_websocket_event, ContinuousRuntime, RestSource, RuntimeConfig, RuntimeHealth,
+        observe_websocket_event, observe_websocket_persistence, ContinuousRuntime, RestSource,
+        RuntimeConfig, RuntimeHealth, WebSocketPersistenceOutcome,
     },
     storage::{IngestResult, Journal},
     websocket::{AuthenticatedWebSocket, WebSocketConfigStage, KALSHI_WS_URL},
@@ -388,9 +389,21 @@ async fn main() -> Result<()> {
                             observe_websocket_event(&mut health, &event, events_rx.len());
                             if stop_ingest {
                                 match journal.spool(&event) {
-                                    Ok(_) => spooled += 1,
+                                    Ok(_) => {
+                                        spooled += 1;
+                                        observe_websocket_persistence(
+                                            &mut health,
+                                            &event,
+                                            WebSocketPersistenceOutcome::Spooled,
+                                        );
+                                    }
                                     Err(error) => {
                                         health.sqlite_state = "SPOOL_WRITE_FAILED".into();
+                                        observe_websocket_persistence(
+                                            &mut health,
+                                            &event,
+                                            WebSocketPersistenceOutcome::Failed,
+                                        );
                                         persistence_error = Some(error);
                                     }
                                 }
@@ -400,6 +413,11 @@ async fn main() -> Result<()> {
                                         health.events_acknowledged += 1;
                                         health.sqlite_state = "HEALTHY".into();
                                         persisted += 1;
+                                        observe_websocket_persistence(
+                                            &mut health,
+                                            &event,
+                                            WebSocketPersistenceOutcome::Journaled,
+                                        );
                                         events_since_capacity_check += 1;
                                         if events_since_capacity_check >= 100 {
                                             events_since_capacity_check = 0;
@@ -446,9 +464,21 @@ async fn main() -> Result<()> {
                                     }
                                     Err(error) => {
                                         match journal.spool(&event) {
-                                            Ok(_) => spooled += 1,
+                                            Ok(_) => {
+                                                spooled += 1;
+                                                observe_websocket_persistence(
+                                                    &mut health,
+                                                    &event,
+                                                    WebSocketPersistenceOutcome::Spooled,
+                                                );
+                                            }
                                             Err(spool_error) => {
                                                 health.sqlite_state = "SPOOL_WRITE_FAILED".into();
+                                                observe_websocket_persistence(
+                                                    &mut health,
+                                                    &event,
+                                                    WebSocketPersistenceOutcome::Failed,
+                                                );
                                                 persistence_error = Some(anyhow::anyhow!(
                                                     "journal failed ({error}); emergency spool failed ({spool_error})"
                                                 ));
@@ -462,6 +492,11 @@ async fn main() -> Result<()> {
                                         health.events_duplicate += 1;
                                         persisted += 1;
                                         events_since_capacity_check += 1;
+                                        observe_websocket_persistence(
+                                            &mut health,
+                                            &event,
+                                            WebSocketPersistenceOutcome::Duplicate,
+                                        );
                                     }
                                 }
                             }
