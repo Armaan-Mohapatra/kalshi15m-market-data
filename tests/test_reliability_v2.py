@@ -212,6 +212,15 @@ class BookReliabilityTests(unittest.TestCase):
             book.delta({"side": "yes", "price_dollars": "0.55", "delta_fp": "-1"})
 
 
+    def test_legacy_cent_denominated_snapshot_and_delta_are_normalized(self):
+        book = OrderBook()
+        book.snapshot({"yes": [[55, 2]], "no": [[35, 3]]})
+        self.assertEqual(book.quotes()["yes_bid"], "0.55")
+        self.assertEqual(book.quotes()["yes_ask"], "0.65")
+        book.delta({"side": "yes", "price": 55, "delta": -2})
+        self.assertIsNone(book.quotes()["yes_bid"])
+
+
 class CaptureReliabilityTests(unittest.TestCase):
     def test_missing_rest_book_is_degraded_and_observed_milestone_is_durable(self):
         with TemporaryDirectory() as directory:
