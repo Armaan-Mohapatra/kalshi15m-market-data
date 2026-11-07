@@ -1127,6 +1127,40 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_partial_parquet_prevents_clean_shutdown_and_archive_verification() {
+        let home = tempfile::tempdir().unwrap();
+        let mut store = Journal::open(home.path()).unwrap();
+        let event = Event::new(
+            "rest",
+            "trade",
+            Some("PARTIAL-PARQUET-TEST"),
+            json!({"id":"partial-parquet-must-not-be-clean"}),
+            Some("partial-parquet-test".into()),
+        );
+        assert_eq!(store.ingest(&event).unwrap(), IngestResult::Inserted);
+        assert_eq!(store.flush_archive(10).unwrap(), 1);
+
+        let parts = archive::list_final_parts(&store.archive_root, 10).unwrap();
+        assert_eq!(parts.len(), 1);
+        let partial = parts[0]
+            .parent()
+            .unwrap()
+            .join("interrupted-partial.parquet.partial");
+        fs::write(&partial, b"simulated interrupted parquet write").unwrap();
+
+        assert!(!store.verify_archive().unwrap());
+        assert!(store.close().is_err());
+
+        let readonly = Journal::open_readonly(home.path()).unwrap();
+        assert_eq!(
+            readonly.audit().unwrap()["archive_marker"],
+            "CLOSED_WITH_ARCHIVE_UNVERIFIED"
+        );
+        assert!(!readonly.verify_archive().unwrap());
+        assert!(partial.is_file());
+    }
+
+    #[test]
     fn temporary_archive_unavailability_never_reports_clean_and_recovers_from_sqlite() {
         let home = tempfile::tempdir().unwrap();
         let mut store = Journal::open(home.path()).unwrap();
