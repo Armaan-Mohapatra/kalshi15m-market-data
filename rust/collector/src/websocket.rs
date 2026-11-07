@@ -173,10 +173,17 @@ pub struct WebSocketConfigStage {
 
 impl WebSocketConfigStage {
     pub fn validate(&self) -> Result<()> {
+        self.validate_with_loopback(false)
+    }
+
+    fn validate_with_loopback(&self, allow_loopback: bool) -> Result<()> {
         if !self.allow_network {
             bail!("WebSocket access is disabled without the explicit operational gate")
         }
-        if self.url != KALSHI_WS_URL {
+        let is_loopback_mock = allow_loopback
+            && self.url.starts_with("ws://127.0.0.1:")
+            && self.url.ends_with(KALSHI_WS_PATH);
+        if self.url != KALSHI_WS_URL && !is_loopback_mock {
             bail!("WebSocket URL must be the documented Kalshi production market-data endpoint")
         }
         if self.key_id.trim().is_empty() || self.private_key_path.as_os_str().is_empty() {
@@ -208,12 +215,27 @@ impl WebSocketConfigStage {
 /// replay engine, and this run loop is never invoked by ordinary CLI startup.
 pub struct AuthenticatedWebSocket {
     config: WebSocketConfigStage,
+    #[cfg(test)]
+    allow_loopback_mock: bool,
 }
 
 impl AuthenticatedWebSocket {
     pub fn new(config: WebSocketConfigStage) -> Result<Self> {
         config.validate()?;
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            #[cfg(test)]
+            allow_loopback_mock: false,
+        })
+    }
+
+    #[cfg(test)]
+    fn new_loopback_mock(config: WebSocketConfigStage) -> Result<Self> {
+        config.validate_with_loopback(true)?;
+        Ok(Self {
+            config,
+            allow_loopback_mock: true,
+        })
     }
 
     /// Reconnects with bounded exponential backoff, resubscribes on each new
@@ -225,6 +247,10 @@ impl AuthenticatedWebSocket {
         mut shutdown: watch::Receiver<bool>,
         events: mpsc::Sender<Event>,
     ) -> Result<()> {
+        #[cfg(test)]
+        self.config
+            .validate_with_loopback(self.allow_loopback_mock)?;
+        #[cfg(not(test))]
         self.config.validate()?;
         let pem = tokio::fs::read_to_string(&self.config.private_key_path)
             .await
@@ -499,6 +525,10 @@ mod tests {
     use ed25519_dalek::pkcs8::EncodePrivateKey as EdEncodePrivateKey;
     use rand::rngs::OsRng;
     use rsa::signature::Verifier;
+    use std::sync::{Arc, Mutex};
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+
     #[test]
     fn first_sequence_two_is_not_a_gap_and_interleaving_valid() {
         let mut ws = WebsocketEngine::with_session("a");
@@ -645,5 +675,151 @@ mod tests {
             &tx,
         ).await.unwrap();
         assert!(engine.book("KXBTC15M-A").unwrap().synchronized());
+    }
+
+    #[tokio::test]
+    async fn authenticated_loopback_reconnect_resubscribes_and_requires_fresh_snapshot(
+    ) -> anyhow::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let url = format!("ws://{address}{KALSHI_WS_PATH}");
+        let observed_headers = Arc::new(Mutex::new(Vec::<(String, String, String)>::new()));
+        let server_headers = observed_headers.clone();
+        let server = tokio::spawn(async move {
+            for (connection, sequence) in [(0, 17), (1, 4)] {
+                let (stream, _) =
+                    tokio::time::timeout(Duration::from_secs(3), listener.accept()).await??;
+                let captured = server_headers.clone();
+                let (mut socket, _) = tokio_tungstenite::accept_hdr_async(
+                    stream,
+                    move |request: &Request, response: Response| {
+                        let header = |name: &str| {
+                            request
+                                .headers()
+                                .get(name)
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or_default()
+                                .to_owned()
+                        };
+                        captured.lock().unwrap().push((
+                            header("KALSHI-ACCESS-KEY"),
+                            header("KALSHI-ACCESS-SIGNATURE"),
+                            header("KALSHI-ACCESS-TIMESTAMP"),
+                        ));
+                        Ok(response)
+                    },
+                )
+                .await?;
+
+                let message = tokio::time::timeout(Duration::from_secs(3), socket.next())
+                    .await?
+                    .ok_or_else(|| anyhow!("client closed before subscribing"))??;
+                let Message::Text(subscription) = message else {
+                    bail!("client did not send a text subscription")
+                };
+                let subscription: Value = serde_json::from_str(&subscription)?;
+                if subscription["cmd"] != "subscribe"
+                    || subscription["params"]["market_tickers"] != json!(["KXBTC15M-MOCK"])
+                {
+                    bail!("unexpected subscription after connection {connection}")
+                }
+                let snapshot = json!({
+                    "type":"orderbook_snapshot",
+                    "sid":7,
+                    "seq":sequence,
+                    "msg":{"market_ticker":"KXBTC15M-MOCK","yes_dollars_fp":[]}
+                });
+                socket
+                    .send(Message::Text(snapshot.to_string().into()))
+                    .await?;
+                if connection == 0 {
+                    socket.close(None).await?;
+                } else {
+                    while let Some(message) = socket.next().await {
+                        if matches!(message?, Message::Close(_)) {
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let key = ed25519_dalek::SigningKey::generate(&mut OsRng);
+        let pem = key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF).unwrap();
+        let key_path = temp.path().join("loopback-test-key.pem");
+        tokio::fs::write(&key_path, pem.as_bytes()).await.unwrap();
+        let transport = AuthenticatedWebSocket::new_loopback_mock(WebSocketConfigStage {
+            url,
+            key_id: "offline-test-key".into(),
+            private_key_path: key_path,
+            market_tickers: vec!["KXBTC15M-MOCK".into()],
+            allow_network: true,
+            reconnect_initial: Duration::from_millis(5),
+            reconnect_max: Duration::from_millis(20),
+            output_capacity: 32,
+        })
+        .unwrap();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let (events_tx, mut events_rx) = mpsc::channel(32);
+        let client = tokio::spawn(async move { transport.run(stop_rx, events_tx).await });
+
+        let mut events = Vec::new();
+        let mut synchronized = 0;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = events_rx.recv().await {
+                if event.kind == "book_synchronized" {
+                    synchronized += 1;
+                }
+                events.push(event);
+                if synchronized == 2 {
+                    let _ = stop_tx.send(true);
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("both connections should obtain fresh snapshots");
+        tokio::time::timeout(Duration::from_secs(3), client)
+            .await
+            .expect("client should stop promptly")??;
+        server.await??;
+
+        let snapshots: Vec<_> = events
+            .iter()
+            .filter(|event| event.channel == "websocket_raw" && event.kind == "orderbook_snapshot")
+            .collect();
+        assert_eq!(snapshots.len(), 2);
+        let sessions: std::collections::BTreeSet<_> = snapshots
+            .iter()
+            .map(|event| event.payload["session_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            sessions.len(),
+            2,
+            "reconnect must use a new connection identity"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "connection_interrupted")
+                .count(),
+            1
+        );
+        assert!(!events.iter().any(|event| event.kind == "sequence_gap"));
+
+        let headers = observed_headers.lock().unwrap();
+        assert_eq!(headers.len(), 2);
+        for (key_id, encoded_signature, timestamp) in headers.iter() {
+            assert_eq!(key_id, "offline-test-key");
+            let signature = BASE64.decode(encoded_signature).unwrap();
+            let signature = ed25519_dalek::Signature::from_slice(&signature).unwrap();
+            let payload = format!("{timestamp}GET{KALSHI_WS_PATH}");
+            key.verifying_key()
+                .verify(payload.as_bytes(), &signature)
+                .unwrap();
+        }
+        Ok(())
     }
 }
