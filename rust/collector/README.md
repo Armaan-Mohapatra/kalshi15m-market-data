@@ -1,0 +1,50 @@
+# Rust Kalshi 15-minute capture engine — staging implementation
+
+This crate is a **runnable, isolated Rust ingestion prototype**, not yet a production replacement. It lives in the same repository as the hardened Python collector, and never changes the running Python collector merely by being merged or built.
+
+## Capabilities
+
+- Deterministic NDJSON event and recorded WebSocket replay, with fixed-size streaming input.
+- Exact fixed-point YES/NO book modeling and synchronized/desynchronized states; subscription-level sequence gap evidence, session identity, and invalid-snapshot rejection.
+- Compatible base `market_events` and `market_event_versions` SQLite structures using WAL, synchronous FULL, and one owned writer connection.
+- Full raw JSON market metadata including strike fields, plus an exchange-data version hash.
+- Durable journal rows before acknowledgment; same-key different-payload variants, persistent event fingerprints, fsynced emergency spool and restart replay.
+- Arrow/Parquet archive parts, bounded reconciliation from SQLite, independent manifest hashes and explicit clean/unverified shutdown.
+- Public GET-only one-shot REST collector with 2-second minimum pacing, bounded 429/5xx/timeouts, discovery of open and unopened 900-second markets, REST book sampling, paginated public trades and incomplete-source telemetry.
+- CI build, Rust unit tests and smoke replay on Windows and Linux.
+
+**Limitations:** This branch is not an authenticated live WebSocket client or a complete continuously scheduled replacement of the Python strategy/paper runtime. WebSocket exchange messages are accepted from replay fixtures; real authenticated WSS activation requires a separate protocol/auth fixture and authorization. REST snapshots cannot reconstruct lost intermediate orderbook deltas. The Rust journal uses staging-specific reconciliation tables and **must never target the production Python SQLite/WAL**. The Rust Parquet schema is explicitly checked by a separate Python compatibility test before any migration decision.
+
+## Build and run — offline by default
+
+Rust stable and its Windows MSVC toolchain must be installed in a **separate Windows staging checkout**. Run commands from the `rust/collector` directory:
+
+```powershell
+cargo test --all-targets
+$stage = Join-Path $env:LOCALAPPDATA "Kalshi15mRustStage"
+cargo run -- --home "$stage" replay --input "fixtures/smoke.ndjson"
+cargo run -- --home "$stage" audit
+```
+
+No public request is made by these commands. `--home` is compulsory and paths matching Phoenix/production runtime roots are rejected. For captured research data, use *only* explicitly reviewed finalized exported NDJSON copies as input. Original E:/C: sources are READ-ONLY.
+
+### Public REST one-shot staging mode (NOT automatically run)
+
+The program has a single-pass GET-only path for explicit tickers or series. Running it is a network action that shares Kalshi rate limits with your active collector; **do not run it while Phoenix collection is active without a separate network scheduling authorization**.
+
+```powershell
+# Example syntax only, DO NOT run in ordinary validation:
+cargo run -- --home "$stage" capture-once --allow-network --ticker KXBTC15M-EXAMPLE
+```
+
+This mode never places orders and does not install a service, configure Task Scheduler, activate WSS or change the active Windows collector.
+
+## Data contract and recovery
+
+The journal is authoritative. Parquet parts are staged to `.partial` and renamed after a complete writer close/fsync. The manifest is then committed in the journal along with event fingerprints. A crash between SQLite commit and Parquet finalization leaves unarchived records; a crash after the Parquet rename but before the manifest commit leaves a finalized orphan part. On the next staging startup, hashes are checked, finalized orphan parts are registered, and missing journal entries are replayed into new Parquet parts. Neither case rewrites source events. Corrupt part hashes are a fail-closed error, not silent success.
+
+Both the archive and the journal live under an isolated staging root. Python keeps responsibility for research/backtesting and any separately authorized PAPER strategy runtime.
+
+## Verification gates
+
+The crate must compile and pass isolated Windows/Linux CI, smoke-replay synthetic events to SQLite/Parquet, preserve all expected event IDs and conflict versions, classify WSS gaps accurately and reconstruct interrupted archive parts. **Production is not authorized** by these checks. We then need finalized market replay parity, Python PyArrow/SQLite compatibility, native Windows CPU/RAM/latency benchmarks and independent review before any deployment decision.
