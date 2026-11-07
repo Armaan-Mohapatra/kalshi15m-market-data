@@ -128,6 +128,9 @@ class RuntimeStatus:
             "last_rest_poll_by_channel": {},
             "rest_poll_ages_seconds": {},
             "rest_poll_health": {},
+            "rest_book_last_observed_utc_by_ticker": {},
+            "rest_book_health_by_ticker": {},
+            "collection_quality_state": "UNKNOWN_PENDING_INITIAL_POLL",
             "strategy_orderbook_source_state": "UNINITIALIZED",
             "strategy_websocket_books_used": 0,
             "strategy_rest_fallback_markets_used": 0,
@@ -354,6 +357,44 @@ class RuntimeStatus:
                     }.get(channel)
                     if profile_health_field and self.data.get(profile_health_field) == "READY":
                         self.data[profile_health_field] = "STALE"
+            # Per-market observations prevent a healthy channel-wide average
+            # from hiding an entirely missing market. A quiet book remains a
+            # valid *sample*; lack of price changes is not feed failure.
+            active_tickers = [
+                str(ticker) for ticker in self.data.get("market_tickers", [])
+            ]
+            rest_book_last = self.data.get("rest_book_last_observed_utc_by_ticker", {})
+            book_threshold = max(1.0, float(self.cfg.book_poll_interval_seconds * 2))
+            book_states: dict[str, str] = {}
+            for ticker in active_tickers:
+                observed = rest_book_last.get(ticker)
+                if not observed:
+                    book_states[ticker] = "NEVER_OBSERVED"
+                    continue
+                try:
+                    age = (now - datetime.fromisoformat(str(observed))).total_seconds()
+                    book_states[ticker] = (
+                        "REST_SAMPLED_RECENT" if 0 <= age <= book_threshold
+                        else "REST_SAMPLE_STALE_OR_CLOCK_ERROR"
+                    )
+                except (ValueError, TypeError):
+                    book_states[ticker] = "TIMESTAMP_INVALID"
+            self.data["rest_book_health_by_ticker"] = book_states
+            book_poll_state = health.get("rest_orderbook")
+            storage_state = str(self.data.get("storage_write_state") or "")
+            if storage_state in {"FATAL_NOT_DURABLE", "DEGRADED_RETRYING", "RECOVERY_SPOOLED_STOPPING"}:
+                quality = "CRITICAL_PERSISTENCE_UNVERIFIED"
+            elif not active_tickers:
+                quality = "UNKNOWN_NO_ACTIVE_MARKETS"
+            elif book_poll_state in {"DEGRADED", "STALE"} or any(
+                state != "REST_SAMPLED_RECENT" for state in book_states.values()
+            ):
+                quality = "DEGRADED_PARTIAL_REST_COVERAGE"
+            elif book_poll_state == "READY":
+                quality = "REST_SAMPLED_RECENT_NOT_CONTINUOUS"
+            else:
+                quality = "UNKNOWN_WAITING_FOR_REST_POLL"
+            self.data["collection_quality_state"] = quality
             self.data["heartbeat_utc"] = now.isoformat()
             self._write_locked()
 
