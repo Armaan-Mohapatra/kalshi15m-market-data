@@ -655,10 +655,10 @@ class Storage:
             ensure_ascii=True,
             default=lambda item: {"unserializable_type": type(item).__name__, "repr": repr(item)},
         )
-        self.connection.execute(
-            "INSERT INTO quarantined_market_events VALUES (?, ?, ?, ?, ?, ?)",
+        cursor = self.connection.execute(
+            "INSERT OR IGNORE INTO quarantined_market_events VALUES (?, ?, ?, ?, ?, ?)",
             (
-                uuid.uuid4().hex,
+                hashlib.sha256(diagnostic.encode("utf-8")).hexdigest(),
                 datetime.now(timezone.utc).isoformat(),
                 type(exc).__name__,
                 str(event.get("dedupe_key") or ""),
@@ -667,7 +667,7 @@ class Storage:
             ),
         )
         self.connection.commit()
-        self.events_quarantined += 1
+        self.events_quarantined += max(0, cursor.rowcount)
 
     def append_batch_resilient(self, events: list[dict[str, Any]]) -> int:
         """Isolate unencodable input; never misclassify a DB/disk failure as poison.
@@ -715,6 +715,7 @@ class Storage:
         rows: list[tuple[Any, ...]] = []
         version_rows: list[tuple[Any, ...]] = []
         new_parquet_rows: list[dict[str, Any]] = []
+        archived_candidates: set[tuple[str, str]] = set()
         for event, dedupe, digest, raw in prepared:
             canonical = existing.get(dedupe, seen.get(dedupe))
             if canonical == digest:
@@ -738,6 +739,10 @@ class Storage:
             else:
                 seen[dedupe] = digest
                 rows.append(row)
+            pair = (dedupe, digest)
+            if pair in archived_candidates:
+                continue
+            archived_candidates.add(pair)
             new_parquet_rows.append(
                 {
                     "dedupe_key": dedupe,
