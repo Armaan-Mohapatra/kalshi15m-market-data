@@ -99,7 +99,7 @@ pub fn write_part(root: &Path, rows: &[ArchiveRow]) -> Result<PartInfo> {
     writer.close()?;
     // fsync BEFORE atomic rename. A filesystem crash may still require
     // directory syncing; verification never assumes the part was finalized.
-    File::open(&partial)?.sync_all()?;
+    OpenOptions::new().read(true).write(true).open(&partial)?.sync_all()?;
     fs::rename(&partial, &final_path)?;
     let bytes = final_path.metadata()?.len();
     let sha256 = hash_file(&final_path)?;
