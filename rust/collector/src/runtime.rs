@@ -777,12 +777,18 @@ impl ContinuousRuntime {
                             .context("durably spool after archive failure")?;
                     }
                     health.sqlite_state = "DEGRADED_ARCHIVE_PENDING".into();
+                    health.archive_state = "INCOMPLETE".into();
                     health.queue_depth = 0;
                     return Err(error).context("Parquet flush failed after SQLite commit");
                 }
             }
         }
-        journal.flush_archive(500)?;
+        if let Err(error) = journal.flush_archive(500) {
+            health.sqlite_state = "DEGRADED_ARCHIVE_PENDING".into();
+            health.archive_state = "INCOMPLETE".into();
+            health.queue_depth = 0;
+            return Err(error).context("Parquet flush failed after SQLite commit");
+        }
         health.sqlite_state = "HEALTHY".into();
         health.archive_state = "RECONCILIATION_PENDING".into();
         Ok(())
@@ -829,6 +835,7 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use rusqlite::{Connection, TransactionBehavior};
+    use std::fs;
     use std::sync::Mutex;
 
     struct MockSource {
@@ -1029,5 +1036,45 @@ mod tests {
         assert_eq!(recovered.audit().unwrap()["pending_spool_entries"], 0);
         assert_eq!(recovered.stats.spool_replayed, 1);
         recovered.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn unavailable_archive_path_reports_incomplete_then_recovers() {
+        let home = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(home.path()).unwrap();
+        let archive_root = journal.archive_root.clone();
+        let parked_root = archive_root.with_extension("parked");
+        fs::rename(&archive_root, &parked_root).unwrap();
+        fs::write(&archive_root, b"simulate unavailable archive directory").unwrap();
+
+        let mut runtime = ContinuousRuntime::default();
+        let mut health = RuntimeHealth::new(2);
+        let event = Event::new(
+            "rest",
+            "trade",
+            Some("ARCHIVE-UNAVAILABLE"),
+            json!({"id":"durable-in-sqlite"}),
+            Some("archive-unavailable-test".into()),
+        );
+        assert!(runtime
+            .commit_bounded(&mut journal, &mut health, vec![event])
+            .await
+            .is_err());
+        assert_eq!(health.sqlite_state, "DEGRADED_ARCHIVE_PENDING");
+        assert_eq!(health.archive_state, "INCOMPLETE");
+        assert_eq!(journal.audit().unwrap()["canonical_events"], 1);
+        assert_eq!(journal.unarchived_count().unwrap(), 1);
+        assert_eq!(journal.audit().unwrap()["pending_spool_entries"], 0);
+
+        fs::remove_file(&archive_root).unwrap();
+        fs::rename(&parked_root, &archive_root).unwrap();
+        drop(journal);
+
+        let recovered = Journal::open(home.path()).unwrap();
+        assert_eq!(recovered.unarchived_count().unwrap(), 1);
+        recovered.close().unwrap();
+        let verified = Journal::open_readonly(home.path()).unwrap();
+        assert!(verified.verify_archive().unwrap());
+        drop(verified);
     }
 }
