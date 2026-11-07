@@ -526,7 +526,10 @@ impl ContinuousRuntime {
                             health.sqlite_state = "DEGRADED_SPOOLED".into();
                             let message = match journal.spool(&item.event) {
                                 Ok(spool) => format!("SQLite write failed; full event spooled at {}: {error}", spool.display()),
-                                Err(spool_error) => format!("SQLite write failed ({error}); emergency spool also failed ({spool_error})"),
+                                Err(spool_error) => {
+                                    health.sqlite_state = "FAILED_UNSPOOLED_EVENT".into();
+                                    format!("SQLite write failed ({error}); emergency spool also failed ({spool_error})")
+                                }
                             };
                             let _ = item.acknowledge(Err(message.clone()));
                             persist_error = Some(anyhow!(message));
@@ -615,6 +618,7 @@ impl ContinuousRuntime {
                         let _ = item.acknowledge(Ok(()));
                     }
                     Err(error) => {
+                        health.sqlite_state = "FAILED_UNSPOOLED_EVENT".into();
                         let message =
                             format!("shutdown spool failed; event remains unacknowledged: {error}");
                         let _ = item.acknowledge(Err(message.clone()));
@@ -634,8 +638,14 @@ impl ContinuousRuntime {
                 }
                 Err(error) => {
                     let message = match journal.spool(&item.event) {
-                        Ok(path) => format!("shutdown drain write failed; event spooled at {}: {error}", path.display()),
-                        Err(spool_error) => format!("shutdown drain SQLite write failed ({error}); emergency spool also failed ({spool_error})"),
+                        Ok(path) => format!(
+                            "shutdown drain write failed; event spooled at {}: {error}",
+                            path.display()
+                        ),
+                        Err(spool_error) => {
+                            health.sqlite_state = "FAILED_UNSPOOLED_EVENT".into();
+                            format!("shutdown drain SQLite write failed ({error}); emergency spool also failed ({spool_error})")
+                        }
                     };
                     let _ = item.acknowledge(Err(message.clone()));
                     persist_error.get_or_insert_with(|| anyhow!(message));
@@ -1158,9 +1168,11 @@ impl ContinuousRuntime {
             health.queue_saturation_count = self.queue_saturation_count;
             health.queue_depth = health.queue_capacity;
             for event in events {
-                journal
-                    .spool(&event)
-                    .context("spool oversized runtime batch")?;
+                if let Err(error) = journal.spool(&event) {
+                    health.sqlite_state = "FAILED_UNSPOOLED_EVENT".into();
+                    health.queue_depth = 0;
+                    return Err(error).context("spool oversized runtime batch");
+                }
             }
             health.sqlite_state = "DEGRADED_SPOOLED".into();
             bail!("cycle exceeded bounded event queue; full batch durably spooled")
@@ -1180,13 +1192,17 @@ impl ContinuousRuntime {
                 Err(error) => {
                     // The failed event is durably spooled before the cycle
                     // reports an error; callers never receive a false ACK.
-                    journal
-                        .spool(&event)
-                        .context("durably spool failed event")?;
+                    if let Err(spool_error) = journal.spool(&event) {
+                        health.sqlite_state = "FAILED_UNSPOOLED_EVENT".into();
+                        health.queue_depth = 0;
+                        return Err(spool_error).context("durably spool failed event");
+                    }
                     for remaining in events {
-                        journal
-                            .spool(&remaining)
-                            .context("durably spool queued event")?;
+                        if let Err(spool_error) = journal.spool(&remaining) {
+                            health.sqlite_state = "FAILED_UNSPOOLED_EVENT".into();
+                            health.queue_depth = 0;
+                            return Err(spool_error).context("durably spool queued event");
+                        }
                     }
                     health.sqlite_state = "DEGRADED_SPOOLED".into();
                     health.queue_depth = 0;
@@ -1197,9 +1213,11 @@ impl ContinuousRuntime {
             if journal.unarchived_count()? >= 500 {
                 if let Err(error) = journal.flush_archive(500) {
                     for remaining in events {
-                        journal
-                            .spool(&remaining)
-                            .context("durably spool after archive failure")?;
+                        if let Err(spool_error) = journal.spool(&remaining) {
+                            health.sqlite_state = "FAILED_UNSPOOLED_EVENT".into();
+                            health.queue_depth = 0;
+                            return Err(spool_error).context("durably spool after archive failure");
+                        }
                     }
                     health.sqlite_state = "DEGRADED_ARCHIVE_PENDING".into();
                     health.archive_state = "INCOMPLETE".into();
@@ -1631,6 +1649,48 @@ mod tests {
         assert_eq!(recovered.audit().unwrap()["pending_spool_entries"], 0);
         assert_eq!(recovered.stats.spool_replayed, 3);
         recovered.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn unavailable_emergency_spool_marks_event_unrecoverable_and_never_clean() {
+        let home = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(home.path()).unwrap();
+        let spool_path = home.path().join("data/rust_pending");
+        fs::write(&spool_path, b"simulate unavailable staging volume path").unwrap();
+
+        let mut runtime = ContinuousRuntime::default();
+        let mut health = RuntimeHealth::new(1);
+        let events = (0..2)
+            .map(|id| {
+                Event::new(
+                    "rest",
+                    "trade",
+                    Some("SPOOL-FAILURE"),
+                    json!({"id":id}),
+                    Some(format!("spool-failure-{id}")),
+                )
+            })
+            .collect();
+
+        let error = runtime
+            .commit_bounded(&mut journal, &mut health, events)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("spool oversized runtime batch"));
+        assert_eq!(health.sqlite_state, "FAILED_UNSPOOLED_EVENT");
+        assert_eq!(health.events_acknowledged, 0);
+        assert_eq!(
+            journal.audit().unwrap()["capture_failure"],
+            "UNSPOOLED_EVENT"
+        );
+        assert!(!journal.verify_archive().unwrap());
+        assert!(journal.close().is_err());
+
+        let readonly = Journal::open_readonly(home.path()).unwrap();
+        let audit = readonly.audit().unwrap();
+        assert_eq!(audit["capture_failure"], "UNSPOOLED_EVENT");
+        assert_eq!(audit["archive_marker"], "CLOSED_WITH_UNSPOOLED_EVENT");
+        assert!(!readonly.verify_archive().unwrap());
     }
 
     #[tokio::test]

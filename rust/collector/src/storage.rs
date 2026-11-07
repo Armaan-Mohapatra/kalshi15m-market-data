@@ -250,22 +250,41 @@ impl Journal {
     /// FSYNC a full canonical event into a staged emergency spool. This must
     /// succeed before a network producer can acknowledge a storage outage.
     pub fn spool(&self, event: &Event) -> Result<PathBuf> {
-        let spool = self.home.join("data").join("rust_pending");
-        fs::create_dir_all(&spool)?;
-        let id = Uuid::new_v4().simple().to_string();
-        let temporary = spool.join(format!("{id}.partial"));
-        let output = spool.join(format!("{id}.json"));
-        let bytes = serde_json::to_vec(event)?;
-        {
-            let mut target = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)?;
-            target.write_all(&bytes)?;
-            target.sync_all()?;
+        let result = (|| {
+            let spool = self.home.join("data").join("rust_pending");
+            fs::create_dir_all(&spool)?;
+            let id = Uuid::new_v4().simple().to_string();
+            let temporary = spool.join(format!("{id}.partial"));
+            let output = spool.join(format!("{id}.json"));
+            let bytes = serde_json::to_vec(event)?;
+            {
+                let mut target = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&temporary)?;
+                target.write_all(&bytes)?;
+                target.sync_all()?;
+            }
+            fs::rename(&temporary, &output)?;
+            Ok(output)
+        })();
+        if result.is_err() {
+            self.record_unspooled_event_failure()
+                .context("persist unspooled-event failure marker")?;
         }
-        fs::rename(&temporary, &output)?;
-        Ok(output)
+        result
+    }
+
+    /// Persist evidence when an observed event could not be committed to
+    /// SQLite or the emergency spool. This marker is intentionally sticky:
+    /// recovery cannot claim completeness without an operator reconciling the
+    /// unpersisted event.
+    pub fn record_unspooled_event_failure(&self) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO collector_markers (marker, value, updated_utc) VALUES ('capture_failure', 'UNSPOOLED_EVENT', ?1)",
+            [utc_now()],
+        )?;
+        Ok(())
     }
 
     fn replay_spool(&mut self, limit: usize) -> Result<()> {
@@ -468,6 +487,17 @@ impl Journal {
     }
 
     pub fn verify_archive(&self) -> Result<bool> {
+        let capture_failure: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM collector_markers WHERE marker='capture_failure'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if capture_failure.is_some() {
+            return Ok(false);
+        }
         let pending_spool = self.home.join("data").join("rust_pending");
         if pending_spool.exists() && fs::read_dir(pending_spool)?.next().is_some() {
             return Ok(false);
@@ -551,6 +581,18 @@ impl Journal {
     }
 
     pub fn close(mut self) -> Result<Stats> {
+        let capture_failure: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM collector_markers WHERE marker='capture_failure'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if capture_failure.is_some() {
+            self.mark("CLOSED_WITH_UNSPOOLED_EVENT")?;
+            bail!("capture contains an event that was not durably persisted")
+        }
         let pending_spool = self.home.join("data").join("rust_pending");
         if pending_spool.exists() && fs::read_dir(&pending_spool)?.next().is_some() {
             self.mark("CLOSED_WITH_PENDING_SPOOL_UNVERIFIED")?;
@@ -592,6 +634,14 @@ impl Journal {
             [],
             |r| r.get(0),
         )?;
+        let capture_failure: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM collector_markers WHERE marker='capture_failure'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
         let spool_dir = self.home.join("data").join("rust_pending");
         let pending_spool_entries = if spool_dir.is_dir() {
             fs::read_dir(spool_dir)?.take(10_001).count()
@@ -602,6 +652,7 @@ impl Journal {
             "canonical_events":canonical, "conflicting_versions":variants,
             "unarchived":unarchived, "archive_marker":marker,
             "pending_spool_entries":pending_spool_entries,
+            "capture_failure":capture_failure,
             "staging_home":self.home.to_string_lossy()
         }))
     }
