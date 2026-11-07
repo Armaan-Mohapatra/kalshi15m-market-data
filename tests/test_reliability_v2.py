@@ -132,6 +132,49 @@ class StorageReliabilityTests(unittest.TestCase):
             store.close()
 
 
+class RuntimeHealthReliabilityTests(unittest.TestCase):
+    def test_active_market_without_book_is_degraded_even_if_worker_runs(self):
+        from kalshi15m.worker import RuntimeStatus
+        with TemporaryDirectory() as directory:
+            status = RuntimeStatus(Settings(home=Path(directory)))
+            status.update(service_state="RUNNING", market_tickers=["ONE"])
+            status.mark_rest_poll(
+                "rest_orderbook",
+                started_utc=datetime.now(timezone.utc).isoformat(),
+                request_count=1, successful_request_count=1, requested_market_count=1,
+                markets_with_data=1, rows_received=1, error_count=0,
+            )
+            status.refresh_ages()
+            self.assertEqual(status.snapshot()["service_state"], "RUNNING")
+            self.assertEqual(status.snapshot()["rest_book_health_by_ticker"]["ONE"], "NEVER_OBSERVED")
+            self.assertEqual(
+                status.snapshot()["collection_quality_state"],
+                "DEGRADED_PARTIAL_REST_COVERAGE",
+            )
+
+    def test_quiet_recent_valid_book_is_sampled_healthy(self):
+        from kalshi15m.worker import RuntimeStatus
+        with TemporaryDirectory() as directory:
+            status = RuntimeStatus(Settings(home=Path(directory)))
+            now = datetime.now(timezone.utc).isoformat()
+            status.update(
+                service_state="RUNNING", market_tickers=["ONE"],
+                rest_book_last_observed_utc_by_ticker={"ONE": now},
+            )
+            status.mark_rest_poll(
+                "rest_orderbook",
+                started_utc=now,
+                request_count=1, successful_request_count=1,
+                requested_market_count=1, markets_with_data=1,
+                rows_received=1, error_count=0,
+            )
+            status.refresh_ages()
+            self.assertEqual(
+                status.snapshot()["collection_quality_state"],
+                "REST_SAMPLED_RECENT_NOT_CONTINUOUS",
+            )
+
+
 class BookReliabilityTests(unittest.TestCase):
     def test_empty_snapshot_is_valid_but_missing_sides_are_invalid(self):
         book = OrderBook()
