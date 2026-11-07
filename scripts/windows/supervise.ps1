@@ -13,6 +13,7 @@ $startPath = Join-Path $root 'scripts\windows\start.ps1'
 $lastLoggedState = $null
 $lastHealthyPid = $null
 $lastCaptureQuality = $null
+$lastCaptureEvidence = $null
 
 function Write-SupervisorLog {
     param([Parameter(Mandatory = $true)][string]$Message)
@@ -192,6 +193,10 @@ while ($true) {
         if ($lastCaptureQuality -ne $check.capture_quality) {
             Write-SupervisorLog "CAPTURE_QUALITY_CHANGED worker_pid=$($check.pid) quality=$($check.capture_quality)"
             $lastCaptureQuality = $check.capture_quality
+        }
+        if ($lastCaptureEvidence -ne $check.capture_evidence) {
+            Write-SupervisorLog "CAPTURE_EVIDENCE_CHANGED worker_pid=$($check.pid) evidence=$($check.capture_evidence) storage_write=$($check.storage_write_state)"
+            $lastCaptureEvidence = $check.capture_evidence
         }
         $lastHealthyPid = $check.pid
         $lastLoggedState = 'HEALTHY'
