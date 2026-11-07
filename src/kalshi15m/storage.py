@@ -247,7 +247,11 @@ class Storage:
         self.orphaned_partial_parts = sum(
             1 for _ in self.cfg.parquet_dir.rglob("*.partial")
         )
-        if previous_marker and previous_marker[0] == "CLEAN_ARCHIVE_VERIFIED":
+        if (
+            previous_marker
+            and previous_marker[0] == "CLEAN_ARCHIVE_VERIFIED"
+            and self._archive_manifest_files_present()
+        ):
             self.parquet_recovery_state = "SKIPPED_VERIFIED_SHUTDOWN_MARKER"
         else:
             try:
@@ -567,6 +571,30 @@ class Storage:
                 # the next flush reconciles the byte count again.
                 continue
         return total
+
+    def _archive_manifest_files_present(self) -> bool:
+        """Cheap restart guard: reject removed/resized parts and new journal rows.
+
+        The verified shutdown marker attests to full SHA-256 checks at exit.
+        This fast check does not replace a periodic full integrity audit.
+        """
+        if self.connection is None:
+            return False
+        expected = int(self.connection.execute("SELECT COUNT(*) FROM market_events").fetchone()[0])
+        expected += int(self.connection.execute("SELECT COUNT(*) FROM market_event_versions").fetchone()[0])
+        rows = self.connection.execute(
+            "SELECT part_path, row_count, byte_count FROM archive_manifests"
+        ).fetchall()
+        if sum(int(row[1]) for row in rows) != expected:
+            return False
+        for part_path, _count, size in rows:
+            path = self.cfg.parquet_dir / str(part_path)
+            try:
+                if not path.is_file() or path.stat().st_size != int(size):
+                    return False
+            except OSError:
+                return False
+        return True
 
     def verify_archive_manifest(self) -> bool:
         """Bounded-memory, full-file integrity check before marking a clean shutdown.
