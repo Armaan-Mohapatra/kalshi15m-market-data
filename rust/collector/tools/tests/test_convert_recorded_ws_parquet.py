@@ -97,7 +97,7 @@ class RecordedWebSocketParquetConverterTests(unittest.TestCase):
             sidecar_path.write_text(json.dumps({
                 "outputSha256": digest, "readbackRowsVerified": 1,
             }), encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "bounded row limit"):
+            with self.assertRaisesRegex(ValueError, "max_source_rows must be between"):
                 convert_segment(source, output, max_source_rows=0)
             manifest = convert_segment(
                 source, output, require_verified_sidecar=True, max_source_rows=1,
