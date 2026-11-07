@@ -171,7 +171,7 @@ pub fn write_part(root: &Path, rows: &[ArchiveRow]) -> Result<PartInfo> {
 pub fn read_part(path: &Path) -> Result<Vec<ArchiveRow>> {
     let file = File::open(path)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let mut reader = builder.with_batch_size(2048).build()?;
+    let reader = builder.with_batch_size(2048).build()?;
     let mut rows = Vec::new();
     for batch in reader {
         let batch = batch?;
