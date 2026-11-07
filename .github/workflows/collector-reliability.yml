@@ -2,7 +2,7 @@ name: Collector reliability regression
 
 on:
   push:
-    branches: [collector/reliability-v2]
+    branches: [collector/reliability-v2, diagnostics/python-capture-triage]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -40,6 +40,29 @@ jobs:
               $parseErrors | ForEach-Object { Write-Error $_.Message }
               throw "PowerShell parse failure: $($_.FullName)"
             }
+          }
+      - name: Check read-only Windows triage has no staging side effects
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $probeRoot = Join-Path $env:RUNNER_TEMP 'does-not-exist-capture-probe'
+          if (Test-Path -LiteralPath $probeRoot) { throw 'Unexpected preexisting probe root' }
+          $raw = & ./scripts/windows/diagnose-capture-readonly.ps1 -RuntimeHome $probeRoot -StatusPort 65534 -IntervalSeconds 0
+          if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) { throw 'Diagnostic script exited abnormally' }
+          $result = ($raw | Out-String) | ConvertFrom-Json
+          if ($result.classification -ne 'UNKNOWN_STATUS_UNREACHABLE') {
+            throw "Unexpected diagnostic classification: $($result.classification)"
+          }
+          if (Test-Path -LiteralPath $probeRoot) { throw 'Read-only triage created a runtime directory' }
+          $superviseRaw = & ./scripts/windows/supervise.ps1 -CheckOnly -RuntimeHome $probeRoot -RuntimePort 65534
+          $superviseExit = $LASTEXITCODE
+          if ($superviseExit -ne 1) { throw "Expected fail-closed check-only exit=1, got $superviseExit" }
+          $supervise = ($superviseRaw | Out-String) | ConvertFrom-Json
+          if ($supervise.healthy -or $supervise.can_start -eq $true) {
+            throw 'Unreachable worker incorrectly marked healthy'
+          }
+          if (Test-Path -LiteralPath $probeRoot) {
+            throw 'Supervisor CheckOnly created a runtime directory or log file'
           }
       - name: Run isolated regression suite
         env:
