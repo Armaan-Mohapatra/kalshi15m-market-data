@@ -1158,26 +1158,51 @@ class Storage:
                 / f"kind={kind.replace('/', '_')}"
             )
             partition.mkdir(parents=True, exist_ok=True)
-            output = partition / f"part-{uuid.uuid4().hex}.parquet"
-            temporary = output.with_suffix(".partial")
             file_rows = [{key: value for key, value in row.items() if key != "kind"} for row in batch]
-            try:
-                pq.write_table(
-                    pa.Table.from_pylist(file_rows),
-                    temporary,
-                    compression="zstd",
-                    compression_level=3,
+            row_documents = sorted(
+                json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                for row in file_rows
+            )
+            # Retrying after a manifest commit failure must reuse the renamed part.
+            fingerprints = "".join(sorted(event_archive_fingerprint(row) for row in batch))
+            batch_fingerprint = hashlib.sha256(fingerprints.encode("ascii")).hexdigest()
+            base_name = f"part-{batch_fingerprint}"
+            output = partition / f"{base_name}.parquet"
+            collision = 0
+            reuse_existing = False
+            while output.exists():
+                existing_rows = pq.ParquetFile(output).read().to_pylist()
+                existing_documents = sorted(
+                    json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                    for row in existing_rows
                 )
-                # Keep incomplete files out of the archive glob. A crash before
-                # the rename leaves the durable SQLite source available to replay.
-                with temporary.open("rb+") as handle:
-                    os.fsync(handle.fileno())
-                os.replace(temporary, output)
-            except Exception:
-                # Leave the .partial file for forensic recovery; never silently
-                # remove evidence of an interrupted archive commit.
-                raise
+                if existing_documents == row_documents:
+                    reuse_existing = True
+                    break
+                # Keep a different valid part if content hashes collide.
+                collision += 1
+                output = partition / f"{base_name}-{collision}.parquet"
+            previous_size = output.stat().st_size if output.exists() else 0
+            temporary = output.with_suffix(".partial")
+            if not reuse_existing:
+                try:
+                    pq.write_table(
+                        pa.Table.from_pylist(file_rows),
+                        temporary,
+                        compression="zstd",
+                        compression_level=3,
+                    )
+                    # Keep incomplete files out of the archive glob. A crash before
+                    # the rename leaves the durable SQLite source available to replay.
+                    with temporary.open("rb+") as handle:
+                        os.fsync(handle.fileno())
+                    os.replace(temporary, output)
+                except Exception:
+                    # Leave the .partial file for forensic recovery; never silently
+                    # remove evidence of an interrupted archive commit.
+                    raise
             size = output.stat().st_size
+            self.parquet_bytes += size - previous_size
             digest = hashlib.sha256()
             with output.open("rb") as source:
                 for chunk in iter(lambda: source.read(1024 * 1024), b""):
@@ -1194,7 +1219,6 @@ class Storage:
                     ),
                 )
                 self.connection.commit()
-            self.parquet_bytes += size
 
     def integrity_check(self) -> str:
         if self.connection is None:
