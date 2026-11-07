@@ -547,6 +547,7 @@ impl WebsocketEngine {
             .map(|state| state.book_markets.clone())
             .unwrap_or_default()
     }
+    #[cfg(test)]
     fn recovery_pending(&self, sid: i64) -> bool {
         self.subscriptions
             .get(&sid)
