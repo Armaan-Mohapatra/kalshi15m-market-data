@@ -790,7 +790,7 @@ mod tests {
         );
         drop(store);
 
-        let mut recovered = Journal::open(home.path()).unwrap();
+        let recovered = Journal::open(home.path()).unwrap();
         assert_eq!(recovered.unarchived_count().unwrap(), 0);
         assert_eq!(recovered.audit().unwrap()["canonical_events"], 1);
         assert!(recovered.verify_archive().unwrap());
