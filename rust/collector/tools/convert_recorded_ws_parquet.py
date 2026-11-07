@@ -96,6 +96,8 @@ def convert_segment(
     start_utc: str | None = None,
     end_utc: str | None = None,
     subscription_ids: set[str] | None = None,
+    require_verified_sidecar: bool = False,
+    max_source_rows: int = 500_000,
 ) -> dict[str, Any]:
     input_path = input_path.resolve(strict=True)
     output_path = output_path.resolve(strict=False)
@@ -117,20 +119,41 @@ def convert_segment(
     except ImportError as error:  # pragma: no cover - installation depends on the caller
         raise RuntimeError("PyArrow is required for Parquet conversion") from error
 
-    table = pq.read_table(input_path)
-    missing = REQUIRED_COLUMNS.difference(table.column_names)
+    if max_source_rows <= 0 or max_source_rows > 1_000_000:
+        raise ValueError("max_source_rows must be between 1 and 1,000,000")
+    parquet_file = pq.ParquetFile(input_path)
+    if parquet_file.metadata.num_rows > max_source_rows:
+        raise ValueError(
+            "source Parquet exceeds bounded row limit; select a smaller finalized segment"
+        )
+    missing = REQUIRED_COLUMNS.difference(parquet_file.schema_arrow.names)
     if missing:
         raise ValueError(f"source Parquet is missing columns: {sorted(missing)}")
     sidecar: dict[str, Any] | None = None
     source_sha256 = _sha256(input_path)
+    sidecar_verified = False
     if sidecar_path.is_file():
         sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        if not isinstance(sidecar, dict):
+            raise ValueError("source sidecar must be a JSON object")
         expected_hash = sidecar.get("outputSha256")
-        if expected_hash and expected_hash.casefold() != source_sha256:
-            raise ValueError("source Parquet SHA-256 does not match its sidecar")
         expected_rows = sidecar.get("readbackRowsVerified")
-        if expected_rows is not None and int(expected_rows) != table.num_rows:
+        # A sidecar without verifiable hash and row count must never be
+        # reported as authoritative provenance.
+        if not isinstance(expected_hash, str) or len(expected_hash) != 64:
+            raise ValueError("source sidecar missing valid outputSha256")
+        if expected_hash.casefold() != source_sha256:
+            raise ValueError("source Parquet SHA-256 does not match its sidecar")
+        if isinstance(expected_rows, bool) or not isinstance(expected_rows, int):
+            raise ValueError("source sidecar missing integer readbackRowsVerified")
+        if expected_rows != parquet_file.metadata.num_rows:
             raise ValueError("source Parquet row count does not match its sidecar")
+        sidecar_verified = True
+    if require_verified_sidecar and not sidecar_verified:
+        raise ValueError("verified finalized sidecar required but not present")
+    # Restrict both initial metadata inspection and materialization. The
+    # caller must provide bounded segments rather than one huge raw archive.
+    table = parquet_file.read(columns=sorted(REQUIRED_COLUMNS))
 
     start = _parse_time(start_utc) if start_utc else None
     end = _parse_time(end_utc) if end_utc else None
@@ -139,7 +162,9 @@ def convert_segment(
     requested_subscriptions = subscription_ids
     counts: Counter[str] = Counter()
     event_counts: Counter[str] = Counter()
-    seq_state: dict[int, int] = {}
+    # A Kalshi subscription ID may be reused after reconnection. Sequence
+    # continuity is meaningful only within the same connection generation.
+    seq_state: dict[tuple[str, int], int] = {}
     seq_breaks: Counter[str] = Counter()
     first_received: str | None = None
     last_received: str | None = None
@@ -176,10 +201,11 @@ def convert_segment(
                     expected_event_type=str(row["event_type"]),
                     source_id=source_sha256,
                 )
-                prior = seq_state.get(sid)
+                sequence_identity = (str(row["connection_generation"]), sid)
+                prior = seq_state.get(sequence_identity)
                 if prior is not None and message["seq"] != prior + 1:
                     seq_breaks[str(sid)] += 1
-                seq_state[sid] = message["seq"]
+                seq_state[sequence_identity] = message["seq"]
                 output.write(json.dumps(message, separators=(",", ":"), ensure_ascii=False))
                 output.write("\n")
                 written += 1
@@ -197,7 +223,8 @@ def convert_segment(
             "input_path": str(input_path),
             "input_sha256": source_sha256,
             "input_sidecar_path": str(sidecar_path) if sidecar else None,
-            "input_sidecar_verified": sidecar is not None,
+            "input_sidecar_verified": sidecar_verified,
+            "max_source_rows": max_source_rows,
             "input_rows": table.num_rows,
             "output_path": str(output_path),
             "output_sha256": _sha256(output_path),
@@ -216,6 +243,7 @@ def convert_segment(
                 "Preserve numeric-subscription raw_payload JSON and source row order.",
                 "Exclude nonnumeric subscription_id rows such as REST:window.",
                 "Inject _fixture_session from source SHA-256 and connection_generation.",
+                "Check subscription sequence continuity only within the same source connection_generation.",
                 "Inject _collector_received_utc from source received_at.",
                 "Apply optional time and subscription filters without rewriting source data.",
             ],
@@ -242,6 +270,14 @@ def main() -> int:
         dest="subscription_ids",
         help="include only this numeric WebSocket subscription; repeatable",
     )
+    parser.add_argument(
+        "--require-verified-sidecar", action="store_true",
+        help="fail closed unless the source sidecar has a matching SHA-256 and row count",
+    )
+    parser.add_argument(
+        "--max-source-rows", type=int, default=500_000,
+        help="maximum Parquet rows to materialize (default 500000, absolute max 1000000)",
+    )
     args = parser.parse_args()
     manifest = convert_segment(
         args.input,
@@ -249,6 +285,8 @@ def main() -> int:
         start_utc=args.start_utc,
         end_utc=args.end_utc,
         subscription_ids=set(args.subscription_ids) if args.subscription_ids else None,
+        require_verified_sidecar=args.require_verified_sidecar,
+        max_source_rows=args.max_source_rows,
     )
     print(json.dumps(manifest, indent=2, sort_keys=True))
     return 0

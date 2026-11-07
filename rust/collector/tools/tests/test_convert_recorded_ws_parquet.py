@@ -1,4 +1,5 @@
 import json
+import hashlib
 import sys
 import tempfile
 import unittest
@@ -65,6 +66,96 @@ class RecordedWebSocketParquetConverterTests(unittest.TestCase):
             self.assertTrue(Path(f"{output}.manifest.json").is_file())
             with self.assertRaises(FileExistsError):
                 convert_segment(source, output)
+
+    def test_finalized_sidecar_requires_matching_hash_and_row_count(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "segment.parquet"
+            output = root / "stage" / "frames.ndjson"
+            pq.write_table(pa.table({
+                "subscription_id": ["7"],
+                "connection_generation": ["4"],
+                "event_type": ["orderbook_snapshot"],
+                "received_at": ["2026-11-07T12:00:00Z"],
+                "raw_payload": [json.dumps({
+                    "type": "orderbook_snapshot", "sid": 7, "seq": 2,
+                    "msg": {"market_ticker": "SYNTH"},
+                }).encode()],
+            }), source)
+            sidecar_path = Path(str(source) + ".json")
+            with self.assertRaisesRegex(ValueError, "verified finalized sidecar required"):
+                convert_segment(source, output, require_verified_sidecar=True)
+            sidecar_path.write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "missing valid outputSha256"):
+                convert_segment(source, output, require_verified_sidecar=True)
+            digest = hashlib.sha256(source.read_bytes()).hexdigest()
+            sidecar_path.write_text(json.dumps({
+                "outputSha256": digest, "readbackRowsVerified": 2,
+            }), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "row count"):
+                convert_segment(source, output, require_verified_sidecar=True)
+            sidecar_path.write_text(json.dumps({
+                "outputSha256": digest, "readbackRowsVerified": 1,
+            }), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "max_source_rows must be between"):
+                convert_segment(source, output, max_source_rows=0)
+            manifest = convert_segment(
+                source, output, require_verified_sidecar=True, max_source_rows=1,
+            )
+            self.assertTrue(manifest["input_sidecar_verified"])
+            self.assertEqual(manifest["output_lines"], 1)
+
+    def test_large_source_rejected_before_materializing_rows(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "segment.parquet"
+            output = root / "out.ndjson"
+            pq.write_table(pa.table({
+                "subscription_id": ["1", "1"],
+                "connection_generation": ["0", "0"],
+                "event_type": ["trade", "trade"],
+                "received_at": ["2026-11-07T12:00:00Z"] * 2,
+                "raw_payload": [b'{"type":"trade","sid":1,"seq":1}'] * 2,
+            }), source)
+            with self.assertRaisesRegex(ValueError, "bounded row limit"):
+                convert_segment(source, output, max_source_rows=1)
+            self.assertFalse(output.exists())
+
+    def test_sequence_reset_on_new_connection_generation_is_not_a_gap(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "reconnected.parquet"
+            output = root / "staging.ndjson"
+            pq.write_table(pa.table({
+                "subscription_id": ["7", "7", "7"],
+                "connection_generation": ["2", "2", "3"],
+                "event_type": ["orderbook_snapshot", "orderbook_delta", "orderbook_snapshot"],
+                "received_at": [
+                    "2026-11-07T12:00:00Z", "2026-11-07T12:00:01Z",
+                    "2026-11-07T12:00:02Z",
+                ],
+                "raw_payload": [
+                    json.dumps({
+                        "type": "orderbook_snapshot", "sid": 7, "seq": 2,
+                        "msg": {"market_ticker": "T"},
+                    }).encode(),
+                    json.dumps({
+                        "type": "orderbook_delta", "sid": 7, "seq": 3,
+                        "msg": {"market_ticker": "T"},
+                    }).encode(),
+                    json.dumps({
+                        "type": "orderbook_snapshot", "sid": 7, "seq": 2,
+                        "msg": {"market_ticker": "T"},
+                    }).encode(),
+                ],
+            }), source)
+            manifest = convert_segment(source, output)
+            self.assertEqual(manifest["subscription_sequence_break_counts"], {})
+            frames = [
+                json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertNotEqual(frames[1]["_fixture_session"], frames[2]["_fixture_session"])
+            self.assertEqual(len(frames), 3)
 
     def test_subscription_mismatch_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "does not match raw sid"):
