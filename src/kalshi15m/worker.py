@@ -24,6 +24,7 @@ from .auth import ws_auth_headers
 from .book import OrderBook
 from .classify import executable_quotes, parse_time
 from .config import Settings, WS_URL, settings
+from .coverage import OpeningCoverage
 from .discovery import (
     candidate_series_tickers,
     discover,
@@ -438,6 +439,8 @@ class Collector:
         self.first_executable_quotes: set[str] = set()
         self.first_trades: set[str] = set()
         self.trade_poll_since_by_ticker: dict[str, int] = {}
+        self.opening_coverage = OpeningCoverage()
+        self.first_ws_synced_books: set[str] = set()
         self.api = PublicKalshiAPI()
         self.status = RuntimeStatus(cfg)
         self.storage = Storage(cfg)
@@ -1265,7 +1268,7 @@ class Collector:
                             "limitation": "observed after inventory pass; may lag first HTTP response",
                         },
                         ticker,
-                        dedupe_key=f"market-first-seen|{ticker}",
+                        dedupe_key=f"market-first-seen|{self.run_id}|{ticker}",
                     )
                 await self.emit(
                     "rest_reconciliation",
@@ -2484,6 +2487,10 @@ class Collector:
         """Capture sampled REST book states and independently record per-market coverage."""
         tickers = sorted(self.open_tickers)
         poll_started = utc_now()
+        for ticker in tickers:
+            self.opening_coverage.track(
+                ticker, self.markets.get(ticker, {}).get("open_time"), poll_started
+            )
         request_count = successful_request_count = rows_received = errors = 0
         markets_with_data: set[str] = set()
         for start in range(0, len(tickers), 100):
@@ -2501,6 +2508,7 @@ class Collector:
                 rows_received += len(orderbooks)
                 returned: set[str] = set()
                 valid: set[str] = set()
+                executable: set[str] = set()
                 for item in orderbooks:
                     if not isinstance(item, dict):
                         errors += 1
@@ -2523,6 +2531,8 @@ class Collector:
                         if ticker in batch:
                             valid.add(ticker)
                             markets_with_data.add(ticker)
+                            if diagnostic_book.yes or diagnostic_book.no:
+                                executable.add(ticker)
                             self.status.mark_channel("rest_orderbook")
                             last_seen = dict(self.status.data.get("rest_book_last_observed_utc_by_ticker", {}))
                             last_seen[ticker] = observed_utc
@@ -2557,7 +2567,7 @@ class Collector:
                                 "run_id": self.run_id,
                             },
                             ticker,
-                            dedupe_key=f"first-rest-book|{ticker}",
+                            dedupe_key=f"first-rest-book|{self.run_id}|{ticker}",
                         )
                     if (ticker in valid and ticker not in self.first_executable_quotes
                             and any(value is not None for value in quotes.values())):
@@ -2570,9 +2580,15 @@ class Collector:
                                 "observed_utc": observed_utc, "quotes": quotes, "run_id": self.run_id,
                             },
                             ticker,
-                            dedupe_key=f"first-executable-quote|{ticker}",
+                            dedupe_key=f"first-executable-quote|{self.run_id}|{ticker}",
                         )
                 missing = sorted(set(batch) - valid)
+                for expected_ticker in batch:
+                    self.opening_coverage.rest_book(
+                        expected_ticker, observed_utc,
+                        valid=(expected_ticker in valid),
+                        executable=(expected_ticker in executable),
+                    )
                 await self.emit(
                     "rest_diagnostics", "rest_poll_result",
                     {
@@ -2594,6 +2610,11 @@ class Collector:
                 )
             except Exception as exc:
                 errors += 1
+                failed_utc = utc_now()
+                for expected_ticker in batch:
+                    self.opening_coverage.rest_book(
+                        expected_ticker, failed_utc, valid=False, executable=False,
+                    )
                 self.status.update(
                     error_count=self.status.data.get("error_count", 0) + 1,
                     last_error=f"orderbook REST failed: {type(exc).__name__}",
@@ -2661,6 +2682,10 @@ class Collector:
                             raise ValueError("trade response contains a non-object")
                         trade_id = str(trade.get("trade_id") or "")
                         exchange_ts = trade.get("created_time")
+                        self.opening_coverage.track(
+                            ticker, self.markets.get(ticker, {}).get("open_time"), utc_now()
+                        )
+                        self.opening_coverage.rest_trade(ticker, exchange_ts, utc_now())
                         await self.emit(
                             "rest_public_trades", "public_trade",
                             {"source": "Kalshi public REST", **trade},
@@ -2681,7 +2706,7 @@ class Collector:
                                     "run_id": self.run_id,
                                 },
                                 ticker, exchange_ts,
-                                f"first-trade-observed|{ticker}",
+                                f"first-trade-observed|{self.run_id}|{ticker}",
                             )
                     next_cursor = payload.get("cursor") or None
                     if not next_cursor:
@@ -3256,6 +3281,27 @@ class Collector:
                             f"ws-gap-ended|{self.websocket_session_id}|{ticker}|{seq}",
                         )
                     self.book_received_monotonic[str(ticker)] = time.monotonic()
+                    self.opening_coverage.track(
+                        str(ticker), self.markets.get(str(ticker), {}).get("open_time"),
+                        received_wall,
+                    )
+                    self.opening_coverage.ws_book(str(ticker), received_wall)
+                    if str(ticker) not in self.first_ws_synced_books:
+                        self.first_ws_synced_books.add(str(ticker))
+                        await self.emit(
+                            "coverage", "first_synchronized_book_observed",
+                            {
+                                "ticker": str(ticker),
+                                "source": "WSS_SEQUENCE_SNAPSHOT",
+                                "scheduled_open_utc": self.markets.get(str(ticker), {}).get("open_time"),
+                                "observed_utc": received_wall,
+                                "session_id": self.websocket_session_id,
+                                "subscription_id": sid, "seq": seq,
+                                "run_id": self.run_id,
+                            },
+                            str(ticker), exchange_ts,
+                            f"first-ws-book|{self.run_id}|{ticker}",
+                        )
                     self._mark_orderbook_quote(str(ticker))
                     await self.emit(
                         "websocket_orderbook",
@@ -3466,6 +3512,23 @@ class Collector:
                     self.stopping.set()
                     break
                 now = time.monotonic()
+                sampled_utc = utc_now()
+                for ticker, market in self.markets.items():
+                    if market.get("is_15m_confirmed"):
+                        self.opening_coverage.track(
+                            ticker, market.get("open_time"), sampled_utc
+                        )
+                for completed in self.opening_coverage.finalize_due(sampled_utc):
+                    completed["run_id"] = self.run_id
+                    await self.emit(
+                        "coverage", "opening_coverage_finalized",
+                        completed,
+                        completed["ticker"],
+                        dedupe_key=(
+                            f"opening-coverage|{self.run_id}|{completed['ticker']}|"
+                            f"{completed['scheduled_open_utc']}"
+                        ),
+                    )
                 if inventory_task is not None and inventory_task.done():
                     try:
                         inventory_task.result()
