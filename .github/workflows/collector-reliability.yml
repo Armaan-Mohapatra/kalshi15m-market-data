@@ -54,10 +54,17 @@ jobs:
             throw "Unexpected diagnostic classification: $($result.classification)"
           }
           if (Test-Path -LiteralPath $probeRoot) { throw 'Read-only triage created a runtime directory' }
-          $superviseRaw = & pwsh -NoProfile -File ./scripts/windows/supervise.ps1 -CheckOnly -RuntimeHome $probeRoot -RuntimePort 65534
-          $superviseExit = $LASTEXITCODE
-          if ($superviseExit -ne 1) { throw "Expected fail-closed check-only exit=1, got $superviseExit" }
-          $supervise = ($superviseRaw | Out-String) | ConvertFrom-Json
+          $superviseOut = Join-Path $env:RUNNER_TEMP 'checkonly-stdout.json'
+          $superviseErr = Join-Path $env:RUNNER_TEMP 'checkonly-stderr.txt'
+          $superviseScript = (Resolve-Path ./scripts/windows/supervise.ps1).Path
+          $superviseProcess = Start-Process -FilePath (Get-Command pwsh).Source -ArgumentList @(
+            '-NoProfile','-File',$superviseScript,'-CheckOnly','-RuntimeHome',$probeRoot,
+            '-RuntimePort','65534'
+          ) -Wait -PassThru -NoNewWindow -RedirectStandardOutput $superviseOut -RedirectStandardError $superviseErr
+          if ($superviseProcess.ExitCode -ne 1) {
+            throw "Expected fail-closed check-only exit=1, got $($superviseProcess.ExitCode)"
+          }
+          $supervise = Get-Content -LiteralPath $superviseOut -Raw | ConvertFrom-Json
           if ($supervise.healthy -or $supervise.can_start -eq $true) {
             throw 'Unreachable worker incorrectly marked healthy'
           }
