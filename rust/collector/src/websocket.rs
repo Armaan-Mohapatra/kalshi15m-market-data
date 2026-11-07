@@ -7,7 +7,6 @@ use ed25519_dalek::pkcs8::DecodePrivateKey as EdDecodePrivateKey;
 use ed25519_dalek::Signer as EdSigner;
 use futures_util::{SinkExt, StreamExt};
 use rsa::pkcs1::DecodeRsaPrivateKey;
-use rsa::pkcs8::DecodePrivateKey as RsaDecodePrivateKey;
 use rsa::signature::{RandomizedSigner, SignatureEncoding};
 use rsa::RsaPrivateKey;
 use serde_json::{json, Value};
@@ -148,7 +147,7 @@ impl AuthenticatedWebSocket {
                 return Ok(());
             }
             match self
-                .run_session(&pem, &mut engine, &shutdown, &events)
+                .run_session(&pem, &mut engine, &mut shutdown, &events)
                 .await
             {
                 Ok(()) => return Ok(()),
@@ -182,7 +181,7 @@ impl AuthenticatedWebSocket {
         &self,
         pem: &str,
         engine: &mut WebsocketEngine,
-        shutdown: &watch::Receiver<bool>,
+        shutdown: &mut watch::Receiver<bool>,
         events: &mpsc::Sender<Event>,
     ) -> Result<()> {
         let timestamp_ms = std::time::SystemTime::now()
