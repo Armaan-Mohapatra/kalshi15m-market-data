@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from kalshi15m.api import PublicKalshiAPI
 from kalshi15m.book import OrderBook
 from kalshi15m.config import Settings
+from kalshi15m.coverage import OpeningCoverage
 from kalshi15m.storage import Storage
 from kalshi15m.worker import Collector
 
@@ -28,6 +29,40 @@ def event(key, payload):
         "received_utc": datetime.now(timezone.utc).isoformat(),
         "payload": payload,
     }
+
+
+class OpeningCoverageTests(unittest.TestCase):
+    def test_three_minute_rest_samples_are_labeled_noncontinuous(self):
+        coverage = OpeningCoverage()
+        open_at = datetime(2026, 11, 7, 12, 15, tzinfo=timezone.utc)
+        at = lambda seconds: (open_at + timedelta(seconds=seconds)).isoformat()
+        coverage.track("K15M", at(0), at(-60))
+        coverage.rest_book("K15M", at(12), valid=True, executable=False)
+        coverage.rest_book("K15M", at(70), valid=True, executable=True)
+        coverage.rest_book("K15M", at(136), valid=True, executable=True)
+        coverage.rest_trade("K15M", at(20), at(90))
+        summaries = coverage.finalize_due(at(181))
+        self.assertEqual(len(summaries), 1)
+        item = summaries[0]
+        self.assertEqual(item["rest_valid_samples_by_minute"], [1, 1, 1])
+        self.assertEqual(item["rest_executable_quote_samples_by_minute"], [0, 1, 1])
+        self.assertEqual(item["rest_trade_rows_by_minute"], [1, 0, 0])
+        self.assertEqual(item["rest_sample_coverage_state"], "REST_SAMPLED_EACH_MINUTE_NOT_CONTINUOUS")
+        self.assertFalse(item["rest_book_history_complete"])
+        self.assertEqual(coverage.finalize_due(at(190)), [])
+
+    def test_failed_polls_do_not_count_as_valid_and_book_may_be_quiet(self):
+        coverage = OpeningCoverage()
+        open_at = datetime(2026, 11, 7, 12, 15, tzinfo=timezone.utc)
+        at = lambda seconds: (open_at + timedelta(seconds=seconds)).isoformat()
+        coverage.track("ONE", at(0), at(0))
+        coverage.rest_book("ONE", at(14), valid=False, executable=False)
+        coverage.rest_book("ONE", at(35), valid=True, executable=False)
+        coverage.rest_book("ONE", at(91), valid=False, executable=False)
+        item = coverage.finalize_due(at(180))[0]
+        self.assertEqual(item["rest_missing_or_invalid_polls_by_minute"], [1, 1, 0])
+        self.assertEqual(item["rest_valid_samples_by_minute"], [1, 0, 0])
+        self.assertEqual(item["rest_sample_coverage_state"], "REST_PARTIAL_OR_INVALID")
 
 
 class StorageReliabilityTests(unittest.TestCase):
