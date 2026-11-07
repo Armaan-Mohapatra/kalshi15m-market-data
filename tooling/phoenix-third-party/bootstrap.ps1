@@ -16,13 +16,6 @@ $destRoot = [IO.Path]::GetFullPath($Root)
 if ($destRoot -notmatch '(?i)^E:\\PhoenixTooling(?:\\|$)') {
     throw 'Refusing non-isolated tooling root: only E:\PhoenixTooling is authorized.'
 }
-if (-not (Test-Path -LiteralPath 'E:\' -PathType Container)) {
-    throw 'E: drive is unavailable. Do not fall back onto C: automatically.'
-}
-$volume = Get-PSDrive -Name E -ErrorAction Stop
-if ($volume.Free -lt ($MinimumFreeGB * 1GB)) {
-    throw "Not enough E: free space for isolated tool checkout; minimum $MinimumFreeGB GiB required."
-}
 $items = @($manifest.repos)
 if (-not $CloneAll) {
     [ordered]@{
@@ -34,6 +27,13 @@ if (-not $CloneAll) {
         policy = 'No third-party code is executed or installed by this bootstrap.'
     } | ConvertTo-Json -Depth 5
     return
+}
+if (-not (Test-Path -LiteralPath 'E:\' -PathType Container)) {
+    throw 'E: drive is unavailable. Do not fall back onto C: automatically.'
+}
+$volume = Get-PSDrive -Name E -ErrorAction Stop
+if ($volume.Free -lt ($MinimumFreeGB * 1GB)) {
+    throw "Not enough E: free space for isolated tool checkout; minimum $MinimumFreeGB GiB required."
 }
 if ($StartIndex -ge $items.Count) { throw 'StartIndex exceeds repository inventory.' }
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
