@@ -124,6 +124,11 @@ class Storage:
         self.parquet_buffer_started_monotonic: float | None = None
         self.parquet_flush_rows = 2000
         self.parquet_flush_interval_seconds = 60.0
+        # The sole writer accounts for its own finalized parts incrementally.
+        # Reconcile external file changes at bounded intervals, rather than
+        # traversing every historical Parquet part on each archive flush.
+        self.parquet_budget_reconcile_interval_seconds = 60.0
+        self.parquet_budget_last_reconcile_monotonic = float('-inf')
         self.parquet_flush_count = 0
         self.parquet_last_flush_utc: str | None = None
         self.parquet_last_flush_rows = 0
@@ -254,6 +259,7 @@ class Storage:
         ).fetchone()
         self.latest_market_event_received_utc = str(latest_event[0]) if latest_event else None
         self.parquet_bytes = self._parquet_directory_size()
+        self.parquet_budget_last_reconcile_monotonic = float('-inf')
         self.sqlite_bytes = self._sqlite_size()
         # A status.json label is not an archival commit marker. The previous
         # process must have durably verified its final archive before skip is
@@ -372,7 +378,11 @@ class Storage:
             disk_paper_rowid = int(latest_paper[0]) if latest_paper else None
             disk_event = str(latest_event[1]) if latest_event else None
             disk_paper = str(latest_paper[1]) if latest_paper else None
-            self.parquet_bytes = self._parquet_directory_size()
+            # Do not recursively stat every Parquet part from the 15-second
+            # SQLite watermark audit. The writer already accounts for the
+            # exact byte size of each newly manifest-committed part. Archive
+            # tree reconciliation is performed at startup/recovery, not on
+            # the latency-sensitive ingest path.
             self.persistence_audit_cache = {
                 "storage_latest_disk_market_event_rowid": disk_event_rowid,
                 "storage_latest_disk_paper_record_rowid": disk_paper_rowid,
@@ -660,6 +670,27 @@ class Storage:
                 continue
         return total
 
+    def _reconcile_parquet_size_if_due(self, *, force: bool = False) -> None:
+        """Discover external archive changes without a tree walk per flush.
+
+        This is an accounting safety check, not a substitute for the SHA-256
+        manifest verification at clean shutdown. After startup, first flush
+        reconciles immediately. Subsequent flushes reconcile at most once
+        per interval unless approaching the configured archive budget.
+        """
+        now = time.monotonic()
+        near_budget = (
+            self.parquet_bytes + self.parquet_buffer_bytes_estimate
+            >= self.cfg.raw_data_budget_bytes * 0.95
+        )
+        if (
+            force or near_budget
+            or now - self.parquet_budget_last_reconcile_monotonic
+            >= self.parquet_budget_reconcile_interval_seconds
+        ):
+            self.parquet_bytes = self._parquet_directory_size()
+            self.parquet_budget_last_reconcile_monotonic = now
+
     def _archive_manifest_files_present(self) -> bool:
         """Cheap restart guard: reject removed/resized parts and new journal rows.
 
@@ -761,9 +792,10 @@ class Storage:
             return self.flush_parquet(reason="RAW_CAPTURE_DISABLED")
         rows = self.parquet_buffer
         self._write_partitioned_parquet(rows)
-        # Reconcile after every flush so budget checks/status include any
-        # archive files created while this worker was running.
-        self.parquet_bytes = self._parquet_directory_size()
+        # The writer increments bytes for every manifest-committed part. A
+        # bounded periodic rescan still detects externally added archive
+        # files, preserving the existing budget reconciliation invariant.
+        self._reconcile_parquet_size_if_due()
         self.parquet_buffer = []
         self.parquet_buffer_bytes_estimate = 0
         self.parquet_buffer_started_monotonic = None
