@@ -2,7 +2,7 @@ name: Collector reliability regression
 
 on:
   push:
-    branches: [collector/reliability-v2, diagnostics/python-capture-triage]
+    branches: [collector/reliability-v2, diagnostics/python-capture-triage, fix/collector-writer-hotpath]
   pull_request:
     branches: [main]
   workflow_dispatch:
