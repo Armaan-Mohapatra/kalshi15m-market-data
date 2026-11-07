@@ -565,7 +565,7 @@ impl ContinuousRuntime {
                     };
                     if unarchived >= 500 {
                         match journal.flush_archive(500) {
-                            Ok(()) => health.archive_state = "RECONCILIATION_PENDING".into(),
+                            Ok(_) => health.archive_state = "RECONCILIATION_PENDING".into(),
                             Err(error) => {
                                 health.archive_state = "INCOMPLETE".into();
                                 health.sqlite_state = "DEGRADED_ARCHIVE_PENDING".into();
