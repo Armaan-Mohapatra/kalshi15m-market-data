@@ -1,0 +1,884 @@
+//! Sequential, bounded continuous REST collection for isolated staging.
+//!
+//! The runtime accepts an exchange source so its scheduling and persistence
+//! behavior can be exercised with recorded or mocked responses. It never
+//! enables a network source itself; callers must construct `RestSource` with
+//! the explicit network gate.
+
+use crate::api::{PublicRest, Response};
+use crate::book::OrderBook;
+use crate::discovery::{Discovery, Market};
+use crate::event::{utc_now, Event};
+use crate::storage::{IngestResult, Journal};
+use anyhow::{anyhow, bail, Context, Result};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use serde::Serialize;
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+use std::time::Duration;
+use tokio::sync::watch;
+
+#[derive(Clone, Debug)]
+pub struct RuntimeConfig {
+    pub series: Vec<String>,
+    pub discovery_interval: Duration,
+    pub book_interval: Duration,
+    pub trade_interval: Duration,
+    pub opening_pre_seconds: i64,
+    pub opening_post_seconds: i64,
+    pub max_pages: usize,
+    pub queue_capacity: usize,
+}
+
+impl RuntimeConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.series.is_empty() || self.series.len() > 100 {
+            bail!("continuous collection requires 1..=100 explicit series tickers")
+        }
+        if self.max_pages == 0 || self.max_pages > 20 {
+            bail!("page limit outside 1..=20")
+        }
+        if self.queue_capacity < self.max_pages.saturating_mul(1000).saturating_add(64)
+            || self.queue_capacity > 12_000
+        {
+            bail!("event queue capacity outside 1..=12000")
+        }
+        for series in &self.series {
+            if series.len() > 128
+                || !series
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+            {
+                bail!("invalid series ticker")
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            series: Vec::new(),
+            discovery_interval: Duration::from_secs(60),
+            book_interval: Duration::from_secs(15),
+            trade_interval: Duration::from_secs(120),
+            opening_pre_seconds: 300,
+            opening_post_seconds: 180,
+            max_pages: 4,
+            queue_capacity: 4096,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct InventoryBatch {
+    pub markets: Vec<Value>,
+    pub failures: Vec<Value>,
+}
+
+#[derive(Debug)]
+pub struct TradeBatch {
+    pub trades: Vec<Value>,
+    pub complete: bool,
+    pub pages: usize,
+}
+
+/// Mockable interface for all exchange reads. Implementations must be
+/// read-only and must return raw market metadata without dropping fields.
+pub trait ExchangeSource: Send + Sync {
+    async fn discover(&self, series: &[String], max_pages: usize) -> Result<InventoryBatch>;
+    async fn orderbook(&self, ticker: &str) -> Result<Option<Response>>;
+    async fn trades(
+        &self,
+        ticker: &str,
+        since: DateTime<Utc>,
+        max_pages: usize,
+    ) -> Result<TradeBatch>;
+}
+
+/// Public REST source. Construction is denied unless the caller passes the
+/// explicit network gate; tests should implement `ExchangeSource` directly.
+pub struct RestSource {
+    rest: PublicRest,
+    network_allowed: bool,
+}
+
+impl RestSource {
+    pub fn new(rest: PublicRest, allow_network: bool) -> Result<Self> {
+        if !allow_network {
+            bail!("continuous REST network access is disabled without --allow-network")
+        }
+        Ok(Self {
+            rest,
+            network_allowed: true,
+        })
+    }
+}
+
+impl ExchangeSource for RestSource {
+    async fn discover(&self, series: &[String], max_pages: usize) -> Result<InventoryBatch> {
+        if !self.network_allowed {
+            bail!("REST network gate is closed")
+        }
+        let mut batch = InventoryBatch::default();
+        for series_ticker in series {
+            for status in ["unopened", "open"] {
+                let params = vec![
+                    ("series_ticker".to_string(), series_ticker.clone()),
+                    ("status".to_string(), status.to_string()),
+                    ("limit".to_string(), "200".to_string()),
+                ];
+                match self
+                    .rest
+                    .pages("/markets", "markets", &params, max_pages)
+                    .await
+                {
+                    Ok((mut markets, _)) => {
+                        let remaining = 1000usize.saturating_sub(batch.markets.len());
+                        if markets.len() > remaining {
+                            let omitted = markets.len() - remaining;
+                            markets.truncate(remaining);
+                            batch.markets.append(&mut markets);
+                            batch.failures.push(json!({"series_ticker":series_ticker,
+                                "status":status,"complete":false,"omitted_rows":omitted,
+                                "error":"bounded market inventory buffer reached 1000 rows"}));
+                        } else {
+                            batch.markets.append(&mut markets);
+                        }
+                    }
+                    Err(error) => batch.failures.push(json!({
+                        "series_ticker":series_ticker,"status":status,
+                        "error":error.to_string(),"complete":false
+                    })),
+                }
+            }
+        }
+        Ok(batch)
+    }
+
+    async fn orderbook(&self, ticker: &str) -> Result<Option<Response>> {
+        let response = self
+            .rest
+            .get(
+                "/markets/orderbooks",
+                &[("tickers".into(), ticker.to_string())],
+            )
+            .await?;
+        let rows = response
+            .body
+            .get("orderbooks")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("orderbooks response missing array"))?;
+        Ok(rows
+            .iter()
+            .find(|v| v.get("ticker").and_then(Value::as_str) == Some(ticker))
+            .map(|row| Response {
+                body: row.clone(),
+                metadata: response.metadata.clone(),
+            }))
+    }
+
+    async fn trades(
+        &self,
+        ticker: &str,
+        since: DateTime<Utc>,
+        max_pages: usize,
+    ) -> Result<TradeBatch> {
+        let params = vec![
+            ("ticker".to_string(), ticker.to_string()),
+            ("min_ts".to_string(), since.timestamp().to_string()),
+            ("limit".to_string(), "1000".to_string()),
+        ];
+        let (trades, pages) = self
+            .rest
+            .pages("/markets/trades", "trades", &params, max_pages)
+            .await?;
+        Ok(TradeBatch {
+            trades,
+            complete: true,
+            pages: pages.len(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MarketHealth {
+    pub ticker: String,
+    pub market_state: String,
+    pub seconds_to_open: i64,
+    pub last_book_poll_utc: Option<String>,
+    pub book_state: String,
+    pub last_trade_poll_utc: Option<String>,
+    pub trades_complete: Option<bool>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeHealth {
+    pub process_liveness: String,
+    pub rest_state: String,
+    pub sqlite_state: String,
+    pub archive_state: String,
+    pub queue_capacity: usize,
+    pub queue_depth: usize,
+    pub queue_saturation_count: u64,
+    pub events_acknowledged: u64,
+    pub events_duplicate: u64,
+    pub poll_failures: u64,
+    pub updated_utc: String,
+    pub markets: BTreeMap<String, MarketHealth>,
+}
+
+impl RuntimeHealth {
+    fn new(queue_capacity: usize) -> Self {
+        Self {
+            process_liveness: "RUNNING".into(),
+            rest_state: "NOT_YET_POLLED".into(),
+            sqlite_state: "OPEN".into(),
+            archive_state: "UNVERIFIED".into(),
+            queue_capacity,
+            queue_depth: 0,
+            queue_saturation_count: 0,
+            events_acknowledged: 0,
+            events_duplicate: 0,
+            poll_failures: 0,
+            updated_utc: utc_now(),
+            markets: BTreeMap::new(),
+        }
+    }
+
+    fn publish(&mut self, home: &Path) -> Result<()> {
+        self.updated_utc = utc_now();
+        let path = home.join("runtime").join("status.json");
+        std::fs::create_dir_all(path.parent().context("status parent")?)?;
+        // Status is a replaceable staging observation, never a durability
+        // marker. The journal and archive manifests remain authoritative.
+        std::fs::write(path, serde_json::to_vec_pretty(self)?)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct CycleSummary {
+    pub discovered: usize,
+    pub book_polls: usize,
+    pub trade_polls: usize,
+    pub failures: usize,
+    pub opening_observations: usize,
+}
+
+#[derive(Default)]
+pub struct ContinuousRuntime {
+    discovery: Discovery,
+    market_health: BTreeMap<String, MarketHealth>,
+    book_due: BTreeMap<String, DateTime<Utc>>,
+    trades_due: BTreeMap<String, DateTime<Utc>>,
+    opening_minutes: BTreeMap<String, BTreeSet<u8>>,
+    last_discovery: Option<DateTime<Utc>>,
+    last_open_state: BTreeMap<String, bool>,
+    queue_saturation_count: u64,
+}
+
+impl ContinuousRuntime {
+    pub async fn run_cycle<S: ExchangeSource>(
+        &mut self,
+        source: &S,
+        journal: &mut Journal,
+        config: &RuntimeConfig,
+        health: &mut RuntimeHealth,
+        now: DateTime<Utc>,
+    ) -> Result<CycleSummary> {
+        config.validate()?;
+        let mut summary = CycleSummary::default();
+        let mut pending = Vec::new();
+
+        let should_discover = self
+            .last_discovery
+            .map(|last| {
+                ChronoDuration::from_std(config.discovery_interval)
+                    .map(|interval| now - last >= interval)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(true);
+        if should_discover {
+            let inventory = source.discover(&config.series, config.max_pages).await?;
+            summary.failures += inventory.failures.len();
+            health.poll_failures += inventory.failures.len() as u64;
+            for failure in inventory.failures {
+                pending.push(Event::new(
+                    "rest_market",
+                    "market_discovery_failure",
+                    failure.get("series_ticker").and_then(Value::as_str),
+                    failure,
+                    None,
+                ));
+            }
+            summary.discovered = inventory.markets.len();
+            for row in &inventory.markets {
+                let Some(ticker) = row.get("ticker").and_then(Value::as_str) else {
+                    pending.push(Event::new(
+                        "rest_market",
+                        "market_metadata_invalid",
+                        None,
+                        row.clone(),
+                        None,
+                    ));
+                    continue;
+                };
+                let digest = Event::new(
+                    "rest_market",
+                    "market_metadata",
+                    Some(ticker),
+                    row.clone(),
+                    None,
+                )
+                .payload_hash()?;
+                pending.push(Event::new(
+                    "rest_market",
+                    "market_metadata",
+                    Some(ticker),
+                    row.clone(),
+                    Some(format!("market-meta|{ticker}|{digest}")),
+                ));
+            }
+            pending.extend(self.discovery.add_rows(&inventory.markets, now));
+            self.last_discovery = Some(now);
+            health.rest_state = if summary.failures == 0 {
+                "HEALTHY"
+            } else {
+                "DEGRADED"
+            }
+            .into();
+        }
+
+        // Commit inventory before per-market polling so a single saturated
+        // trade page cannot combine with thousands of metadata rows.
+        if !pending.is_empty() {
+            let batch = std::mem::take(&mut pending);
+            self.commit_bounded(journal, health, batch).await?;
+        }
+
+        let mut due_markets: Vec<Market> = self
+            .discovery
+            .near_open(now, config.opening_pre_seconds, config.opening_post_seconds)
+            .into_iter()
+            .cloned()
+            .collect();
+        due_markets.sort_by_key(|market| {
+            let seconds = market.seconds_to_open(now);
+            let active_opening = seconds <= 0 && seconds > -180;
+            (!active_opening, seconds.abs(), market.ticker.clone())
+        });
+
+        for market in due_markets {
+            let ticker = market.ticker.as_str();
+            let is_open = market.open <= now && now < market.close;
+            let previous_open = self.last_open_state.insert(ticker.to_string(), is_open);
+            if is_open && previous_open != Some(true) {
+                pending.push(Event::new(
+                    "market_lifecycle",
+                    "market_opened_observed",
+                    Some(ticker),
+                    json!({"scheduled_open_utc":market.open.to_rfc3339(),"observed_utc":now.to_rfc3339(),
+                        "source":"REST_DISCOVERY","opening_detection_uncertainty_seconds":config.discovery_interval.as_secs()}),
+                    Some(format!("market-open|{ticker}|{}", market.open.timestamp())),
+                ));
+            }
+            if market.close <= now && previous_open == Some(true) {
+                pending.push(Event::new(
+                    "market_lifecycle",
+                    "market_closed_observed",
+                    Some(ticker),
+                    json!({"scheduled_close_utc":market.close.to_rfc3339(),"observed_utc":now.to_rfc3339()}),
+                    Some(format!("market-close|{ticker}|{}", market.close.timestamp())),
+                ));
+            }
+
+            self.market_health
+                .entry(ticker.to_string())
+                .or_insert_with(|| MarketHealth {
+                    ticker: ticker.to_string(),
+                    market_state: if is_open { "OPEN" } else { "UPCOMING" }.into(),
+                    seconds_to_open: market.seconds_to_open(now),
+                    last_book_poll_utc: None,
+                    book_state: "NOT_YET_OBSERVED".into(),
+                    last_trade_poll_utc: None,
+                    trades_complete: None,
+                    last_error: None,
+                });
+
+            let book_is_due = self
+                .book_due
+                .get(ticker)
+                .map(|next| now >= *next)
+                .unwrap_or(true);
+            if book_is_due {
+                self.book_due.insert(
+                    ticker.to_string(),
+                    now + ChronoDuration::from_std(config.book_interval)?,
+                );
+                summary.book_polls += 1;
+                let observed = utc_now();
+                match source.orderbook(ticker).await {
+                    Ok(Some(response)) => {
+                        let book_data = response
+                            .body
+                            .get("orderbook_fp")
+                            .or_else(|| response.body.get("orderbook"))
+                            .unwrap_or(&response.body);
+                        let mut book = OrderBook::default();
+                        let validation = if book.snapshot(book_data).is_ok() {
+                            "VALID_REST_SAMPLED"
+                        } else {
+                            "INVALID_REST_BOOK"
+                        };
+                        pending.push(Event::new(
+                            "rest_orderbook",
+                            "orderbook_snapshot",
+                            Some(ticker),
+                            json!({"raw":response.body,"validation":validation,"http":response.metadata,
+                                "observed_utc":observed,"source":"REST_SAMPLED_NOT_WS_SYNCHRONIZED"}),
+                            Some(format!("rest-book|{ticker}|{observed}")),
+                        ));
+                        if let Some(item) = self.market_health.get_mut(ticker) {
+                            item.last_book_poll_utc = Some(observed.clone());
+                            item.book_state = validation.into();
+                            item.last_error = None;
+                        }
+                        self.track_opening(ticker, market.open, now, &mut pending, &mut summary);
+                    }
+                    Ok(None) => {
+                        let error = "requested ticker absent from orderbook response";
+                        pending.push(Event::new(
+                            "rest_orderbook",
+                            "orderbook_missing",
+                            Some(ticker),
+                            json!({"requested_ticker":ticker,"observed_utc":observed,"error":error}),
+                            Some(format!("rest-book-missing|{ticker}|{observed}")),
+                        ));
+                        health.poll_failures += 1;
+                        summary.failures += 1;
+                        if let Some(item) = self.market_health.get_mut(ticker) {
+                            item.last_book_poll_utc = Some(observed);
+                            item.book_state = "MISSING".into();
+                            item.last_error = Some(error.into());
+                        }
+                    }
+                    Err(error) => {
+                        self.poll_failure(
+                            ticker,
+                            "orderbook",
+                            &error,
+                            observed,
+                            health,
+                            &mut pending,
+                        );
+                        summary.failures += 1;
+                    }
+                }
+            }
+
+            let trade_is_due = self
+                .trades_due
+                .get(ticker)
+                .map(|next| now >= *next)
+                .unwrap_or(true);
+            if trade_is_due {
+                self.trades_due.insert(
+                    ticker.to_string(),
+                    now + ChronoDuration::from_std(config.trade_interval)?,
+                );
+                summary.trade_polls += 1;
+                let observed = utc_now();
+                match source
+                    .trades(ticker, now - ChronoDuration::hours(1), config.max_pages)
+                    .await
+                {
+                    Ok(batch) => {
+                        for trade in &batch.trades {
+                            let trade_id = trade
+                                .get("trade_id")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| {
+                                    Event::new(
+                                        "rest_public_trades",
+                                        "public_trade",
+                                        Some(ticker),
+                                        trade.clone(),
+                                        None,
+                                    )
+                                    .payload_hash()
+                                    .unwrap_or_default()
+                                });
+                            let mut event = Event::new(
+                                "rest_public_trades",
+                                "public_trade",
+                                Some(ticker),
+                                trade.clone(),
+                                Some(format!("trade|{trade_id}")),
+                            );
+                            event.exchange_ts = trade
+                                .get("created_time")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned);
+                            pending.push(event);
+                        }
+                        pending.push(Event::new(
+                            "rest_public_trades",
+                            "trade_poll_result",
+                            Some(ticker),
+                            json!({"trade_rows":batch.trades.len(),"pages":batch.pages,"complete":batch.complete,
+                                "observed_utc":observed,"coverage":"REST_POLL_NOT_CONTINUOUS_STREAM"}),
+                            Some(format!("trade-poll|{ticker}|{observed}")),
+                        ));
+                        if let Some(item) = self.market_health.get_mut(ticker) {
+                            item.last_trade_poll_utc = Some(observed);
+                            item.trades_complete = Some(batch.complete);
+                            item.last_error = None;
+                        }
+                    }
+                    Err(error) => {
+                        self.poll_failure(ticker, "trades", &error, observed, health, &mut pending);
+                        summary.failures += 1;
+                        if let Some(item) = self.market_health.get_mut(ticker) {
+                            item.trades_complete = Some(false);
+                        }
+                    }
+                }
+            }
+
+            self.market_health
+                .entry(ticker.to_string())
+                .or_insert_with(|| MarketHealth {
+                    ticker: ticker.to_string(),
+                    market_state: if is_open { "OPEN" } else { "UPCOMING" }.into(),
+                    seconds_to_open: market.seconds_to_open(now),
+                    last_book_poll_utc: None,
+                    book_state: "NOT_YET_OBSERVED".into(),
+                    last_trade_poll_utc: None,
+                    trades_complete: None,
+                    last_error: None,
+                });
+            if let Some(item) = self.market_health.get_mut(ticker) {
+                item.market_state = if market.close <= now {
+                    "CLOSED"
+                } else if is_open {
+                    "OPEN"
+                } else {
+                    "UPCOMING"
+                }
+                .into();
+                item.seconds_to_open = market.seconds_to_open(now);
+            }
+            if !pending.is_empty() {
+                let batch = std::mem::take(&mut pending);
+                self.commit_bounded(journal, health, batch).await?;
+            }
+        }
+
+        self.commit_bounded(journal, health, pending).await?;
+        health.archive_state = if journal.verify_archive()? {
+            "VERIFIED".into()
+        } else {
+            "INCOMPLETE".into()
+        };
+        health.markets = self.market_health.clone();
+        health.publish(&journal.home)?;
+        Ok(summary)
+    }
+
+    fn track_opening(
+        &mut self,
+        ticker: &str,
+        open: DateTime<Utc>,
+        now: DateTime<Utc>,
+        pending: &mut Vec<Event>,
+        summary: &mut CycleSummary,
+    ) {
+        let elapsed = (now - open).num_seconds();
+        if !(0..180).contains(&elapsed) {
+            return;
+        }
+        let minute = (elapsed / 60) as u8;
+        let seen = self.opening_minutes.entry(ticker.to_string()).or_default();
+        if seen.insert(minute) {
+            summary.opening_observations += 1;
+            pending.push(Event::new(
+                "opening_coverage",
+                "rest_opening_minute_observed",
+                Some(ticker),
+                json!({"scheduled_open_utc":open.to_rfc3339(),"observed_utc":now.to_rfc3339(),
+                    "minute_from_open":minute,"source":"REST_SAMPLED_NOT_CONTINUOUS"}),
+                Some(format!(
+                    "opening-minute|{ticker}|{}|{minute}",
+                    open.timestamp()
+                )),
+            ));
+        }
+    }
+
+    fn poll_failure(
+        &mut self,
+        ticker: &str,
+        channel: &str,
+        error: &anyhow::Error,
+        observed: String,
+        health: &mut RuntimeHealth,
+        pending: &mut Vec<Event>,
+    ) {
+        health.poll_failures += 1;
+        pending.push(Event::new(
+            "rest_health",
+            "market_poll_failure",
+            Some(ticker),
+            json!({"channel":channel,"error":error.to_string(),"observed_utc":observed}),
+            None,
+        ));
+        let item = self
+            .market_health
+            .entry(ticker.to_string())
+            .or_insert_with(|| MarketHealth {
+                ticker: ticker.to_string(),
+                market_state: "UNKNOWN".into(),
+                seconds_to_open: 0,
+                last_book_poll_utc: None,
+                book_state: "NOT_YET_OBSERVED".into(),
+                last_trade_poll_utc: None,
+                trades_complete: None,
+                last_error: None,
+            });
+        {
+            item.last_error = Some(error.to_string());
+            if channel == "orderbook" {
+                item.book_state = "ERROR".into();
+                item.last_book_poll_utc = Some(observed);
+            } else {
+                item.trades_complete = Some(false);
+                item.last_trade_poll_utc = Some(observed);
+            }
+        }
+    }
+
+    async fn commit_bounded(
+        &mut self,
+        journal: &mut Journal,
+        health: &mut RuntimeHealth,
+        events: Vec<Event>,
+    ) -> Result<()> {
+        if events.len() > health.queue_capacity {
+            for event in events {
+                journal
+                    .spool(&event)
+                    .context("spool oversized runtime batch")?;
+            }
+            health.sqlite_state = "DEGRADED_SPOOLED".into();
+            bail!("cycle exceeded bounded event queue; full batch durably spooled")
+        }
+        health.queue_depth = events.len();
+        if health.queue_depth == health.queue_capacity {
+            self.queue_saturation_count += 1;
+            health.queue_saturation_count = self.queue_saturation_count;
+        }
+        let mut events = events.into_iter();
+        while let Some(event) = events.next() {
+            match journal.ingest(&event) {
+                Ok(IngestResult::Inserted | IngestResult::Versioned) => {
+                    health.events_acknowledged += 1;
+                }
+                Ok(IngestResult::Duplicate) => health.events_duplicate += 1,
+                Err(error) => {
+                    // The failed event is durably spooled before the cycle
+                    // reports an error; callers never receive a false ACK.
+                    journal
+                        .spool(&event)
+                        .context("durably spool failed event")?;
+                    for remaining in events {
+                        journal
+                            .spool(&remaining)
+                            .context("durably spool queued event")?;
+                    }
+                    health.sqlite_state = "DEGRADED_SPOOLED".into();
+                    health.queue_depth = 0;
+                    return Err(error).context("SQLite write failed; event spooled");
+                }
+            }
+            health.queue_depth = health.queue_depth.saturating_sub(1);
+            if journal.unarchived_count()? >= 500 {
+                if let Err(error) = journal.flush_archive(500) {
+                    for remaining in events {
+                        journal
+                            .spool(&remaining)
+                            .context("durably spool after archive failure")?;
+                    }
+                    health.sqlite_state = "DEGRADED_ARCHIVE_PENDING".into();
+                    health.queue_depth = 0;
+                    return Err(error).context("Parquet flush failed after SQLite commit");
+                }
+            }
+        }
+        journal.flush_archive(500)?;
+        health.sqlite_state = "HEALTHY".into();
+        health.archive_state = "RECONCILIATION_PENDING".into();
+        Ok(())
+    }
+
+    pub async fn run<S: ExchangeSource>(
+        &mut self,
+        source: &S,
+        journal: &mut Journal,
+        config: &RuntimeConfig,
+        stop: &mut watch::Receiver<bool>,
+    ) -> Result<()> {
+        config.validate()?;
+        let mut health = RuntimeHealth::new(config.queue_capacity);
+        loop {
+            if *stop.borrow() {
+                break;
+            }
+            let now = Utc::now();
+            if let Err(error) = self
+                .run_cycle(source, journal, config, &mut health, now)
+                .await
+            {
+                health.rest_state = "DEGRADED".into();
+                health.poll_failures += 1;
+                health.publish(&journal.home)?;
+                return Err(error);
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+                changed = stop.changed() => {
+                    if changed.is_err() || *stop.borrow() { break; }
+                }
+            }
+        }
+        health.process_liveness = "STOPPING".into();
+        health.publish(&journal.home)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use std::sync::Mutex;
+
+    struct MockSource {
+        market: Value,
+        books: Mutex<Vec<Option<Value>>>,
+        trade_complete: bool,
+    }
+
+    impl ExchangeSource for MockSource {
+        async fn discover(&self, _series: &[String], _max_pages: usize) -> Result<InventoryBatch> {
+            Ok(InventoryBatch {
+                markets: vec![self.market.clone()],
+                failures: Vec::new(),
+            })
+        }
+
+        async fn orderbook(&self, ticker: &str) -> Result<Option<Response>> {
+            let value = self.books.lock().unwrap().remove(0);
+            Ok(value.map(|body| Response {
+                body: json!({"ticker":ticker,"orderbook_fp":body}),
+                metadata: json!({"http_status":200}),
+            }))
+        }
+
+        async fn trades(
+            &self,
+            _ticker: &str,
+            _since: DateTime<Utc>,
+            _max_pages: usize,
+        ) -> Result<TradeBatch> {
+            Ok(TradeBatch {
+                trades: Vec::new(),
+                complete: self.trade_complete,
+                pages: 1,
+            })
+        }
+    }
+
+    fn config() -> RuntimeConfig {
+        RuntimeConfig {
+            series: vec!["KXTEST15M".into()],
+            discovery_interval: Duration::from_secs(15),
+            book_interval: Duration::from_secs(15),
+            trade_interval: Duration::from_secs(120),
+            opening_pre_seconds: 300,
+            opening_post_seconds: 180,
+            max_pages: 4,
+            queue_capacity: 4096,
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduler_persists_empty_books_opening_coverage_and_health() {
+        let home = tempfile::tempdir().unwrap();
+        let open = Utc.with_ymd_and_hms(2026, 11, 7, 12, 0, 0).unwrap();
+        let market = json!({"ticker":"KXTEST15M-ONE","status":"open",
+            "open_time":open.to_rfc3339(),"close_time":(open+ChronoDuration::seconds(900)).to_rfc3339(),
+            "floor_strike":123,"expiration_time":(open+ChronoDuration::seconds(900)).to_rfc3339()});
+        let source = MockSource {
+            market,
+            books: Mutex::new(vec![Some(json!({"yes_dollars_fp":[],"no_dollars_fp":[]}))]),
+            trade_complete: true,
+        };
+        let mut runtime = ContinuousRuntime::default();
+        let mut journal = Journal::open(home.path()).unwrap();
+        let mut health = RuntimeHealth::new(config().queue_capacity);
+        let at = open + ChronoDuration::seconds(30);
+        let summary = runtime
+            .run_cycle(&source, &mut journal, &config(), &mut health, at)
+            .await
+            .unwrap();
+        assert_eq!(summary.discovered, 1);
+        assert_eq!(summary.book_polls, 1);
+        assert_eq!(summary.trade_polls, 1);
+        assert_eq!(summary.opening_observations, 1);
+        assert_eq!(
+            health.markets["KXTEST15M-ONE"].book_state,
+            "VALID_REST_SAMPLED"
+        );
+        assert_eq!(health.markets["KXTEST15M-ONE"].trades_complete, Some(true));
+        assert!(journal.verify_archive().unwrap());
+        assert_eq!(journal.audit().unwrap()["canonical_events"], 6);
+        journal.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn scheduler_records_missing_books_and_incomplete_failures() {
+        let home = tempfile::tempdir().unwrap();
+        let open = Utc.with_ymd_and_hms(2026, 11, 7, 12, 0, 0).unwrap();
+        let source = MockSource {
+            market: json!({"ticker":"ONE","status":"open","open_time":open.to_rfc3339(),
+                "close_time":(open+ChronoDuration::seconds(900)).to_rfc3339()}),
+            books: Mutex::new(vec![None]),
+            trade_complete: false,
+        };
+        let mut runtime = ContinuousRuntime::default();
+        let mut journal = Journal::open(home.path()).unwrap();
+        let mut health = RuntimeHealth::new(config().queue_capacity);
+        let summary = runtime
+            .run_cycle(&source, &mut journal, &config(), &mut health, open)
+            .await
+            .unwrap();
+        assert_eq!(summary.failures, 1);
+        assert_eq!(health.markets["ONE"].book_state, "MISSING");
+        assert_eq!(health.markets["ONE"].trades_complete, Some(false));
+        let missing: i64 = journal
+            .conn
+            .query_row(
+                "SELECT count(*) FROM market_events WHERE kind='orderbook_missing'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(missing, 1);
+        journal.close().unwrap();
+    }
+}

@@ -3,11 +3,13 @@ use clap::{Parser, Subcommand};
 use kalshi15m_rust::{
     api::{PublicRest, DEFAULT_BASE},
     replay::{collect_once, replay_file},
+    runtime::{ContinuousRuntime, RestSource, RuntimeConfig},
     storage::Journal,
 };
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tokio::sync::watch;
 
 #[derive(Parser)]
 #[command(
@@ -49,6 +51,18 @@ enum Commands {
         #[arg(long, default_value_t = 2.0)]
         min_spacing_seconds: f64,
         #[arg(long, default_value=DEFAULT_BASE)]
+        base_url: String,
+    },
+    /// Start the continuously scheduled, read-only REST collector.
+    /// Network access requires `--allow-network true`; no trading routes exist.
+    RunContinuous {
+        #[arg(long, required = true, num_args = 1..)]
+        series: Vec<String>,
+        #[arg(long, required = true)]
+        allow_network: bool,
+        #[arg(long, default_value_t = 2.0)]
+        min_spacing_seconds: f64,
+        #[arg(long, default_value = DEFAULT_BASE)]
         base_url: String,
     },
     /// Audit staging journal and verify archive integrity without network.
@@ -142,6 +156,48 @@ async fn main() -> Result<()> {
             let report = collect_once(&mut journal, &client, &series, &ticker, max_pages).await?;
             journal.close()?;
             println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Commands::RunContinuous {
+            series,
+            allow_network,
+            min_spacing_seconds,
+            base_url,
+        } => {
+            if !allow_network {
+                bail!("continuous REST network access requires --allow-network true")
+            }
+            if !min_spacing_seconds.is_finite() || min_spacing_seconds < 2.0 {
+                bail!("minimum REST pacing is 2 seconds without a separate limit review")
+            }
+            let rest = PublicRest::new(&base_url, Duration::from_secs_f64(min_spacing_seconds))?;
+            let source = RestSource::new(rest, allow_network)?;
+            let config = RuntimeConfig {
+                series,
+                ..RuntimeConfig::default()
+            };
+            config.validate()?;
+            let (stop_tx, mut stop_rx) = watch::channel(false);
+            let signal_task = tokio::spawn(async move {
+                let _ = tokio::signal::ctrl_c().await;
+                let _ = stop_tx.send(true);
+            });
+            let mut runtime = ContinuousRuntime::default();
+            let result = runtime
+                .run(&source, &mut journal, &config, &mut stop_rx)
+                .await;
+            signal_task.abort();
+            result?;
+            let stats = journal.close()?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "mode":"CONTINUOUS_READ_ONLY_REST",
+                    "process_state":"STOPPED_GRACEFULLY",
+                    "network_used":true,
+                    "durable_events":stats.inserted + stats.variants,
+                    "duplicates":stats.duplicates,
+                }))?
+            );
         }
         Commands::Audit => {
             let report = journal.audit()?;
