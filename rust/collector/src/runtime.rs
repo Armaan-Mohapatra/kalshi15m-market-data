@@ -21,6 +21,50 @@ use std::path::Path;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 
+const MAX_WEBSOCKET_SUBSCRIPTION_HEALTH_ROWS: usize = 2048;
+
+fn websocket_subscription_identity(event: &Event) -> Option<(String, i64, String)> {
+    let session_id = event.payload.get("session_id")?.as_str()?.to_owned();
+    let sid = if event.channel == "websocket_raw" {
+        let raw = event.payload.get("raw")?;
+        raw.get("sid")
+            .and_then(serde_json::Value::as_i64)
+            .or_else(|| raw.get("msg")?.get("sid")?.as_i64())?
+    } else {
+        event.payload.get("sid")?.as_i64()?
+    };
+    let key = format!("{session_id}:{sid}");
+    Some((session_id, sid, key))
+}
+
+fn subscription_health_mut(
+    health: &mut RuntimeHealth,
+    session_id: &str,
+    sid: i64,
+    key: String,
+) -> &mut WebSocketSubscriptionHealth {
+    if !health.websocket_subscriptions.contains_key(&key)
+        && health.websocket_subscriptions.len() >= MAX_WEBSOCKET_SUBSCRIPTION_HEALTH_ROWS
+    {
+        if let Some(oldest) = health
+            .websocket_subscriptions
+            .iter()
+            .min_by_key(|(_, state)| state.raw_frames.last_frame_received_utc.as_deref())
+            .map(|(key, _)| key.clone())
+        {
+            health.websocket_subscriptions.remove(&oldest);
+        }
+    }
+    health
+        .websocket_subscriptions
+        .entry(key)
+        .or_insert_with(|| WebSocketSubscriptionHealth {
+            session_id: session_id.to_owned(),
+            sid,
+            ..WebSocketSubscriptionHealth::default()
+        })
+}
+
 pub fn observe_websocket_event(health: &mut RuntimeHealth, event: &Event, queue_depth: usize) {
     if event.channel.starts_with("websocket_") {
         health.websocket_events_observed += 1;
@@ -37,6 +81,10 @@ pub fn observe_websocket_event(health: &mut RuntimeHealth, event: &Event, queue_
         )
     {
         health.websocket_state = "CONNECTED".into();
+    }
+    let raw_frame = event.channel == "websocket_raw";
+    if raw_frame {
+        health.websocket_raw_frames.observe(event);
     }
     match event.kind.as_str() {
         "connection_interrupted" => {
@@ -66,6 +114,9 @@ pub fn observe_websocket_event(health: &mut RuntimeHealth, event: &Event, queue_
         if event.channel.starts_with("websocket_") {
             market.websocket_events_observed += 1;
         }
+        if raw_frame {
+            market.websocket_raw_frames.observe(event);
+        }
         match event.kind.as_str() {
             "orderbook_snapshot" | "orderbook_delta" => {
                 market.websocket_book_state = "FRAME_OBSERVED".into();
@@ -88,6 +139,15 @@ pub fn observe_websocket_event(health: &mut RuntimeHealth, event: &Event, queue_
             _ => {}
         }
     }
+    if let Some((session_id, sid, key)) = websocket_subscription_identity(event) {
+        let subscription = subscription_health_mut(health, &session_id, sid, key);
+        if raw_frame {
+            subscription.raw_frames.observe(event);
+        }
+        if event.kind == "sequence_gap" {
+            subscription.sequence_gaps_observed += 1;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,6 +156,106 @@ pub enum WebSocketPersistenceOutcome {
     Duplicate,
     Spooled,
     Failed,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RawFrameHealth {
+    pub frames_observed: u64,
+    pub orderbook_delta_frames_observed: u64,
+    pub orderbook_delta_frames_applied: u64,
+    pub orderbook_delta_frames_rejected: u64,
+    pub frames_journaled: u64,
+    pub orderbook_delta_frames_journaled: u64,
+    pub frames_duplicate: u64,
+    pub orderbook_delta_frames_duplicate: u64,
+    pub frames_spooled: u64,
+    pub orderbook_delta_frames_spooled: u64,
+    pub frames_unpersisted: u64,
+    pub orderbook_delta_frames_unpersisted: u64,
+    pub frames_archived: u64,
+    pub orderbook_delta_frames_archived: u64,
+    pub last_frame_received_utc: Option<String>,
+    pub last_delta_received_utc: Option<String>,
+    pub last_delta_journal_ack_utc: Option<String>,
+    pub last_archive_ack_utc: Option<String>,
+    pub last_delta_archive_ack_utc: Option<String>,
+}
+
+impl RawFrameHealth {
+    fn observe(&mut self, event: &Event) {
+        self.frames_observed += 1;
+        self.last_frame_received_utc = Some(event.received_utc.clone());
+        if event.kind == "orderbook_delta" {
+            self.orderbook_delta_frames_observed += 1;
+            self.last_delta_received_utc = Some(event.received_utc.clone());
+            match event.payload["collector"]["book_processing"].as_str() {
+                Some("DELTA_APPLIED") => self.orderbook_delta_frames_applied += 1,
+                Some("DELTA_REJECTED") => self.orderbook_delta_frames_rejected += 1,
+                _ => {}
+            }
+        }
+    }
+
+    fn observe_persistence(&mut self, event: &Event, outcome: WebSocketPersistenceOutcome) {
+        let is_delta = event.kind == "orderbook_delta";
+        match outcome {
+            WebSocketPersistenceOutcome::Journaled => {
+                self.frames_journaled += 1;
+                if is_delta {
+                    self.orderbook_delta_frames_journaled += 1;
+                    self.last_delta_journal_ack_utc = Some(utc_now());
+                }
+            }
+            WebSocketPersistenceOutcome::Duplicate => {
+                self.frames_duplicate += 1;
+                if is_delta {
+                    self.orderbook_delta_frames_duplicate += 1;
+                    self.last_delta_journal_ack_utc = Some(utc_now());
+                }
+            }
+            WebSocketPersistenceOutcome::Spooled => {
+                self.frames_spooled += 1;
+                if is_delta {
+                    self.orderbook_delta_frames_spooled += 1;
+                }
+            }
+            WebSocketPersistenceOutcome::Failed => {
+                self.frames_unpersisted += 1;
+                if is_delta {
+                    self.orderbook_delta_frames_unpersisted += 1;
+                }
+            }
+        }
+    }
+
+    fn observe_archive(
+        &mut self,
+        raw_frames: u64,
+        delta_frames: u64,
+        latest_delta_received_utc: Option<&str>,
+        acknowledged_utc: &str,
+    ) {
+        self.frames_archived += raw_frames;
+        self.orderbook_delta_frames_archived += delta_frames;
+        if raw_frames > 0 {
+            self.last_archive_ack_utc = Some(acknowledged_utc.to_owned());
+        }
+        if delta_frames > 0 {
+            self.last_delta_archive_ack_utc = Some(acknowledged_utc.to_owned());
+            self.last_delta_received_utc = latest_delta_received_utc.map(str::to_owned);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct WebSocketSubscriptionHealth {
+    pub session_id: String,
+    pub sid: i64,
+    pub raw_frames: RawFrameHealth,
+    pub sequence_gaps_observed: u64,
+    pub sequence_gaps_journaled: u64,
+    pub sequence_gaps_duplicate: u64,
+    pub sequence_gaps_archived: u64,
 }
 
 /// Record persistence for a WebSocket event. Journaled means SQLite insert/version;
@@ -144,6 +304,31 @@ pub fn observe_websocket_persistence(
             }
         }
     }
+    if event.channel == "websocket_raw" {
+        health
+            .websocket_raw_frames
+            .observe_persistence(event, outcome);
+        if let Some(ticker) = event.market_ticker.as_deref() {
+            if let Some(market) = health.markets.get_mut(ticker) {
+                market
+                    .websocket_raw_frames
+                    .observe_persistence(event, outcome);
+            }
+        }
+    }
+    if let Some((session_id, sid, key)) = websocket_subscription_identity(event) {
+        let subscription = subscription_health_mut(health, &session_id, sid, key);
+        if event.channel == "websocket_raw" {
+            subscription.raw_frames.observe_persistence(event, outcome);
+        }
+        if event.kind == "sequence_gap" {
+            match outcome {
+                WebSocketPersistenceOutcome::Journaled => subscription.sequence_gaps_journaled += 1,
+                WebSocketPersistenceOutcome::Duplicate => subscription.sequence_gaps_duplicate += 1,
+                WebSocketPersistenceOutcome::Spooled | WebSocketPersistenceOutcome::Failed => {}
+            }
+        }
+    }
 }
 
 /// Record Parquet/archive acknowledgments separately from SQLite journaling.
@@ -153,6 +338,12 @@ pub fn observe_archive_flush(health: &mut RuntimeHealth, summary: &ArchiveFlushS
     health.websocket_events_archived += summary.websocket_events;
     health.websocket_orderbook_deltas_archived += summary.orderbook_deltas;
     health.websocket_sequence_gaps_archived += summary.sequence_gaps;
+    health.websocket_raw_frames.observe_archive(
+        summary.websocket_raw_frames,
+        summary.orderbook_delta_frames,
+        summary.latest_delta_received_utc.as_deref(),
+        &utc_now(),
+    );
     if summary.websocket_events == 0 {
         return;
     }
@@ -167,6 +358,12 @@ pub fn observe_archive_flush(health: &mut RuntimeHealth, summary: &ArchiveFlushS
         market.websocket_events_archived += archived.websocket_events;
         market.websocket_orderbook_deltas_archived += archived.orderbook_deltas;
         market.websocket_sequence_gaps_archived += archived.sequence_gaps;
+        market.websocket_raw_frames.observe_archive(
+            archived.raw_frames,
+            archived.orderbook_delta_frames,
+            archived.latest_delta_received_utc.as_deref(),
+            &acknowledged_utc,
+        );
         if let Some(received_utc) = &archived.latest_event_received_utc {
             if market
                 .last_websocket_archived_event_utc
@@ -177,6 +374,23 @@ pub fn observe_archive_flush(health: &mut RuntimeHealth, summary: &ArchiveFlushS
             }
         }
         market.last_websocket_archive_ack_utc = Some(acknowledged_utc.clone());
+    }
+    for (key, archived) in &summary.by_subscription {
+        let subscription = health
+            .websocket_subscriptions
+            .entry(key.clone())
+            .or_insert_with(|| WebSocketSubscriptionHealth {
+                session_id: archived.session_id.clone(),
+                sid: archived.sid,
+                ..WebSocketSubscriptionHealth::default()
+            });
+        subscription.raw_frames.observe_archive(
+            archived.raw_frames,
+            archived.orderbook_delta_frames,
+            archived.latest_delta_received_utc.as_deref(),
+            &acknowledged_utc,
+        );
+        subscription.sequence_gaps_archived += archived.sequence_gaps;
     }
 }
 
@@ -418,6 +632,7 @@ pub struct MarketHealth {
     pub book_state: String,
     pub websocket_book_state: String,
     pub websocket_events_observed: u64,
+    pub websocket_raw_frames: RawFrameHealth,
     pub websocket_events_journaled: u64,
     pub websocket_events_duplicate: u64,
     pub websocket_events_spooled: u64,
@@ -448,6 +663,7 @@ impl MarketHealth {
             book_state: "NOT_YET_OBSERVED".into(),
             websocket_book_state: "NOT_YET_OBSERVED".into(),
             websocket_events_observed: 0,
+            websocket_raw_frames: RawFrameHealth::default(),
             websocket_events_journaled: 0,
             websocket_events_duplicate: 0,
             websocket_events_spooled: 0,
@@ -477,6 +693,8 @@ pub struct RuntimeHealth {
     pub websocket_malformed_frame_count: u64,
     pub websocket_last_frame_utc: Option<String>,
     pub websocket_events_observed: u64,
+    pub websocket_raw_frames: RawFrameHealth,
+    pub websocket_subscriptions: BTreeMap<String, WebSocketSubscriptionHealth>,
     pub websocket_events_journaled: u64,
     pub websocket_events_duplicate: u64,
     pub websocket_events_spooled: u64,
@@ -513,6 +731,8 @@ impl RuntimeHealth {
             websocket_malformed_frame_count: 0,
             websocket_last_frame_utc: None,
             websocket_events_observed: 0,
+            websocket_raw_frames: RawFrameHealth::default(),
+            websocket_subscriptions: BTreeMap::new(),
             websocket_events_journaled: 0,
             websocket_events_duplicate: 0,
             websocket_events_spooled: 0,
@@ -1078,6 +1298,7 @@ impl ContinuousRuntime {
                     book_state: "NOT_YET_OBSERVED".into(),
                     websocket_book_state: "NOT_YET_OBSERVED".into(),
                     websocket_events_observed: 0,
+                    websocket_raw_frames: RawFrameHealth::default(),
                     websocket_events_journaled: 0,
                     websocket_events_duplicate: 0,
                     websocket_events_spooled: 0,
@@ -1250,6 +1471,7 @@ impl ContinuousRuntime {
                     book_state: "NOT_YET_OBSERVED".into(),
                     websocket_book_state: "NOT_YET_OBSERVED".into(),
                     websocket_events_observed: 0,
+                    websocket_raw_frames: RawFrameHealth::default(),
                     websocket_events_journaled: 0,
                     websocket_events_duplicate: 0,
                     websocket_events_spooled: 0,
@@ -1332,6 +1554,7 @@ impl ContinuousRuntime {
             market.last_websocket_trade_utc = websocket.last_websocket_trade_utc;
             market.websocket_book_state = websocket.websocket_book_state;
             market.websocket_events_observed = websocket.websocket_events_observed;
+            market.websocket_raw_frames = websocket.websocket_raw_frames;
             market.websocket_events_journaled = websocket.websocket_events_journaled;
             market.websocket_events_duplicate = websocket.websocket_events_duplicate;
             market.websocket_events_spooled = websocket.websocket_events_spooled;
@@ -1411,6 +1634,7 @@ impl ContinuousRuntime {
                 book_state: "NOT_YET_OBSERVED".into(),
                 websocket_book_state: "NOT_YET_OBSERVED".into(),
                 websocket_events_observed: 0,
+                websocket_raw_frames: RawFrameHealth::default(),
                 websocket_events_journaled: 0,
                 websocket_events_duplicate: 0,
                 websocket_events_spooled: 0,
@@ -1627,17 +1851,24 @@ mod tests {
         let summary = ArchiveFlushSummary {
             rows: 3,
             websocket_events: 3,
+            websocket_raw_frames: 0,
+            orderbook_delta_frames: 0,
             orderbook_deltas: 1,
             sequence_gaps: 1,
+            latest_delta_received_utc: None,
             by_market: BTreeMap::from([(
                 "KXBTC15M-STATUS-MOCK".into(),
                 crate::storage::MarketArchiveSummary {
                     websocket_events: 3,
+                    raw_frames: 0,
+                    orderbook_delta_frames: 0,
                     orderbook_deltas: 1,
                     sequence_gaps: 1,
                     latest_event_received_utc: Some(event.received_utc.clone()),
+                    latest_delta_received_utc: None,
                 },
             )]),
+            by_subscription: BTreeMap::new(),
         };
         observe_archive_flush(&mut health, &summary);
 

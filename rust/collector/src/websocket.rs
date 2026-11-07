@@ -578,6 +578,7 @@ impl AuthenticatedWebSocket {
 #[derive(Debug, Default)]
 pub struct SubscriptionState {
     last_seq: Option<i64>,
+    configured_markets: Vec<String>,
     book_markets: Vec<String>,
     gap: Option<(i64, i64)>,
     resync_pending: bool,
@@ -619,6 +620,9 @@ impl WebsocketEngine {
     pub fn register_orderbook_subscription(&mut self, sid: i64, markets: &[String]) {
         let state = self.subscriptions.entry(sid).or_default();
         for market in markets {
+            if !state.configured_markets.contains(market) {
+                state.configured_markets.push(market.clone());
+            }
             if !state.book_markets.contains(market) {
                 state.book_markets.push(market.clone());
             }
@@ -670,6 +674,17 @@ impl WebsocketEngine {
             .get("market_ticker")
             .and_then(Value::as_str)
             .map(str::to_string);
+        let membership = match (sid, ticker.as_deref()) {
+            (_, None) => "NO_MARKET_TICKER",
+            (Some(sid), Some(ticker)) => match self.subscriptions.get(&sid) {
+                Some(state) if state.configured_markets.iter().any(|x| x == ticker) => {
+                    "SUBSCRIBED_TICKER"
+                }
+                Some(_) => "UNSUBSCRIBED_TICKER",
+                None => "UNKNOWN_SUBSCRIPTION",
+            },
+            (None, Some(_)) => "MISSING_SUBSCRIPTION_ID",
+        };
         let raw_hash = hash_bytes(
             serde_json::to_string(&message)
                 .unwrap_or_default()
@@ -685,7 +700,8 @@ impl WebsocketEngine {
             "websocket_raw",
             &kind,
             ticker.as_deref(),
-            json!({"raw":message,"session_id":self.session,"received_utc":observed}),
+            json!({"raw":message,"session_id":self.session,"received_utc":observed,
+                "collector":{"subscription_membership":membership}}),
             Some(key),
         );
         original.exchange_ts = msg.get("ts").and_then(Value::as_str).map(str::to_string);
@@ -724,6 +740,26 @@ impl WebsocketEngine {
             }
         }
         if let Some(ticker_name) = ticker {
+            if membership == "UNSUBSCRIBED_TICKER" {
+                out[0].payload["collector"]["book_processing"] =
+                    json!("NOT_APPLIED_UNSUBSCRIBED_TICKER");
+                out.push(Event::new(
+                    "websocket_health",
+                    "unsubscribed_market_frame",
+                    Some(&ticker_name),
+                    json!({"session_id":self.session,"sid":sid,"seq":seq,
+                        "frame_kind":kind,"subscription_membership":membership,
+                        "raw_frame_preserved":true}),
+                    Some(format!(
+                        "ws-unsubscribed|{}|{}|{}|{}",
+                        self.session,
+                        sid.unwrap_or(-1),
+                        seq.unwrap_or(-1),
+                        raw_hash
+                    )),
+                ));
+                return out;
+            }
             if kind == "orderbook_snapshot" {
                 let snapshot_result = self
                     .books
@@ -732,6 +768,8 @@ impl WebsocketEngine {
                     .snapshot(&msg);
                 match snapshot_result {
                     Ok(()) => {
+                        out[0].payload["collector"]["book_processing"] =
+                            json!("SNAPSHOT_SYNCHRONIZED");
                         out.push(Event::new("websocket_health","book_synchronized",
                             Some(&ticker_name),
                             json!({"session_id":self.session,"sid":sid,"seq":seq,
@@ -757,6 +795,7 @@ impl WebsocketEngine {
                         }
                     }
                     Err(error) => {
+                        out[0].payload["collector"]["book_processing"] = json!("SNAPSHOT_REJECTED");
                         out.push(Event::new(
                             "websocket_health",
                             "invalid_snapshot",
@@ -771,6 +810,7 @@ impl WebsocketEngine {
                 let book = self.books.entry(ticker_name.clone()).or_default();
                 if let Err(error) = book.delta(&msg) {
                     book.invalidate(format!("delta rejected: {error}"));
+                    out[0].payload["collector"]["book_processing"] = json!("DELTA_REJECTED");
                     out.push(Event::new(
                         "websocket_health",
                         "delta_not_applied",
@@ -779,6 +819,8 @@ impl WebsocketEngine {
                             "state":"UNSYNCHRONIZED","observed_utc":observed}),
                         Some(format!("ws-delta-rejected|{}|{}", self.session, raw_hash)),
                     ));
+                } else {
+                    out[0].payload["collector"]["book_processing"] = json!("DELTA_APPLIED");
                 }
             }
         }
@@ -909,6 +951,44 @@ mod tests {
         assert!(ws.book("A").unwrap().synchronized());
         assert!(!ws.book("B").unwrap().synchronized());
     }
+
+    #[test]
+    fn configured_subscription_membership_preserves_unsubscribed_raw_frames_without_applying() {
+        let mut ws = WebsocketEngine::with_session("membership-session");
+        ws.register_orderbook_subscription(17, &["SUBSCRIBED".to_owned()]);
+
+        let subscribed = ws.handle(json!({"type":"orderbook_snapshot","sid":17,"seq":9,
+            "msg":{"market_ticker":"SUBSCRIBED","yes_dollars_fp":[]}}));
+        assert_eq!(
+            subscribed[0].payload["collector"]["subscription_membership"],
+            "SUBSCRIBED_TICKER"
+        );
+        assert_eq!(
+            subscribed[0].payload["collector"]["book_processing"],
+            "SNAPSHOT_SYNCHRONIZED"
+        );
+
+        let unexpected = ws.handle(json!({"type":"orderbook_delta","sid":17,"seq":10,
+            "msg":{"market_ticker":"UNSUBSCRIBED","side":"yes",
+                "price_dollars":"0.5","delta_fp":"1"}}));
+        assert_eq!(unexpected[0].channel, "websocket_raw");
+        assert_eq!(
+            unexpected[0].payload["raw"]["msg"]["market_ticker"],
+            "UNSUBSCRIBED"
+        );
+        assert_eq!(
+            unexpected[0].payload["collector"]["subscription_membership"],
+            "UNSUBSCRIBED_TICKER"
+        );
+        assert_eq!(
+            unexpected[0].payload["collector"]["book_processing"],
+            "NOT_APPLIED_UNSUBSCRIBED_TICKER"
+        );
+        assert_eq!(unexpected[1].kind, "unsubscribed_market_frame");
+        assert!(ws.book("UNSUBSCRIBED").is_none());
+        assert!(ws.book("SUBSCRIBED").unwrap().synchronized());
+    }
+
     #[test]
     fn session_reset_changes_raw_dedupe_identity() {
         let input = json!({"type":"trade","sid":2,"seq":2,"msg":{"market_ticker":"T"}});

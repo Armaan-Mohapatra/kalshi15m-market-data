@@ -3,7 +3,7 @@ use crate::event::{hash_bytes, utc_now, Event};
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -29,18 +29,36 @@ pub struct Stats {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct MarketArchiveSummary {
     pub websocket_events: u64,
+    pub raw_frames: u64,
+    pub orderbook_delta_frames: u64,
     pub orderbook_deltas: u64,
     pub sequence_gaps: u64,
     pub latest_event_received_utc: Option<String>,
+    pub latest_delta_received_utc: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SubscriptionArchiveSummary {
+    pub session_id: String,
+    pub sid: i64,
+    pub raw_frames: u64,
+    pub orderbook_delta_frames: u64,
+    pub sequence_gaps: u64,
+    pub latest_frame_received_utc: Option<String>,
+    pub latest_delta_received_utc: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ArchiveFlushSummary {
     pub rows: usize,
     pub websocket_events: u64,
+    pub websocket_raw_frames: u64,
+    pub orderbook_delta_frames: u64,
     pub orderbook_deltas: u64,
     pub sequence_gaps: u64,
+    pub latest_delta_received_utc: Option<String>,
     pub by_market: BTreeMap<String, MarketArchiveSummary>,
+    pub by_subscription: BTreeMap<String, SubscriptionArchiveSummary>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -450,10 +468,38 @@ impl Journal {
                 if row.kind == "sequence_gap" {
                     summary.sequence_gaps += 1;
                 }
+                let is_raw_frame = row.channel == "websocket_raw";
+                let is_delta_frame = is_raw_frame && row.kind == "orderbook_delta";
+                if is_raw_frame {
+                    summary.websocket_raw_frames += 1;
+                }
+                if is_delta_frame {
+                    summary.orderbook_delta_frames += 1;
+                    if summary
+                        .latest_delta_received_utc
+                        .as_ref()
+                        .is_none_or(|latest| row.received_utc > *latest)
+                    {
+                        summary.latest_delta_received_utc = Some(row.received_utc.clone());
+                    }
+                }
                 if let Some(market) = market {
                     market.websocket_events += 1;
+                    if is_raw_frame {
+                        market.raw_frames += 1;
+                    }
+                    if is_delta_frame {
+                        market.orderbook_delta_frames += 1;
+                    }
                     if row.kind == "orderbook_delta" {
                         market.orderbook_deltas += 1;
+                        if market
+                            .latest_delta_received_utc
+                            .as_ref()
+                            .is_none_or(|latest| row.received_utc > *latest)
+                        {
+                            market.latest_delta_received_utc = Some(row.received_utc.clone());
+                        }
                     }
                     if row.kind == "sequence_gap" {
                         market.sequence_gaps += 1;
@@ -466,9 +512,54 @@ impl Journal {
                         market.latest_event_received_utc = Some(row.received_utc.clone());
                     }
                 }
+                if let Some((session_id, sid)) = archive_subscription_identity(row) {
+                    let key = format!("{session_id}:{sid}");
+                    let subscription = summary.by_subscription.entry(key).or_insert_with(|| {
+                        SubscriptionArchiveSummary {
+                            session_id,
+                            sid,
+                            ..SubscriptionArchiveSummary::default()
+                        }
+                    });
+                    if is_raw_frame {
+                        subscription.raw_frames += 1;
+                        if subscription
+                            .latest_frame_received_utc
+                            .as_ref()
+                            .is_none_or(|latest| row.received_utc > *latest)
+                        {
+                            subscription.latest_frame_received_utc = Some(row.received_utc.clone());
+                        }
+                    }
+                    if is_delta_frame {
+                        subscription.orderbook_delta_frames += 1;
+                        if subscription
+                            .latest_delta_received_utc
+                            .as_ref()
+                            .is_none_or(|latest| row.received_utc > *latest)
+                        {
+                            subscription.latest_delta_received_utc = Some(row.received_utc.clone());
+                        }
+                    }
+                    if row.kind == "sequence_gap" {
+                        subscription.sequence_gaps += 1;
+                    }
+                }
             }
         }
         Ok(summary)
+    }
+
+    fn archive_subscription_identity(row: &ArchiveRow) -> Option<(String, i64)> {
+        let payload: Value = serde_json::from_str(&row.raw_json).ok()?;
+        let session_id = payload.get("session_id")?.as_str()?.to_owned();
+        let sid = payload.get("sid").and_then(Value::as_i64).or_else(|| {
+            let raw = payload.get("raw")?;
+            raw.get("sid")
+                .and_then(Value::as_i64)
+                .or_else(|| raw.get("msg")?.get("sid")?.as_i64())
+        })?;
+        Some((session_id, sid))
     }
 
     fn revoke_archive_part(&mut self, name: &str, reason: &str) -> Result<()> {
@@ -929,6 +1020,14 @@ mod tests {
                 Some("archive-health-gap".into()),
             ),
             Event::new(
+                "websocket_raw",
+                "orderbook_delta",
+                Some("KXBTC15M-ARCHIVE-HEALTH"),
+                json!({"session_id":"mock-session","raw":{"sid":7,"seq":11,
+                    "msg":{"market_ticker":"KXBTC15M-ARCHIVE-HEALTH"}}}),
+                Some("archive-health-raw-delta".into()),
+            ),
+            Event::new(
                 "rest",
                 "trade",
                 Some("KXBTC15M-ARCHIVE-HEALTH"),
@@ -941,15 +1040,22 @@ mod tests {
         }
 
         let summary = journal.flush_archive_with_summary(10).unwrap();
-        assert_eq!(summary.rows, 4);
-        assert_eq!(summary.websocket_events, 3);
-        assert_eq!(summary.orderbook_deltas, 1);
+        assert_eq!(summary.rows, 5);
+        assert_eq!(summary.websocket_events, 4);
+        assert_eq!(summary.websocket_raw_frames, 1);
+        assert_eq!(summary.orderbook_delta_frames, 1);
+        assert_eq!(summary.orderbook_deltas, 2);
         assert_eq!(summary.sequence_gaps, 1);
         let market = &summary.by_market["KXBTC15M-ARCHIVE-HEALTH"];
-        assert_eq!(market.websocket_events, 3);
-        assert_eq!(market.orderbook_deltas, 1);
+        assert_eq!(market.websocket_events, 4);
+        assert_eq!(market.raw_frames, 1);
+        assert_eq!(market.orderbook_delta_frames, 1);
+        assert_eq!(market.orderbook_deltas, 2);
         assert_eq!(market.sequence_gaps, 1);
         assert!(market.latest_event_received_utc.is_some());
+        let subscription = &summary.by_subscription["mock-session:7"];
+        assert_eq!(subscription.raw_frames, 1);
+        assert_eq!(subscription.orderbook_delta_frames, 1);
         assert_eq!(journal.unarchived_count().unwrap(), 0);
         assert!(journal.verify_archive().unwrap());
         journal.close().unwrap();
