@@ -537,7 +537,6 @@ mod tests {
             "C:\\stage",
             "run-continuous",
             "--allow-network",
-            "true",
         ])
         .unwrap();
         assert!(matches!(
