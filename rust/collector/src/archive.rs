@@ -276,7 +276,7 @@ mod tests {
             payload_sha256: "hash".into(),
             raw_json: r#"{"price":"0.5"}"#.into(),
         };
-        let part = write_part(temp.path(), &[item.clone()]).unwrap();
+        let part = write_part(temp.path(), std::slice::from_ref(&item)).unwrap();
         let path = temp.path().join(part.path);
         assert_eq!(read_part(&path).unwrap(), vec![item]);
         assert_eq!(hash_file(&path).unwrap(), part.sha256);

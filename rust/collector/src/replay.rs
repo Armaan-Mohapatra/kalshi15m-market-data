@@ -315,9 +315,7 @@ mod tests {
         let stats = replay_file(&mut journal, &input, 2).unwrap();
         assert_eq!(stats.lines, 3);
         assert_eq!(stats.ws_gap_events, 1);
-        assert!(
-            journal.verify_archive().unwrap() == false || journal.unarchived_count().unwrap() <= 2
-        );
+        assert!(!journal.verify_archive().unwrap() || journal.unarchived_count().unwrap() <= 2);
         let first_count: i64 = journal
             .conn
             .query_row("SELECT COUNT(*) FROM market_events", [], |row| row.get(0))

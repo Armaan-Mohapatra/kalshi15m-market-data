@@ -209,7 +209,7 @@ mod tests {
         let a = json!({"ticker":"X","status":"open","open_time":"2026-11-07T00:00:00Z",
             "close_time":"2026-11-07T00:15:00Z","floor_strike":100});
         let mut d = Discovery::default();
-        d.add_rows(&[a.clone()], now);
+        d.add_rows(std::slice::from_ref(&a), now);
         let mut changed = a;
         changed["floor_strike"] = json!(101);
         let events = d.add_rows(&[changed], now);
