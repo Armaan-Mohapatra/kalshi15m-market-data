@@ -307,7 +307,13 @@ class Storage:
             "storage_latest_market_event_received_utc": self.latest_market_event_received_utc,
             **disk_audit,
             "sqlite_bytes": self.sqlite_bytes,
+            "sqlite_growth_warning": self.sqlite_bytes >= 8 * 1024**3,
             "parquet_bytes": self.parquet_bytes,
+            "events_key_conflict": self.events_key_conflict,
+            "events_quarantined": self.events_quarantined,
+            "archive_corrupt_part_count": len(self.corrupt_parquet_parts),
+            "archive_corrupt_part_paths": [Path(path).name for path in self.corrupt_parquet_parts[:20]],
+            "archive_orphaned_partial_count": self.orphaned_partial_parts,
             "parquet_buffered_rows": len(self.parquet_buffer),
             "parquet_buffer_estimated_bytes": self.parquet_buffer_bytes_estimate,
             "parquet_flush_count": self.parquet_flush_count,
@@ -557,9 +563,59 @@ class Storage:
                 continue
         return total
 
+    def verify_archive_manifest(self) -> bool:
+        """Bounded-memory, full-file integrity check before marking a clean shutdown.
+
+        The existing journal remains canonical. A verified marker is only
+        committed if *all* event versions are represented in archive manifests,
+        and every referenced archive part has the expected size and hash.
+        """
+        if self.connection is None:
+            return False
+        if (
+            self.parquet_buffer or not self.raw_capture_enabled
+            or self.parquet_dropped_rows > 0
+            or self.corrupt_parquet_parts or self.orphaned_partial_parts > 0
+        ):
+            return False
+        expected = int(self.connection.execute(
+            "SELECT COUNT(*) FROM market_events"
+        ).fetchone()[0])
+        expected += int(self.connection.execute(
+            "SELECT COUNT(*) FROM market_event_versions"
+        ).fetchone()[0])
+        manifest_rows = self.connection.execute(
+            "SELECT part_path, row_count, byte_count, sha256 FROM archive_manifests"
+        ).fetchall()
+        if sum(int(row[1]) for row in manifest_rows) != expected:
+            return False
+        for name, _count, byte_count, checksum in manifest_rows:
+            path = self.cfg.parquet_dir / str(name)
+            try:
+                if not path.is_file() or path.stat().st_size != int(byte_count):
+                    return False
+                digest = hashlib.sha256()
+                with path.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                if digest.hexdigest() != checksum:
+                    return False
+            except OSError:
+                return False
+        return True
+
     def close(self) -> None:
         self.flush_parquet(reason="SHUTDOWN")
         if self.connection is not None:
+            verified = self.verify_archive_manifest()
+            self.connection.execute(
+                "INSERT OR REPLACE INTO collector_markers VALUES (?, ?, ?)",
+                (
+                    "archive_shutdown",
+                    "CLEAN_ARCHIVE_VERIFIED" if verified else "CLOSED_WITH_ARCHIVE_UNVERIFIED",
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
             self.connection.commit()
             self.connection.close()
             self.connection = None
