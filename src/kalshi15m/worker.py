@@ -8,6 +8,8 @@ import os
 import shutil
 import threading
 import time
+import uuid
+import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -427,6 +429,13 @@ def status_server(status: RuntimeStatus, cfg: Settings) -> ThreadingHTTPServer:
 class Collector:
     def __init__(self, cfg: Settings = settings) -> None:
         self.cfg = cfg
+        self.run_id = uuid.uuid4().hex
+        self.websocket_session_id: str | None = None
+        self.first_seen_tickers: set[str] = set()
+        self.first_rest_books: set[str] = set()
+        self.first_executable_quotes: set[str] = set()
+        self.first_trades: set[str] = set()
+        self.trade_poll_since_by_ticker: dict[str, int] = {}
         self.api = PublicKalshiAPI()
         self.status = RuntimeStatus(cfg)
         self.storage = Storage(cfg)
@@ -811,7 +820,7 @@ class Collector:
             while True:
                 try:
                     await loop.run_in_executor(
-                        self.writer_pool, self.storage.append_batch, batch
+                        self.writer_pool, self.storage.append_batch_resilient, batch
                     )
                     break
                 except Exception as exc:
@@ -857,6 +866,8 @@ class Collector:
                 queue_depth=self.queue.qsize(),
                 events_inserted=self.storage.events_inserted,
                 events_duplicate=self.storage.events_duplicate,
+                events_key_conflict=self.storage.events_key_conflict,
+                events_quarantined=self.storage.events_quarantined,
                 raw_capture_state="ENABLED" if self.storage.raw_capture_enabled else "THROTTLED_BUDGET",
                 **storage_status,
             )
@@ -1205,13 +1216,37 @@ class Collector:
             )
             for market in market_rows_to_emit:
                 ticker = str(market.get("ticker", ""))
+                if ticker and ticker not in self.first_seen_tickers:
+                    self.first_seen_tickers.add(ticker)
+                    await self.emit(
+                        "rest_reconciliation",
+                        "market_first_seen",
+                        {
+                            "ticker": ticker,
+                            "scheduled_open_utc": market.get("open_time"),
+                            "first_seen_utc": utc_now(),
+                            "run_id": self.run_id,
+                            "first_seen_is_api_response_time": False,
+                            "limitation": "observed after inventory pass; may lag first HTTP response",
+                        },
+                        ticker,
+                        dedupe_key=f"market-first-seen|{ticker}",
+                    )
                 await self.emit(
                     "rest_reconciliation",
                     "market_metadata",
                     market,
                     ticker,
                     market.get("updated_time"),
-                    f"market-meta|{ticker}|{market.get('market_status')}|{market.get('open_time')}|{market.get('close_time')}|{market.get('yes_bid_dollars')}|{market.get('no_bid_dollars')}",
+                    "market-meta|" + ticker + "|" + hashlib.sha256(
+                        json.dumps(
+                            market.get("market_api_raw") or market,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            ensure_ascii=False,
+                            default=str,
+                        ).encode("utf-8")
+                    ).hexdigest(),
                 )
             await self.emit(
                 "rest_reconciliation",
@@ -1223,7 +1258,7 @@ class Collector:
                     "active_15m_market_rows": snapshot["active_15m_market_rows"],
                     "market_event_rows": snapshot["market_event_rows"],
                 },
-                dedupe_key=f"inventory|{snapshot['snapshot_utc']}",
+                dedupe_key=f"inventory-observed|{self.run_id}|{utc_now()}",
             )
             if self.paper_positions:
                 await self.settle_paper_positions()
@@ -2548,6 +2583,13 @@ class Collector:
                         reconnect_count=self.status.data.get("reconnect_count", 0) + 1,
                     )
                     reconnect_delay = 1.0
+                    self.websocket_session_id = uuid.uuid4().hex
+                    await self.emit(
+                        "websocket",
+                        "ws_session_started",
+                        {"session_id": self.websocket_session_id, "run_id": self.run_id},
+                        dedupe_key=f"ws-session-start|{self.websocket_session_id}",
+                    )
                     self._reset_websocket_subscriptions()
                     self.orderbook_sequence_by_sid.clear()
                     self._publish_orderbook_sequence_state(connected=True)
@@ -2602,6 +2644,13 @@ class Collector:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                if self.websocket_session_id:
+                    await self.emit(
+                        "websocket",
+                        "ws_session_interrupted",
+                        {"session_id": self.websocket_session_id, "reason": type(exc).__name__},
+                        dedupe_key=f"ws-session-interrupted|{self.websocket_session_id}",
+                    )
                 self._invalidate_websocket_books()
                 self.status.update(
                     websocket_state="RECONNECTING",
@@ -2611,6 +2660,7 @@ class Collector:
                 LOG.warning("WebSocket disconnected: %s", type(exc).__name__)
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(30.0, reconnect_delay * 2)
+        self.websocket_session_id = None
         self.status.update(websocket_state="STOPPED")
 
     def _invalidate_websocket_books(self) -> None:
@@ -2952,7 +3002,7 @@ class Collector:
                         {"sid": sid, "prior_seq": prior, "current_seq": seq, "market_ticker": ticker},
                         str(ticker),
                         exchange_ts,
-                        f"snapshot-gap|{sid}|{prior}|{seq}",
+                        f"snapshot-gap|{self.websocket_session_id}|{sid}|{prior}|{seq}",
                     )
                     await ws.close(code=1011, reason="snapshot missing sequence metadata")
                     return
@@ -2969,7 +3019,7 @@ class Collector:
                         {"raw": outer, "synchronized": book.synchronized, "executable_quotes": book.quotes()},
                         str(ticker),
                         exchange_ts,
-                        f"ws|{sid}|{seq}",
+                        f"ws|{self.websocket_session_id}|{channel}|{sid}|{seq}",
                     )
             elif kind == "orderbook_delta" and ticker:
                 prior = self.last_seq.get(sid) if isinstance(sid, int) else None
@@ -2996,7 +3046,7 @@ class Collector:
                         {"sid": sid, "prior_seq": prior, "current_seq": seq, "market_ticker": ticker},
                         str(ticker),
                         exchange_ts,
-                        f"gap|{sid}|{prior}|{seq}",
+                        f"gap|{self.websocket_session_id}|{sid}|{prior}|{seq}",
                     )
                     await ws.close(code=1011, reason="sequence invalid; reconnect for fresh snapshots")
                     return
@@ -3042,7 +3092,7 @@ class Collector:
                     },
                     str(ticker),
                     exchange_ts,
-                    f"ws|{sid}|{seq}" if sid is not None and seq is not None else None,
+                    f"ws|{self.websocket_session_id}|{channel}|{sid}|{seq}" if sid is not None and seq is not None else None,
                 )
             else:
                 await self.emit(
@@ -3051,7 +3101,7 @@ class Collector:
                     outer,
                     str(ticker) if ticker else None,
                     exchange_ts,
-                    f"ws|{sid}|{seq}" if sid is not None and seq is not None else None,
+                    f"ws|{self.websocket_session_id}|{channel}|{sid}|{seq}" if sid is not None and seq is not None else None,
                 )
             self.status.mark_channel(channel, exchange_ts)
             if kind == "trade":
