@@ -15,6 +15,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::path::Path;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -88,14 +89,21 @@ pub struct TradeBatch {
 /// Mockable interface for all exchange reads. Implementations must be
 /// read-only and must return raw market metadata without dropping fields.
 pub trait ExchangeSource: Send + Sync {
-    async fn discover(&self, series: &[String], max_pages: usize) -> Result<InventoryBatch>;
-    async fn orderbook(&self, ticker: &str) -> Result<Option<Response>>;
-    async fn trades(
-        &self,
-        ticker: &str,
+    fn discover<'a>(
+        &'a self,
+        series: &'a [String],
+        max_pages: usize,
+    ) -> impl Future<Output = Result<InventoryBatch>> + Send + 'a;
+    fn orderbook<'a>(
+        &'a self,
+        ticker: &'a str,
+    ) -> impl Future<Output = Result<Option<Response>>> + Send + 'a;
+    fn trades<'a>(
+        &'a self,
+        ticker: &'a str,
         since: DateTime<Utc>,
         max_pages: usize,
-    ) -> Result<TradeBatch>;
+    ) -> impl Future<Output = Result<TradeBatch>> + Send + 'a;
 }
 
 /// Public REST source. Construction is denied unless the caller passes the
