@@ -223,6 +223,10 @@ class RuntimeStatus:
             "crossmarket_performance_by_market": {},
             "error_count": 0,
             "last_error": None,
+            "websocket_delta_received_count": 0,
+            "websocket_delta_filtered_out_of_scope_count": 0,
+            "websocket_delta_enqueued_count": 0,
+            "websocket_delta_last_enqueued_utc": None,
             "storage_write_state": "NOT_OPEN",
             "storage_write_retry_count": 0,
             "storage_pending_batch_events": 0,
@@ -517,6 +521,9 @@ class Collector:
         self.subscribed_tickers: set[str] = set()
         self.books: dict[str, OrderBook] = {}
         self.last_seq: dict[int, int] = {}
+        self.ws_delta_received_count = 0
+        self.ws_delta_filtered_out_of_scope_count = 0
+        self.ws_delta_enqueued_count = 0
         self.orderbook_sequence_by_sid: dict[int, dict[str, Any]] = {}
         self.orderbook_sequence_last_verified_utc: str | None = None
         self.book_received_monotonic: dict[str, float] = {}
@@ -3369,6 +3376,11 @@ class Collector:
                         f"ws|{self.websocket_session_id}|{channel}|{sid}|{seq}",
                     )
             elif kind == "orderbook_delta" and ticker:
+                # Subscription sequence progress is not durable archive
+                # evidence. Count observed, filtered and queue-accepted
+                # deltas separately to diagnose stale finalized partitions.
+                self.ws_delta_received_count += 1
+                self.status.update(websocket_delta_received_count=self.ws_delta_received_count)
                 prior = self.last_seq.get(sid) if isinstance(sid, int) else None
                 if (
                     not isinstance(sid, int)
@@ -3399,7 +3411,16 @@ class Collector:
                     return
                 self.last_seq[sid] = seq
                 if str(ticker) not in self.open_tickers:
+                    self.ws_delta_filtered_out_of_scope_count += 1
                     self._record_orderbook_sequence(sid, seq, snapshot=False)
+                    self.status.update(
+                        websocket_delta_filtered_out_of_scope_count=(
+                            self.ws_delta_filtered_out_of_scope_count
+                        ),
+                    )
+                    # Even intentionally filtered frames are WSS-received.
+                    # Mark receipt separately from event enqueue/durability.
+                    self.status.mark_channel(channel, exchange_ts)
                     continue
                 book = self.books.setdefault(str(ticker), OrderBook())
                 if not book.synchronized:
@@ -3440,6 +3461,11 @@ class Collector:
                     str(ticker),
                     exchange_ts,
                     f"ws|{self.websocket_session_id}|{channel}|{sid}|{seq}" if sid is not None and seq is not None else None,
+                )
+                self.ws_delta_enqueued_count += 1
+                self.status.update(
+                    websocket_delta_enqueued_count=self.ws_delta_enqueued_count,
+                    websocket_delta_last_enqueued_utc=received_wall,
                 )
             else:
                 await self.emit(
