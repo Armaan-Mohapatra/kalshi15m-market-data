@@ -725,6 +725,28 @@ mod tests {
     }
 
     #[test]
+    fn critical_capacity_snapshot_is_reported_without_losing_journaled_data() {
+        let home = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(home.path()).unwrap();
+        let event = Event::new(
+            "websocket_orderbook",
+            "orderbook_delta",
+            Some("KXBTC15M-LOW-CAPACITY-MOCK"),
+            json!({"seq":32}),
+            Some("low-capacity-snapshot-mock".into()),
+        );
+        assert_eq!(journal.ingest(&event).unwrap(), IngestResult::Inserted);
+
+        let snapshot = journal
+            .capacity_snapshot_with_probe(|_| Ok(256 * 1024 * 1024))
+            .unwrap();
+        assert_eq!(snapshot.capacity_state, "CRITICAL_DISK_PRESSURE");
+        assert!(snapshot.sqlite_bytes > 0);
+        assert_eq!(journal.audit().unwrap()["canonical_events"], 1);
+        journal.close().unwrap();
+    }
+
+    #[test]
     fn readonly_audit_preserves_clean_marker_and_does_not_replay_spool() {
         let home = tempfile::tempdir().unwrap();
         let mut writer = Journal::open(home.path()).unwrap();
