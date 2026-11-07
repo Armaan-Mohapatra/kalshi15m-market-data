@@ -372,7 +372,11 @@ class Storage:
             disk_paper_rowid = int(latest_paper[0]) if latest_paper else None
             disk_event = str(latest_event[1]) if latest_event else None
             disk_paper = str(latest_paper[1]) if latest_paper else None
-            self.parquet_bytes = self._parquet_directory_size()
+            # Do not recursively stat every Parquet part from the 15-second
+            # SQLite watermark audit. The writer already accounts for the
+            # exact byte size of each newly manifest-committed part. Archive
+            # tree reconciliation is performed at startup/recovery, not on
+            # the latency-sensitive ingest path.
             self.persistence_audit_cache = {
                 "storage_latest_disk_market_event_rowid": disk_event_rowid,
                 "storage_latest_disk_paper_record_rowid": disk_paper_rowid,
@@ -761,9 +765,11 @@ class Storage:
             return self.flush_parquet(reason="RAW_CAPTURE_DISABLED")
         rows = self.parquet_buffer
         self._write_partitioned_parquet(rows)
-        # Reconcile after every flush so budget checks/status include any
-        # archive files created while this worker was running.
-        self.parquet_bytes = self._parquet_directory_size()
+        # _write_partitioned_parquet records each part's exact size after
+        # committing its manifest. Rewalking the entire archive here causes
+        # work proportional to *all historic files* on every small flush.
+        # This process is the sole archive writer; start/recovery establish
+        # the initial on-disk size, and subsequent writes update it exactly.
         self.parquet_buffer = []
         self.parquet_buffer_bytes_estimate = 0
         self.parquet_buffer_started_monotonic = None
