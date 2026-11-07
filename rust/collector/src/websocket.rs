@@ -690,7 +690,7 @@ mod tests {
                 let (stream, _) =
                     tokio::time::timeout(Duration::from_secs(3), listener.accept()).await??;
                 let captured = server_headers.clone();
-                let (mut socket, _) = tokio_tungstenite::accept_hdr_async(
+                let mut socket = tokio_tungstenite::accept_hdr_async(
                     stream,
                     move |request: &Request, response: Response| {
                         let header = |name: &str| {
