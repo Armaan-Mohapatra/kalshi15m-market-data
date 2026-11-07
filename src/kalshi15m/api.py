@@ -4,6 +4,7 @@ import asyncio
 import heapq
 import json
 import time
+from email.utils import parsedate_to_datetime
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -19,6 +20,14 @@ class PaginationLimitExceeded(RuntimeError):
         self.cursor = cursor
         self.pages = pages
         super().__init__(f"Pagination exceeded configured maximum of {pages} pages")
+
+
+class ObservedPayload(dict):
+    """Dict-compatible REST response with independent HTTP timing evidence."""
+
+    def __init__(self, data: dict[str, Any], metadata: dict[str, Any]) -> None:
+        super().__init__(data)
+        self.response_metadata = metadata
 
 
 class PublicKalshiAPI:
@@ -132,16 +141,37 @@ class PublicKalshiAPI:
             method="GET",
             headers={"Accept": "application/json", "User-Agent": "kalshi-15m-native/0.1"},
         )
+        request_sent_utc = datetime.now(timezone.utc)
         with urllib.request.urlopen(request, timeout=25) as response:
             if response.status != 200:
                 raise RuntimeError(f"Kalshi GET returned HTTP {response.status}")
+            date_header = response.headers.get("Date")
             raw = response.read(settings.max_response_bytes + 1)
             if len(raw) > settings.max_response_bytes:
                 raise RuntimeError("Kalshi response exceeded configured 64 MiB limit")
+        response_received_utc = datetime.now(timezone.utc)
         payload = json.loads(raw)
         if not isinstance(payload, dict):
             raise RuntimeError("Kalshi response was not a JSON object")
-        return payload
+        offset = None
+        if date_header:
+            try:
+                server_date = parsedate_to_datetime(date_header)
+                if server_date.tzinfo is not None:
+                    midpoint = request_sent_utc + (response_received_utc - request_sent_utc) / 2
+                    offset = round((server_date - midpoint).total_seconds(), 3)
+            except (TypeError, ValueError, OverflowError):
+                pass
+        return ObservedPayload(payload, {
+            "request_sent_utc": request_sent_utc.isoformat(),
+            "response_received_utc": response_received_utc.isoformat(),
+            "http_status": 200,
+            "server_date_header": date_header,
+            "server_date_offset_approx_seconds": offset,
+            "server_date_offset_quality": (
+                "COARSE_HTTP_DATE_DIAGNOSTIC" if offset is not None else "NOT_MEASURED"
+            ),
+        })
 
     async def get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         self.requests += 1
