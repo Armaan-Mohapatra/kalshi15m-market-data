@@ -119,6 +119,22 @@ class StorageReliabilityTests(unittest.TestCase):
             self.assertEqual(reopened.parquet_recovery_state, "RECOVERED_MISSING_ROWS")
             reopened.close()
 
+    def test_emergency_spool_replays_idempotently_after_storage_recovers(self):
+        with TemporaryDirectory() as directory:
+            cfg = Settings(home=Path(directory), min_free_bytes=0)
+            store = Storage(cfg)
+            store.open()
+            event_payload = event("spooled-event", {"id": 7})
+            original = store.spool_batch([event_payload])
+            self.assertTrue(original.exists())
+            self.assertEqual(store.replay_spooled_batches(), 1)
+            self.assertFalse(original.exists())
+            self.assertEqual(store.replay_spooled_batches(), 0)
+            self.assertEqual(store.connection.execute(
+                "SELECT COUNT(*) FROM market_events WHERE dedupe_key = 'spooled-event'"
+            ).fetchone()[0], 1)
+            store.close()
+
     def test_corrupt_parquet_is_reported_without_deleting_source(self):
         with TemporaryDirectory() as directory:
             cfg = Settings(home=Path(directory), min_free_bytes=0)
@@ -266,6 +282,23 @@ class CaptureReliabilityTests(unittest.TestCase):
 
 
 class ApiReliabilityTests(unittest.TestCase):
+    def test_public_http_date_metadata_is_diagnostic_only(self):
+        class Response:
+            status = 200
+            headers = {"Date": "Sat, 07 Nov 2026 12:00:00 GMT"}
+            def __enter__(self):
+                return self
+            def __exit__(self, *_args):
+                return False
+            def read(self, _limit):
+                return b'{"markets":[]}'
+        with patch("kalshi15m.api.urllib.request.urlopen", return_value=Response()):
+            api = PublicKalshiAPI(min_interval=0)
+            result = api._get_sync("/markets", None)
+        self.assertEqual(result["markets"], [])
+        self.assertEqual(result.response_metadata["server_date_header"], Response.headers["Date"])
+        self.assertEqual(result.response_metadata["server_date_offset_quality"], "COARSE_HTTP_DATE_DIAGNOSTIC")
+
     def test_http_503_get_is_retried_but_not_trading(self):
         api = PublicKalshiAPI(min_interval=0)
         transient = urllib.error.HTTPError(
