@@ -953,7 +953,7 @@ mod tests {
     #[tokio::test]
     async fn fixture_frames_detect_gap_and_resynchronize_only_on_snapshot() {
         let mut engine = WebsocketEngine::with_session("recorded-connection");
-        let (tx, mut rx) = mpsc::channel(32);
+        let (tx, mut rx) = mpsc::channel::<Event>(32);
         assert!(process_text_frame(
             &mut engine,
             r#"{"type":"orderbook_snapshot","sid":3,"seq":17,"msg":{"market_ticker":"KXBTC15M-A","yes_dollars_fp":[]}}"#,
