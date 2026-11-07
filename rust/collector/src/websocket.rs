@@ -95,6 +95,70 @@ fn malformed_frame_event(
     )
 }
 
+fn subscription_command(market_tickers: &[String]) -> Value {
+    json!({
+        "id":1,
+        "cmd":"subscribe",
+        "params":{"channels":["orderbook_delta","trade"],"market_tickers":market_tickers}
+    })
+}
+
+async fn process_text_frame(
+    engine: &mut WebsocketEngine,
+    raw: &str,
+    events: &mpsc::Sender<Event>,
+) -> Result<()> {
+    let mut parsed: Value = match serde_json::from_str(raw) {
+        Ok(value) => value,
+        Err(error) => {
+            let event = malformed_frame_event(engine, raw.as_bytes(), "utf8", &error.to_string());
+            events
+                .send(event)
+                .await
+                .map_err(|_| anyhow!("WebSocket event receiver closed"))?;
+            return Err(error).context("invalid WebSocket JSON frame");
+        }
+    };
+    if let Some(object) = parsed.as_object_mut() {
+        object.insert("_collector_received_utc".into(), json!(utc_now()));
+    }
+    for event in engine.handle(parsed) {
+        events
+            .send(event)
+            .await
+            .map_err(|_| anyhow!("WebSocket event receiver closed"))?;
+    }
+    Ok(())
+}
+
+async fn process_binary_frame(
+    engine: &mut WebsocketEngine,
+    raw: &[u8],
+    events: &mpsc::Sender<Event>,
+) -> Result<()> {
+    let mut parsed: Value = match serde_json::from_slice(raw) {
+        Ok(value) => value,
+        Err(error) => {
+            let event = malformed_frame_event(engine, raw, "binary", &error.to_string());
+            events
+                .send(event)
+                .await
+                .map_err(|_| anyhow!("WebSocket event receiver closed"))?;
+            return Err(error).context("invalid binary WebSocket JSON frame");
+        }
+    };
+    if let Some(object) = parsed.as_object_mut() {
+        object.insert("_collector_received_utc".into(), json!(utc_now()));
+    }
+    for event in engine.handle(parsed) {
+        events
+            .send(event)
+            .await
+            .map_err(|_| anyhow!("WebSocket event receiver closed"))?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 pub struct WebSocketConfigStage {
     pub url: String,
@@ -228,11 +292,7 @@ impl AuthenticatedWebSocket {
         .await
         .context("WebSocket handshake timeout")?
         .context("authenticated Kalshi WebSocket handshake failed")?;
-        let subscription = json!({
-            "id":1,
-            "cmd":"subscribe",
-            "params":{"channels":["orderbook_delta","trade"],"market_tickers":self.config.market_tickers}
-        });
+        let subscription = subscription_command(&self.config.market_tickers);
         socket
             .send(Message::Text(subscription.to_string().into()))
             .await?;
@@ -246,36 +306,10 @@ impl AuthenticatedWebSocket {
                 }
                 next = socket.next() => match next {
                     Some(Ok(Message::Text(raw))) => {
-                        let mut parsed: Value = match serde_json::from_str(&raw) {
-                            Ok(value) => value,
-                            Err(error) => {
-                                let event = malformed_frame_event(engine, raw.as_bytes(), "utf8", &error.to_string());
-                                events.send(event).await.map_err(|_| anyhow!("WebSocket event receiver closed"))?;
-                                return Err(error).context("invalid WebSocket JSON frame");
-                            }
-                        };
-                        if let Some(object) = parsed.as_object_mut() {
-                            object.insert("_collector_received_utc".into(), json!(utc_now()));
-                        }
-                        for event in engine.handle(parsed) {
-                            events.send(event).await.map_err(|_| anyhow!("WebSocket event receiver closed"))?;
-                        }
+                        process_text_frame(engine, &raw, events).await?;
                     }
                     Some(Ok(Message::Binary(raw))) => {
-                        let mut parsed: Value = match serde_json::from_slice(&raw) {
-                            Ok(value) => value,
-                            Err(error) => {
-                                let event = malformed_frame_event(engine, &raw, "binary", &error.to_string());
-                                events.send(event).await.map_err(|_| anyhow!("WebSocket event receiver closed"))?;
-                                return Err(error).context("invalid binary WebSocket JSON frame");
-                            }
-                        };
-                        if let Some(object) = parsed.as_object_mut() {
-                            object.insert("_collector_received_utc".into(), json!(utc_now()));
-                        }
-                        for event in engine.handle(parsed) {
-                            events.send(event).await.map_err(|_| anyhow!("WebSocket event receiver closed"))?;
-                        }
+                        process_binary_frame(engine, &raw, events).await?;
                     }
                     Some(Ok(Message::Ping(payload))) => socket.send(Message::Pong(payload)).await?,
                     Some(Ok(Message::Pong(_))) => {},
@@ -560,5 +594,56 @@ mod tests {
         assert_eq!(event.payload["raw_hex"], "7b626164");
         assert_eq!(event.payload["session_id"], "fixture-connection");
         assert!(event.dedupe_key.unwrap().contains("fixture-connection"));
+    }
+
+    #[test]
+    fn subscription_command_matches_documented_market_data_shape() {
+        let tickers = vec!["KXBTC15M-A".to_owned(), "KXBTC15M-B".to_owned()];
+        let command = subscription_command(&tickers);
+        assert_eq!(command["cmd"], "subscribe");
+        assert_eq!(
+            command["params"]["channels"],
+            json!(["orderbook_delta", "trade"])
+        );
+        assert_eq!(command["params"]["market_tickers"], json!(tickers));
+    }
+
+    #[tokio::test]
+    async fn recorded_frames_detect_gap_and_resynchronize_only_on_snapshot() {
+        let mut engine = WebsocketEngine::with_session("recorded-connection");
+        let (tx, mut rx) = mpsc::channel(32);
+        process_text_frame(
+            &mut engine,
+            r#"{"type":"orderbook_snapshot","sid":3,"seq":17,"msg":{"market_ticker":"KXBTC15M-A","yes_dollars_fp":[]}}"#,
+            &tx,
+        ).await.unwrap();
+        assert!(engine.book("KXBTC15M-A").unwrap().synchronized());
+        let raw = rx.recv().await.unwrap();
+        assert!(
+            raw.payload["raw"]["_collector_received_utc"]
+                .as_str()
+                .unwrap()
+                .len()
+                > 10
+        );
+
+        process_text_frame(
+            &mut engine,
+            r#"{"type":"orderbook_delta","sid":3,"seq":19,"msg":{"market_ticker":"KXBTC15M-A","side":"yes","price_dollars":"0.5","delta_fp":"1"}}"#,
+            &tx,
+        ).await.unwrap();
+        assert!(!engine.book("KXBTC15M-A").unwrap().synchronized());
+        let mut saw_gap = false;
+        while let Ok(event) = rx.try_recv() {
+            saw_gap |= event.kind == "sequence_gap";
+        }
+        assert!(saw_gap);
+
+        process_text_frame(
+            &mut engine,
+            r#"{"type":"orderbook_snapshot","sid":3,"seq":20,"msg":{"market_ticker":"KXBTC15M-A","yes_dollars_fp":[]}}"#,
+            &tx,
+        ).await.unwrap();
+        assert!(engine.book("KXBTC15M-A").unwrap().synchronized());
     }
 }
