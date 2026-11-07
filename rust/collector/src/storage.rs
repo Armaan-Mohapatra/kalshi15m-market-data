@@ -842,4 +842,28 @@ mod tests {
             .unwrap();
         assert_eq!(marker, "CLOSED_WITH_PENDING_SPOOL_UNVERIFIED");
     }
+
+    #[test]
+    fn interrupted_partial_spool_prevents_clean_shutdown_and_archive_verification() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Journal::open(home.path()).unwrap();
+        let spool_dir = home.path().join("data").join("rust_pending");
+        fs::create_dir_all(&spool_dir).unwrap();
+        let partial = spool_dir.join("interrupted.partial");
+        fs::write(&partial, b"{truncated emergency spool").unwrap();
+
+        assert!(store.close().is_err());
+        assert!(partial.is_file());
+
+        let readonly = Journal::open_readonly(home.path()).unwrap();
+        let audit = readonly.audit().unwrap();
+        assert_eq!(audit["pending_spool_entries"], 1);
+        assert_eq!(
+            audit["archive_marker"],
+            "CLOSED_WITH_PENDING_SPOOL_UNVERIFIED"
+        );
+        assert!(!readonly.verify_archive().unwrap());
+        drop(readonly);
+        assert!(partial.is_file());
+    }
 }
