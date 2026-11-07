@@ -291,6 +291,66 @@ class CaptureReliabilityTests(unittest.TestCase):
             collector.writer_pool.shutdown(wait=False)
 
 
+    def test_websocket_delta_counters_distinguish_filtered_from_enqueued(self):
+        class FakeSocket:
+            def __init__(self, frame):
+                self.frame = frame
+                self.delivered = False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self.delivered:
+                    raise StopAsyncIteration
+                self.delivered = True
+                return json.dumps(self.frame)
+
+        with TemporaryDirectory() as directory:
+            collector = Collector(Settings(home=Path(directory)))
+            collector.websocket_session_id = "staging-test-session"
+            collector.subscription_channel_by_sid[9] = "orderbook_delta"
+            collector.last_seq[9] = 2
+            frame = {
+                "type": "orderbook_delta", "sid": 9, "seq": 3,
+                "msg": {
+                    "market_ticker": "ONE", "side": "yes",
+                    "price_dollars": "0.50", "delta_fp": "1",
+                },
+            }
+            # Valid sequence, but market is not currently in our capture scope.
+            asyncio.run(collector._receive_ws(FakeSocket(frame)))
+            status = collector.status.snapshot()
+            self.assertEqual(status["websocket_delta_received_count"], 1)
+            self.assertEqual(status["websocket_delta_filtered_out_of_scope_count"], 1)
+            self.assertEqual(status["websocket_delta_enqueued_count"], 0)
+            self.assertEqual(
+                status["last_by_channel"]["websocket_orderbook_delta"]["exchange_ts"],
+                None,
+            )
+            self.assertEqual(len(collector.queue._queue), 0)
+            self.assertEqual(status["orderbook_sequence_delta_count"], 1)
+
+            collector.open_tickers = {"ONE"}
+            book = OrderBook()
+            book.snapshot({"yes_dollars_fp": [["0.50", "2"]], "no_dollars_fp": []})
+            collector.books["ONE"] = book
+            frame["seq"] = 4
+            asyncio.run(collector._receive_ws(FakeSocket(frame)))
+            status = collector.status.snapshot()
+            self.assertEqual(status["websocket_delta_received_count"], 2)
+            self.assertEqual(status["websocket_delta_filtered_out_of_scope_count"], 1)
+            self.assertEqual(status["websocket_delta_enqueued_count"], 1)
+            self.assertIsNotNone(status["websocket_delta_last_enqueued_utc"])
+            self.assertEqual(status["orderbook_sequence_delta_count"], 2)
+            self.assertEqual(
+                len([e for e in collector.queue._queue if e["kind"] == "orderbook_delta"]),
+                1,
+            )
+            # Enqueued does not imply journaled or finalized in Parquet.
+            collector.writer_pool.shutdown(wait=False)
+
+
 class ApiReliabilityTests(unittest.TestCase):
     def test_public_http_date_metadata_is_diagnostic_only(self):
         class Response:
