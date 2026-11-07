@@ -54,7 +54,7 @@ jobs:
             throw "Unexpected diagnostic classification: $($result.classification)"
           }
           if (Test-Path -LiteralPath $probeRoot) { throw 'Read-only triage created a runtime directory' }
-          $superviseRaw = & ./scripts/windows/supervise.ps1 -CheckOnly -RuntimeHome $probeRoot -RuntimePort 65534
+          $superviseRaw = & pwsh -NoProfile -File ./scripts/windows/supervise.ps1 -CheckOnly -RuntimeHome $probeRoot -RuntimePort 65534
           $superviseExit = $LASTEXITCODE
           if ($superviseExit -ne 1) { throw "Expected fail-closed check-only exit=1, got $superviseExit" }
           $supervise = ($superviseRaw | Out-String) | ConvertFrom-Json
