@@ -1960,6 +1960,67 @@ mod tests {
         journal.close().unwrap();
     }
 
+    #[test]
+    fn raw_websocket_health_reconciles_observed_journaled_and_manifest_committed_counts() {
+        let home = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(home.path()).unwrap();
+        let mut health = RuntimeHealth::new(8);
+        let raw_delta = Event::new(
+            "websocket_raw",
+            "orderbook_delta",
+            Some("KXBTC15M-TELEMETRY-MOCK"),
+            json!({"session_id":"mock-session","raw":{"sid":7,"seq":12,
+                "msg":{"market_ticker":"KXBTC15M-TELEMETRY-MOCK"}},
+                "collector":{"book_processing":"DELTA_APPLIED"}}),
+            Some("raw-telemetry-delta".into()),
+        );
+        let gap = Event::new(
+            "websocket_health",
+            "sequence_gap",
+            Some("KXBTC15M-TELEMETRY-MOCK"),
+            json!({"session_id":"mock-session","sid":7,"prior_seq":11,"new_seq":13}),
+            Some("raw-telemetry-gap".into()),
+        );
+
+        for event in [&raw_delta, &gap] {
+            observe_websocket_event(&mut health, event, 0);
+            assert_eq!(journal.ingest(event).unwrap(), IngestResult::Inserted);
+            observe_websocket_persistence(
+                &mut health,
+                event,
+                WebSocketPersistenceOutcome::Journaled,
+            );
+        }
+        assert_eq!(health.websocket_raw_frames.frames_observed, 1);
+        assert_eq!(
+            health.websocket_raw_frames.orderbook_delta_frames_applied,
+            1
+        );
+        assert_eq!(
+            health.websocket_raw_frames.orderbook_delta_frames_journaled,
+            1
+        );
+        assert_eq!(
+            health.websocket_subscriptions["mock-session:7"].sequence_gaps_observed,
+            1
+        );
+
+        finalize_runtime_archive(&mut journal, &mut health).unwrap();
+
+        let global = &health.websocket_raw_frames;
+        assert_eq!(global.frames_archived, 1);
+        assert_eq!(global.orderbook_delta_frames_archived, 1);
+        let subscription = &health.websocket_subscriptions["mock-session:7"];
+        assert_eq!(subscription.raw_frames.frames_journaled, 1);
+        assert_eq!(subscription.raw_frames.frames_archived, 1);
+        assert_eq!(subscription.raw_frames.orderbook_delta_frames_archived, 1);
+        assert_eq!(subscription.sequence_gaps_journaled, 1);
+        assert_eq!(subscription.sequence_gaps_archived, 1);
+        assert_eq!(health.archive_state, "VERIFIED");
+        assert!(journal.verify_archive().unwrap());
+        journal.close().unwrap();
+    }
+
     struct MockSource {
         market: Value,
         books: Mutex<Vec<Option<Value>>>,
