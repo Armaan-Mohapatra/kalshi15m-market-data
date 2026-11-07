@@ -4,8 +4,9 @@ use kalshi15m_rust::{
     api::{PublicRest, DEFAULT_BASE},
     replay::{collect_once, replay_file},
     runtime::{
-        observe_websocket_event, observe_websocket_persistence, ContinuousRuntime, RestSource,
-        RuntimeConfig, RuntimeHealth, WebSocketPersistenceOutcome,
+        finalize_runtime_archive, observe_archive_flush, observe_websocket_event,
+        observe_websocket_persistence, ContinuousRuntime, RestSource, RuntimeConfig, RuntimeHealth,
+        WebSocketPersistenceOutcome,
     },
     storage::{IngestResult, Journal},
     websocket::{AuthenticatedWebSocket, WebSocketConfigStage, KALSHI_WS_URL},
@@ -435,12 +436,16 @@ async fn main() -> Result<()> {
                                                     if !stop_ingest {
                                                     match journal.unarchived_count() {
                                                         Ok(count) if count >= 500 => {
-                                                            if let Err(error) = journal.flush_archive(500) {
-                                                                persistence_error = Some(error);
-                                                                stop_ingest = true;
-                                                                health.archive_state = "DEGRADED_ARCHIVE_PENDING".into();
-                                                            } else {
-                                                                health.archive_state = if journal.verify_archive().unwrap_or(false) { "VERIFIED" } else { "INCOMPLETE" }.into();
+                                                            match journal.flush_archive_with_summary(500) {
+                                                                Ok(summary) => {
+                                                                    observe_archive_flush(&mut health, &summary);
+                                                                    health.archive_state = if journal.verify_archive().unwrap_or(false) { "VERIFIED" } else { "INCOMPLETE" }.into();
+                                                                }
+                                                                Err(error) => {
+                                                                    persistence_error = Some(error);
+                                                                    stop_ingest = true;
+                                                                    health.archive_state = "DEGRADED_ARCHIVE_PENDING".into();
+                                                                }
                                                             }
                                                         }
                                                         Ok(_) => {}
@@ -515,19 +520,14 @@ async fn main() -> Result<()> {
                 "FAILED".into()
             };
             health.queue_depth = events_rx.len();
-            health.archive_state = if journal.verify_archive().unwrap_or(false) {
-                "VERIFIED".into()
-            } else {
-                "INCOMPLETE".into()
-            };
+            let finalization_result = finalize_runtime_archive(&mut journal, &mut health);
             let close_result = journal.close();
-            if close_result.is_ok() {
-                health.archive_state = "VERIFIED_ON_CLOSE".into();
-            } else {
+            if close_result.is_err() || finalization_result.is_err() {
                 health.archive_state = "INCOMPLETE_ON_CLOSE".into();
             }
             let _ = health.publish(&home);
             let stats = close_result?;
+            finalization_result?;
             if let Some(error) = persistence_error {
                 return Err(error);
             }

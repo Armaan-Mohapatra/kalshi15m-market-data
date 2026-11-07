@@ -26,6 +26,23 @@ pub struct Stats {
     pub spool_replayed: u64,
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct MarketArchiveSummary {
+    pub websocket_events: u64,
+    pub orderbook_deltas: u64,
+    pub sequence_gaps: u64,
+    pub latest_event_received_utc: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ArchiveFlushSummary {
+    pub rows: usize,
+    pub websocket_events: u64,
+    pub orderbook_deltas: u64,
+    pub sequence_gaps: u64,
+    pub by_market: BTreeMap<String, MarketArchiveSummary>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CapacitySnapshot {
     pub disk_free_bytes: u64,
@@ -390,12 +407,19 @@ impl Journal {
     }
 
     pub fn flush_archive(&mut self, limit: usize) -> Result<usize> {
+        Ok(self.flush_archive_with_summary(limit)?.rows)
+    }
+
+    /// Finalize archive parts and return only rows whose manifest/index
+    /// transaction committed. Runtime health can therefore distinguish
+    /// SQLite journal acknowledgments from Parquet archive acknowledgments.
+    pub fn flush_archive_with_summary(&mut self, limit: usize) -> Result<ArchiveFlushSummary> {
         if limit == 0 || limit > 5000 {
             bail!("archive chunk size outside 1..=5000")
         }
         let pending = self.outstanding_rows(limit)?;
         if pending.is_empty() {
-            return Ok(0);
+            return Ok(ArchiveFlushSummary::default());
         }
         let mut partitions = BTreeMap::<PathBuf, Vec<ArchiveRow>>::new();
         for row in pending {
@@ -404,15 +428,47 @@ impl Journal {
                 .or_default()
                 .push(row);
         }
-        let mut archived = 0;
+        let mut summary = ArchiveFlushSummary::default();
         for (_path, rows) in partitions {
             // On disk errors, the original SQLite source remains intact. A
             // completed part without index will be discovered at next open.
             let part = archive::write_part(&self.archive_root, &rows)?;
             self.register_part(&part, &rows)?;
-            archived += rows.len();
+            summary.rows += rows.len();
+            for row in rows
+                .iter()
+                .filter(|row| row.channel.starts_with("websocket_"))
+            {
+                summary.websocket_events += 1;
+                let market = row
+                    .market_ticker
+                    .as_deref()
+                    .map(|ticker| summary.by_market.entry(ticker.to_owned()).or_default());
+                if row.kind == "orderbook_delta" {
+                    summary.orderbook_deltas += 1;
+                }
+                if row.kind == "sequence_gap" {
+                    summary.sequence_gaps += 1;
+                }
+                if let Some(market) = market {
+                    market.websocket_events += 1;
+                    if row.kind == "orderbook_delta" {
+                        market.orderbook_deltas += 1;
+                    }
+                    if row.kind == "sequence_gap" {
+                        market.sequence_gaps += 1;
+                    }
+                    if market
+                        .latest_event_received_utc
+                        .as_ref()
+                        .is_none_or(|latest| row.received_utc > *latest)
+                    {
+                        market.latest_event_received_utc = Some(row.received_utc.clone());
+                    }
+                }
+            }
         }
-        Ok(archived)
+        Ok(summary)
     }
 
     fn revoke_archive_part(&mut self, name: &str, reason: &str) -> Result<()> {
@@ -844,6 +900,59 @@ mod tests {
         let reopened = Journal::open(home.path()).unwrap();
         assert_eq!(reopened.audit().unwrap()["conflicting_versions"], 1);
         reopened.close().unwrap();
+    }
+
+    #[test]
+    fn archive_flush_summary_counts_only_manifest_committed_websocket_rows() {
+        let home = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(home.path()).unwrap();
+        let events = [
+            Event::new(
+                "websocket_orderbook",
+                "orderbook_snapshot",
+                Some("KXBTC15M-ARCHIVE-HEALTH"),
+                json!({"seq":10}),
+                Some("archive-health-snapshot".into()),
+            ),
+            Event::new(
+                "websocket_orderbook",
+                "orderbook_delta",
+                Some("KXBTC15M-ARCHIVE-HEALTH"),
+                json!({"seq":11}),
+                Some("archive-health-delta".into()),
+            ),
+            Event::new(
+                "websocket_orderbook",
+                "sequence_gap",
+                Some("KXBTC15M-ARCHIVE-HEALTH"),
+                json!({"prior_seq":11,"current_seq":13}),
+                Some("archive-health-gap".into()),
+            ),
+            Event::new(
+                "rest",
+                "trade",
+                Some("KXBTC15M-ARCHIVE-HEALTH"),
+                json!({"trade_id":"rest-only"}),
+                Some("archive-health-rest".into()),
+            ),
+        ];
+        for event in &events {
+            assert_eq!(journal.ingest(event).unwrap(), IngestResult::Inserted);
+        }
+
+        let summary = journal.flush_archive_with_summary(10).unwrap();
+        assert_eq!(summary.rows, 4);
+        assert_eq!(summary.websocket_events, 3);
+        assert_eq!(summary.orderbook_deltas, 1);
+        assert_eq!(summary.sequence_gaps, 1);
+        let market = &summary.by_market["KXBTC15M-ARCHIVE-HEALTH"];
+        assert_eq!(market.websocket_events, 3);
+        assert_eq!(market.orderbook_deltas, 1);
+        assert_eq!(market.sequence_gaps, 1);
+        assert!(market.latest_event_received_utc.is_some());
+        assert_eq!(journal.unarchived_count().unwrap(), 0);
+        assert!(journal.verify_archive().unwrap());
+        journal.close().unwrap();
     }
 
     #[test]

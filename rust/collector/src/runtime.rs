@@ -9,7 +9,7 @@ use crate::api::{PublicRest, Response};
 use crate::book::OrderBook;
 use crate::discovery::{Discovery, Market};
 use crate::event::{utc_now, Event};
-use crate::storage::{IngestResult, Journal};
+use crate::storage::{ArchiveFlushSummary, IngestResult, Journal};
 use crate::websocket::AuthenticatedWebSocket;
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -61,28 +61,7 @@ pub fn observe_websocket_event(health: &mut RuntimeHealth, event: &Event, queue_
         let market = health
             .markets
             .entry(ticker.to_owned())
-            .or_insert_with(|| MarketHealth {
-                ticker: ticker.to_owned(),
-                market_state: "UNKNOWN_FROM_WEBSOCKET".into(),
-                seconds_to_open: 0,
-                last_book_poll_utc: None,
-                last_websocket_frame_utc: None,
-                last_websocket_trade_utc: None,
-                book_source: "NOT_POLLED".into(),
-                book_state: "NOT_YET_OBSERVED".into(),
-                websocket_book_state: "NOT_YET_OBSERVED".into(),
-                websocket_events_observed: 0,
-                websocket_events_journaled: 0,
-                websocket_events_duplicate: 0,
-                websocket_events_spooled: 0,
-                websocket_events_unpersisted: 0,
-                last_websocket_journaled_event_utc: None,
-                last_websocket_journal_ack_utc: None,
-                last_websocket_spooled_event_utc: None,
-                last_trade_poll_utc: None,
-                trades_complete: None,
-                last_error: None,
-            });
+            .or_insert_with(|| MarketHealth::unknown(ticker, "UNKNOWN_FROM_WEBSOCKET"));
         market.last_websocket_frame_utc = Some(event.received_utc.clone());
         if event.channel.starts_with("websocket_") {
             market.websocket_events_observed += 1;
@@ -165,6 +144,64 @@ pub fn observe_websocket_persistence(
             }
         }
     }
+}
+
+/// Record Parquet/archive acknowledgments separately from SQLite journaling.
+/// Counters are scoped to flush commits observed by this process; archive
+/// manifests and `archive_state` remain the authority across restarts.
+pub fn observe_archive_flush(health: &mut RuntimeHealth, summary: &ArchiveFlushSummary) {
+    health.websocket_events_archived += summary.websocket_events;
+    health.websocket_orderbook_deltas_archived += summary.orderbook_deltas;
+    health.websocket_sequence_gaps_archived += summary.sequence_gaps;
+    if summary.websocket_events == 0 {
+        return;
+    }
+
+    let acknowledged_utc = utc_now();
+    health.last_websocket_archive_ack_utc = Some(acknowledged_utc.clone());
+    for (ticker, archived) in &summary.by_market {
+        let market = health
+            .markets
+            .entry(ticker.clone())
+            .or_insert_with(|| MarketHealth::unknown(ticker, "UNKNOWN_FROM_ARCHIVE"));
+        market.websocket_events_archived += archived.websocket_events;
+        market.websocket_orderbook_deltas_archived += archived.orderbook_deltas;
+        market.websocket_sequence_gaps_archived += archived.sequence_gaps;
+        if let Some(received_utc) = &archived.latest_event_received_utc {
+            if market
+                .last_websocket_archived_event_utc
+                .as_ref()
+                .is_none_or(|latest| received_utc > latest)
+            {
+                market.last_websocket_archived_event_utc = Some(received_utc.clone());
+            }
+        }
+        market.last_websocket_archive_ack_utc = Some(acknowledged_utc.clone());
+    }
+}
+
+/// Flush the bounded remaining SQLite backlog, update per-market archive
+/// acknowledgments, and verify the final archive before a runtime reports a
+/// clean stop. The loop bound matches Journal::close recovery limits.
+pub fn finalize_runtime_archive(journal: &mut Journal, health: &mut RuntimeHealth) -> Result<()> {
+    for _ in 0..200 {
+        if journal.unarchived_count()? == 0 {
+            if journal.verify_archive()? {
+                health.archive_state = "VERIFIED".into();
+                return Ok(());
+            }
+            health.archive_state = "INCOMPLETE".into();
+            bail!("archive verification failed during runtime shutdown")
+        }
+        let summary = journal.flush_archive_with_summary(2000)?;
+        if summary.rows == 0 {
+            health.archive_state = "INCOMPLETE".into();
+            bail!("runtime archive finalization made no progress")
+        }
+        observe_archive_flush(health, &summary);
+    }
+    health.archive_state = "INCOMPLETE".into();
+    bail!("runtime archive finalization exceeded bounded flush limit")
 }
 
 #[derive(Clone, Debug)]
@@ -385,12 +422,49 @@ pub struct MarketHealth {
     pub websocket_events_duplicate: u64,
     pub websocket_events_spooled: u64,
     pub websocket_events_unpersisted: u64,
+    pub websocket_events_archived: u64,
+    pub websocket_orderbook_deltas_archived: u64,
+    pub websocket_sequence_gaps_archived: u64,
     pub last_websocket_journaled_event_utc: Option<String>,
     pub last_websocket_journal_ack_utc: Option<String>,
+    pub last_websocket_archived_event_utc: Option<String>,
+    pub last_websocket_archive_ack_utc: Option<String>,
     pub last_websocket_spooled_event_utc: Option<String>,
     pub last_trade_poll_utc: Option<String>,
     pub trades_complete: Option<bool>,
     pub last_error: Option<String>,
+}
+
+impl MarketHealth {
+    fn unknown(ticker: &str, market_state: &str) -> Self {
+        Self {
+            ticker: ticker.to_owned(),
+            market_state: market_state.to_owned(),
+            seconds_to_open: 0,
+            last_book_poll_utc: None,
+            last_websocket_frame_utc: None,
+            last_websocket_trade_utc: None,
+            book_source: "NOT_POLLED".into(),
+            book_state: "NOT_YET_OBSERVED".into(),
+            websocket_book_state: "NOT_YET_OBSERVED".into(),
+            websocket_events_observed: 0,
+            websocket_events_journaled: 0,
+            websocket_events_duplicate: 0,
+            websocket_events_spooled: 0,
+            websocket_events_unpersisted: 0,
+            websocket_events_archived: 0,
+            websocket_orderbook_deltas_archived: 0,
+            websocket_sequence_gaps_archived: 0,
+            last_websocket_journaled_event_utc: None,
+            last_websocket_journal_ack_utc: None,
+            last_websocket_archived_event_utc: None,
+            last_websocket_archive_ack_utc: None,
+            last_websocket_spooled_event_utc: None,
+            last_trade_poll_utc: None,
+            trades_complete: None,
+            last_error: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -407,6 +481,11 @@ pub struct RuntimeHealth {
     pub websocket_events_duplicate: u64,
     pub websocket_events_spooled: u64,
     pub websocket_events_unpersisted: u64,
+    pub websocket_events_archived: u64,
+    pub websocket_orderbook_deltas_archived: u64,
+    pub websocket_sequence_gaps_archived: u64,
+    pub last_websocket_archive_ack_utc: Option<String>,
+    pub archive_counter_scope: String,
     pub sqlite_state: String,
     pub archive_state: String,
     pub queue_capacity: usize,
@@ -438,6 +517,11 @@ impl RuntimeHealth {
             websocket_events_duplicate: 0,
             websocket_events_spooled: 0,
             websocket_events_unpersisted: 0,
+            websocket_events_archived: 0,
+            websocket_orderbook_deltas_archived: 0,
+            websocket_sequence_gaps_archived: 0,
+            last_websocket_archive_ack_utc: None,
+            archive_counter_scope: "CURRENT_PROCESS_ARCHIVE_ACKS_ONLY".into(),
             sqlite_state: "OPEN".into(),
             archive_state: "UNVERIFIED".into(),
             queue_capacity,
@@ -677,8 +761,11 @@ impl ContinuousRuntime {
                         }
                     };
                     if unarchived >= 500 {
-                        match journal.flush_archive(500) {
-                            Ok(_) => health.archive_state = "RECONCILIATION_PENDING".into(),
+                        match journal.flush_archive_with_summary(500) {
+                            Ok(summary) => {
+                                observe_archive_flush(&mut health, &summary);
+                                health.archive_state = "RECONCILIATION_PENDING".into();
+                            }
                             Err(error) => {
                                 health.archive_state = "INCOMPLETE".into();
                                 health.sqlite_state = "DEGRADED_ARCHIVE_PENDING".into();
@@ -812,6 +899,12 @@ impl ContinuousRuntime {
                     });
                 }
             }
+        }
+        if let Err(error) = finalize_runtime_archive(journal, &mut health) {
+            health.sqlite_state = "DEGRADED_ARCHIVE_PENDING".into();
+            health.archive_state = "INCOMPLETE".into();
+            persist_error
+                .get_or_insert_with(|| error.context("finalize combined collector archive"));
         }
         health.process_liveness = "STOPPING".into();
         health.queue_depth = 0;
@@ -989,8 +1082,13 @@ impl ContinuousRuntime {
                     websocket_events_duplicate: 0,
                     websocket_events_spooled: 0,
                     websocket_events_unpersisted: 0,
+                    websocket_events_archived: 0,
+                    websocket_orderbook_deltas_archived: 0,
+                    websocket_sequence_gaps_archived: 0,
                     last_websocket_journaled_event_utc: None,
                     last_websocket_journal_ack_utc: None,
+                    last_websocket_archived_event_utc: None,
+                    last_websocket_archive_ack_utc: None,
                     last_websocket_spooled_event_utc: None,
                     last_trade_poll_utc: None,
                     trades_complete: None,
@@ -1156,8 +1254,13 @@ impl ContinuousRuntime {
                     websocket_events_duplicate: 0,
                     websocket_events_spooled: 0,
                     websocket_events_unpersisted: 0,
+                    websocket_events_archived: 0,
+                    websocket_orderbook_deltas_archived: 0,
+                    websocket_sequence_gaps_archived: 0,
                     last_websocket_journaled_event_utc: None,
                     last_websocket_journal_ack_utc: None,
+                    last_websocket_archived_event_utc: None,
+                    last_websocket_archive_ack_utc: None,
                     last_websocket_spooled_event_utc: None,
                     last_trade_poll_utc: None,
                     trades_complete: None,
@@ -1312,8 +1415,13 @@ impl ContinuousRuntime {
                 websocket_events_duplicate: 0,
                 websocket_events_spooled: 0,
                 websocket_events_unpersisted: 0,
+                websocket_events_archived: 0,
+                websocket_orderbook_deltas_archived: 0,
+                websocket_sequence_gaps_archived: 0,
                 last_websocket_journaled_event_utc: None,
                 last_websocket_journal_ack_utc: None,
+                last_websocket_archived_event_utc: None,
+                last_websocket_archive_ack_utc: None,
                 last_websocket_spooled_event_utc: None,
                 last_trade_poll_utc: None,
                 trades_complete: None,
@@ -1386,26 +1494,33 @@ impl ContinuousRuntime {
             }
             health.queue_depth = health.queue_depth.saturating_sub(1);
             if journal.unarchived_count()? >= 500 {
-                if let Err(error) = journal.flush_archive(500) {
-                    for remaining in events {
-                        if let Err(spool_error) = journal.spool(&remaining) {
-                            health.sqlite_state = "FAILED_UNSPOOLED_EVENT".into();
-                            health.queue_depth = 0;
-                            return Err(spool_error).context("durably spool after archive failure");
+                match journal.flush_archive_with_summary(500) {
+                    Ok(summary) => observe_archive_flush(health, &summary),
+                    Err(error) => {
+                        for remaining in events {
+                            if let Err(spool_error) = journal.spool(&remaining) {
+                                health.sqlite_state = "FAILED_UNSPOOLED_EVENT".into();
+                                health.queue_depth = 0;
+                                return Err(spool_error)
+                                    .context("durably spool after archive failure");
+                            }
                         }
+                        health.sqlite_state = "DEGRADED_ARCHIVE_PENDING".into();
+                        health.archive_state = "INCOMPLETE".into();
+                        health.queue_depth = 0;
+                        return Err(error).context("Parquet flush failed after SQLite commit");
                     }
-                    health.sqlite_state = "DEGRADED_ARCHIVE_PENDING".into();
-                    health.archive_state = "INCOMPLETE".into();
-                    health.queue_depth = 0;
-                    return Err(error).context("Parquet flush failed after SQLite commit");
                 }
             }
         }
-        if let Err(error) = journal.flush_archive(500) {
-            health.sqlite_state = "DEGRADED_ARCHIVE_PENDING".into();
-            health.archive_state = "INCOMPLETE".into();
-            health.queue_depth = 0;
-            return Err(error).context("Parquet flush failed after SQLite commit");
+        match journal.flush_archive_with_summary(500) {
+            Ok(summary) => observe_archive_flush(health, &summary),
+            Err(error) => {
+                health.sqlite_state = "DEGRADED_ARCHIVE_PENDING".into();
+                health.archive_state = "INCOMPLETE".into();
+                health.queue_depth = 0;
+                return Err(error).context("Parquet flush failed after SQLite commit");
+            }
         }
         health.sqlite_state = "HEALTHY".into();
         health.archive_state = "RECONCILIATION_PENDING".into();
@@ -1432,6 +1547,11 @@ impl ContinuousRuntime {
             {
                 health.rest_state = "DEGRADED".into();
                 health.poll_failures += 1;
+                if let Err(archive_error) = finalize_runtime_archive(journal, &mut health) {
+                    health.sqlite_state = "DEGRADED_ARCHIVE_PENDING".into();
+                    health.archive_state = "INCOMPLETE".into();
+                    let _ = archive_error;
+                }
                 health.publish(&journal.home)?;
                 return Err(error);
             }
@@ -1443,6 +1563,12 @@ impl ContinuousRuntime {
             }
         }
         health.process_liveness = "STOPPING".into();
+        if let Err(error) = finalize_runtime_archive(journal, &mut health) {
+            health.sqlite_state = "DEGRADED_ARCHIVE_PENDING".into();
+            health.archive_state = "INCOMPLETE".into();
+            health.publish(&journal.home)?;
+            return Err(error).context("finalize continuous collector archive");
+        }
         health.publish(&journal.home)?;
         Ok(())
     }
@@ -1498,6 +1624,22 @@ mod tests {
         observe_websocket_persistence(&mut health, &event, WebSocketPersistenceOutcome::Duplicate);
         observe_websocket_persistence(&mut health, &event, WebSocketPersistenceOutcome::Spooled);
         observe_websocket_persistence(&mut health, &event, WebSocketPersistenceOutcome::Failed);
+        let summary = ArchiveFlushSummary {
+            rows: 3,
+            websocket_events: 3,
+            orderbook_deltas: 1,
+            sequence_gaps: 1,
+            by_market: BTreeMap::from([(
+                "KXBTC15M-STATUS-MOCK".into(),
+                crate::storage::MarketArchiveSummary {
+                    websocket_events: 3,
+                    orderbook_deltas: 1,
+                    sequence_gaps: 1,
+                    latest_event_received_utc: Some(event.received_utc.clone()),
+                },
+            )]),
+        };
+        observe_archive_flush(&mut health, &summary);
 
         let market = &health.markets["KXBTC15M-STATUS-MOCK"];
         assert_eq!(health.websocket_events_observed, 1);
@@ -1505,11 +1647,27 @@ mod tests {
         assert_eq!(health.websocket_events_duplicate, 1);
         assert_eq!(health.websocket_events_spooled, 1);
         assert_eq!(health.websocket_events_unpersisted, 1);
+        assert_eq!(health.websocket_events_archived, 3);
+        assert_eq!(health.websocket_orderbook_deltas_archived, 1);
+        assert_eq!(health.websocket_sequence_gaps_archived, 1);
+        assert!(health.last_websocket_archive_ack_utc.is_some());
+        assert_eq!(
+            health.archive_counter_scope,
+            "CURRENT_PROCESS_ARCHIVE_ACKS_ONLY"
+        );
         assert_eq!(market.websocket_events_observed, 1);
         assert_eq!(market.websocket_events_journaled, 1);
         assert_eq!(market.websocket_events_duplicate, 1);
         assert_eq!(market.websocket_events_spooled, 1);
         assert_eq!(market.websocket_events_unpersisted, 1);
+        assert_eq!(market.websocket_events_archived, 3);
+        assert_eq!(market.websocket_orderbook_deltas_archived, 1);
+        assert_eq!(market.websocket_sequence_gaps_archived, 1);
+        assert_eq!(
+            market.last_websocket_archived_event_utc.as_deref(),
+            Some(event.received_utc.as_str())
+        );
+        assert!(market.last_websocket_archive_ack_utc.is_some());
         assert_eq!(
             market.last_websocket_journaled_event_utc.as_deref(),
             Some(event.received_utc.as_str())
@@ -1519,6 +1677,56 @@ mod tests {
             market.last_websocket_spooled_event_utc.as_deref(),
             Some(event.received_utc.as_str())
         );
+        let status = serde_json::to_value(&health).unwrap();
+        assert_eq!(
+            status["markets"]["KXBTC15M-STATUS-MOCK"]["websocket_orderbook_deltas_archived"],
+            1
+        );
+    }
+
+    #[test]
+    fn final_archive_flush_records_per_market_acknowledgments_before_clean_status() {
+        let home = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(home.path()).unwrap();
+        let mut health = RuntimeHealth::new(8);
+        let snapshot = Event::new(
+            "websocket_orderbook",
+            "orderbook_snapshot",
+            Some("KXBTC15M-FINALIZE-MOCK"),
+            json!({"seq":10,"yes":[],"no":[]}),
+            Some("finalize-snapshot".into()),
+        );
+        let delta = Event::new(
+            "websocket_orderbook",
+            "orderbook_delta",
+            Some("KXBTC15M-FINALIZE-MOCK"),
+            json!({"seq":11,"side":"yes","price":"0.5","delta":1}),
+            Some("finalize-delta".into()),
+        );
+        for event in [&snapshot, &delta] {
+            observe_websocket_event(&mut health, event, 0);
+            assert_eq!(journal.ingest(event).unwrap(), IngestResult::Inserted);
+            observe_websocket_persistence(
+                &mut health,
+                event,
+                WebSocketPersistenceOutcome::Journaled,
+            );
+        }
+        assert_eq!(health.websocket_events_journaled, 2);
+        assert_eq!(health.websocket_events_archived, 0);
+
+        finalize_runtime_archive(&mut journal, &mut health).unwrap();
+
+        assert_eq!(health.archive_state, "VERIFIED");
+        assert_eq!(health.websocket_events_archived, 2);
+        assert_eq!(health.websocket_orderbook_deltas_archived, 1);
+        let market = &health.markets["KXBTC15M-FINALIZE-MOCK"];
+        assert_eq!(market.websocket_events_archived, 2);
+        assert_eq!(market.websocket_orderbook_deltas_archived, 1);
+        assert!(market.last_websocket_archive_ack_utc.is_some());
+        assert_eq!(journal.unarchived_count().unwrap(), 0);
+        assert!(journal.verify_archive().unwrap());
+        journal.close().unwrap();
     }
 
     struct MockSource {
@@ -1964,14 +2172,14 @@ mod tests {
         let mut runtime = ContinuousRuntime::default();
         let mut health = RuntimeHealth::new(2);
         let event = Event::new(
-            "rest",
-            "trade",
+            "websocket_orderbook",
+            "orderbook_delta",
             Some("ARCHIVE-UNAVAILABLE"),
             json!({"id":"durable-in-sqlite"}),
             Some("archive-unavailable-test".into()),
         );
         assert!(runtime
-            .commit_bounded(&mut journal, &mut health, vec![event])
+            .commit_bounded(&mut journal, &mut health, vec![event.clone()])
             .await
             .is_err());
         assert_eq!(health.sqlite_state, "DEGRADED_ARCHIVE_PENDING");
@@ -1979,6 +2187,20 @@ mod tests {
         assert_eq!(journal.audit().unwrap()["canonical_events"], 1);
         assert_eq!(journal.unarchived_count().unwrap(), 1);
         assert_eq!(journal.audit().unwrap()["pending_spool_entries"], 0);
+        observe_websocket_event(&mut health, &event, 0);
+        observe_websocket_persistence(&mut health, &event, WebSocketPersistenceOutcome::Journaled);
+        assert!(finalize_runtime_archive(&mut journal, &mut health).is_err());
+        assert_eq!(health.archive_state, "INCOMPLETE");
+        assert_eq!(health.sqlite_state, "DEGRADED_ARCHIVE_PENDING");
+        assert_eq!(health.websocket_events_archived, 0);
+        assert_eq!(
+            health.markets["ARCHIVE-UNAVAILABLE"].websocket_events_journaled,
+            1
+        );
+        assert_eq!(
+            health.markets["ARCHIVE-UNAVAILABLE"].websocket_orderbook_deltas_archived,
+            0
+        );
 
         fs::remove_file(&archive_root).unwrap();
         fs::rename(&parked_root, &archive_root).unwrap();
