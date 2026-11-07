@@ -307,10 +307,14 @@ impl ContinuousRuntime {
             summary.failures += inventory.failures.len();
             health.poll_failures += inventory.failures.len() as u64;
             for failure in inventory.failures {
+                let ticker = failure
+                    .get("series_ticker")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
                 pending.push(Event::new(
                     "rest_market",
                     "market_discovery_failure",
-                    failure.get("series_ticker").and_then(Value::as_str),
+                    ticker.as_deref(),
                     failure,
                     None,
                 ));
