@@ -18,7 +18,7 @@ class Settings:
     status_port: int = int(os.environ.get("KALSHI15M_STATUS_PORT", "8768"))
     min_free_bytes: int = 20 * 1024**3
     max_response_bytes: int = 64 * 1024**2
-    max_queue_events: int = 12000
+    max_queue_events: int = 25000
     # Leave headroom below one REST request per second; forward polling at
     # 1.0 s observed recoverable 429 responses on /markets discovery.
     rest_min_interval_seconds: float = 2.0
