@@ -64,6 +64,13 @@ class Settings:
     log_budget_bytes: int = 40 * 1024**2
     log_file_max_bytes: int = 8 * 1024**2
     log_backup_count: int = 5
+    # Archive recovery keeps its fingerprint index in a file under home (so it
+    # lives on the research volume, never %TEMP%) and refuses to grow past this.
+    recovery_index_max_bytes: int = 4 * 1024**3
+
+    @property
+    def recovery_workspace_dir(self) -> Path:
+        return self.home / "tmp"
 
     @property
     def data_dir(self) -> Path:

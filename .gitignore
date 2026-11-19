@@ -6,3 +6,6 @@ __pycache__/
 runtime/*.pid.json
 runtime/*.request
 reports/live_*.json
+
+# private frozen strategy fixtures: local only, never committed
+strategy/

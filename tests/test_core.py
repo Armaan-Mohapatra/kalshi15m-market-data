@@ -1970,7 +1970,8 @@ class StorageTests(unittest.TestCase):
                 self.assertEqual(writer.submit(store.integrity_check).result(), "ok")
                 with patch("kalshi15m.storage.os.fsync", wraps=os.fsync) as fsync:
                     writer.submit(store.close).result()
-                    self.assertEqual(fsync.call_count, 2)
+                    # parquet file, manifest listing, checkpoint: each durable in order
+                    self.assertEqual(fsync.call_count, 3)
             checkpoint = json.loads(store.archive_checkpoint_path.read_text(encoding="utf-8"))
             self.assertEqual(checkpoint["through_rowid"], 1)
             self.assertEqual(checkpoint["through_dedupe_key"], "trade-1")
@@ -3059,6 +3060,266 @@ class ArchiveCheckpointRecoveryTests(unittest.TestCase):
             self.assertEqual(_archived_keys(cfg), [])
             recovered.connection.close()
             recovered.connection = None
+
+def _flushed_store(cfg, sizes):
+    """Journal and flush one Parquet file per size; leave the store open."""
+    store = Storage(cfg)
+    store.open()
+    start = 0
+    for size in sizes:
+        store.append_batch([_trade(i) for i in range(start, start + size)])
+        store.flush_parquet(reason="TEST")
+        start += size
+    return store, start
+
+
+def _crash(store, cfg):
+    store.connection.close()
+    store.connection = None
+    _mark_unclean(cfg)
+
+
+def _expected(count):
+    return sorted(f"trade-{i}" for i in range(count))
+
+
+class ArchiveManifestIntegrityTests(unittest.TestCase):
+    def test_same_size_corruption_of_newest_file_forces_full_scan_without_loss_or_dupes(self):
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary), min_free_bytes=0)
+            store, count = _flushed_store(cfg, [3, 3, 3])
+            newest = cfg.parquet_dir / store._manifest_read()[0][-1]["path"]
+            _crash(store, cfg)
+            data = bytearray(newest.read_bytes())
+            data[len(data) // 2] ^= 0xFF  # flip a byte: size unchanged
+            newest.write_bytes(bytes(data))
+
+            recovered = Storage(cfg)
+            recovered.open()
+
+            self.assertEqual(recovered.parquet_recovery_mode, "FULL_SCAN")
+            self.assertTrue(recovered.parquet_recovery_reason.startswith("MANIFEST_FILE_HASH_MISMATCH"))
+            self.assertEqual(recovered.archive_quarantined_files, 1)
+            self.assertEqual(len(list(cfg.parquet_dir.rglob("*.parquet.corrupt-*"))), 1)
+            self.assertEqual(sorted(_archived_keys(cfg)), _expected(count))
+            self.assertEqual(recovered.archive_integrity_state, "VERIFIED_COMPLETE")
+            self.assertTrue(recovered.verify_archive(full=True)["ok"])
+            self.assertEqual(len(list(cfg.parquet_dir.glob("_archive_manifest.jsonl.superseded-*"))), 1)
+            recovered.close()
+
+    def test_file_replacement_is_detected(self):
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary), min_free_bytes=0)
+            store, count = _flushed_store(cfg, [2, 5])
+            entries = store._manifest_read()[0]
+            small = cfg.parquet_dir / entries[0]["path"]
+            large = cfg.parquet_dir / entries[1]["path"]
+            _crash(store, cfg)
+            small.write_bytes(large.read_bytes())  # a different, valid Parquet file
+
+            recovered = Storage(cfg)
+            recovered.open()
+
+            self.assertEqual(recovered.parquet_recovery_mode, "FULL_SCAN")
+            self.assertTrue(recovered.parquet_recovery_reason.startswith("MANIFEST_FILE_SIZE_MISMATCH"))
+            # The replacement's rows are duplicates of the other file; the original
+            # file's rows come back from the journal.
+            self.assertEqual(set(_archived_keys(cfg)), set(_expected(count)))
+            self.assertEqual(recovered.archive_integrity_state, "VERIFIED_COMPLETE")
+            recovered.close()
+
+    def test_missing_archive_part_is_rebuilt_from_journal(self):
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary), min_free_bytes=0)
+            store, count = _flushed_store(cfg, [2, 2, 2])
+            oldest = cfg.parquet_dir / store._manifest_read()[0][0]["path"]
+            _crash(store, cfg)
+            oldest.unlink()
+
+            recovered = Storage(cfg)
+            recovered.open()
+
+            self.assertEqual(recovered.parquet_recovery_mode, "FULL_SCAN")
+            self.assertTrue(recovered.parquet_recovery_reason.startswith("MANIFEST_FILE_MISSING"))
+            self.assertEqual(recovered.parquet_recovery_rows, 2)
+            self.assertEqual(sorted(_archived_keys(cfg)), _expected(count))
+            recovered.close()
+
+    def test_old_same_size_corruption_is_only_caught_by_full_verification(self):
+        # Documented limit: startup hashes the newest MANIFEST_TAIL_HASH_FILES only.
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary), min_free_bytes=0)
+            with patch.object(Storage, "MANIFEST_TAIL_HASH_FILES", 1):
+                store, count = _flushed_store(cfg, [2, 2, 2])
+                oldest = cfg.parquet_dir / store._manifest_read()[0][0]["path"]
+                _crash(store, cfg)
+                original = oldest.stat()
+                data = bytearray(oldest.read_bytes())
+                data[len(data) // 2] ^= 0xFF
+                oldest.write_bytes(bytes(data))
+                os.utime(oldest, ns=(original.st_atime_ns, original.st_mtime_ns))
+
+                recovered = Storage(cfg)
+                recovered.open()
+                self.assertTrue(recovered.parquet_recovery_mode.startswith("INCREMENTAL_FROM_ROWID_"))
+                self.assertTrue(recovered.verify_archive()["ok"])
+                audit = recovered.verify_archive(full=True)
+                self.assertFalse(audit["ok"])
+                self.assertTrue(audit["violations"][0].startswith("MANIFEST_FILE_HASH_MISMATCH"))
+                recovered.connection.close()
+                recovered.connection = None
+
+    def test_interrupted_checkpoint_write_is_counted_and_recovered_idempotently(self):
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary), min_free_bytes=0)
+            store, count = _flushed_store(cfg, [3])
+            store.append_batch([_trade(i) for i in range(3, 6)])
+            with patch.object(store, "_write_archive_checkpoint_file", side_effect=OSError("disk")):
+                store.flush_parquet(reason="TEST")
+            self.assertEqual(store.archive_checkpoint_write_failures, 1)
+            record = json.loads(store.archive_checkpoint_path.read_text(encoding="utf-8"))
+            self.assertEqual(record["through_rowid"], 3)  # older checkpoint kept
+            _crash(store, cfg)
+
+            recovered = Storage(cfg)
+            recovered.open()
+            self.assertEqual(recovered.parquet_recovery_mode, "INCREMENTAL_FROM_ROWID_3")
+            self.assertEqual(recovered.parquet_recovery_rows, 0)
+            self.assertEqual(sorted(_archived_keys(cfg)), _expected(6))
+            recovered.close()
+
+    def test_failed_parquet_fsync_publishes_nothing_and_keeps_buffer(self):
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary), min_free_bytes=0)
+            store, _ = _flushed_store(cfg, [2])
+            store.append_batch([_trade(2), _trade(3)])
+            with patch("kalshi15m.storage.os.fsync", side_effect=OSError(5, "I/O error")):
+                with self.assertRaises(OSError):
+                    store.flush_parquet(reason="TEST")
+            self.assertEqual(len(store.parquet_buffer), 2)
+            self.assertEqual(list(cfg.parquet_dir.rglob("*.partial")), [])
+            record = json.loads(store.archive_checkpoint_path.read_text(encoding="utf-8"))
+            self.assertEqual(record["through_rowid"], 2)
+            self.assertEqual(store.flush_parquet(reason="TEST"), 2)
+            self.assertEqual(sorted(_archived_keys(cfg)), _expected(4))
+            store.close()
+
+    def test_failed_manifest_fsync_freezes_checkpoint_and_next_start_adopts_files(self):
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary), min_free_bytes=0)
+            store, _ = _flushed_store(cfg, [2])
+            store.append_batch([_trade(2), _trade(3)])
+            with patch.object(store, "_manifest_append", side_effect=OSError(5, "I/O error")):
+                store.flush_parquet(reason="TEST")
+            self.assertEqual(store.archive_manifest_failures, 1)
+            self.assertTrue(store.archive_gap_pending)
+            self.assertEqual(store.archive_integrity_state, "INCOMPLETE")
+            store.append_batch([_trade(4)])
+            store.flush_parquet(reason="TEST")  # must not advance past the unlisted file
+            record = json.loads(store.archive_checkpoint_path.read_text(encoding="utf-8"))
+            self.assertEqual(record["through_rowid"], 2)
+            _crash(store, cfg)
+
+            recovered = Storage(cfg)
+            recovered.open()
+            self.assertEqual(recovered.parquet_recovery_mode, "INCREMENTAL_FROM_ROWID_2")
+            self.assertEqual(recovered.parquet_recovery_rows, 0)
+            self.assertEqual(sorted(_archived_keys(cfg)), _expected(5))
+            self.assertEqual(recovered.archive_integrity_state, "VERIFIED_COMPLETE")
+            self.assertTrue(recovered.verify_archive(full=True)["ok"])
+            recovered.close()
+
+    def test_torn_manifest_tail_is_ignored_then_truncated_by_next_append(self):
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary), min_free_bytes=0)
+            store, _ = _flushed_store(cfg, [2])
+            with store.archive_manifest_path.open("ab") as handle:
+                handle.write(b'{"seq":2,"prev":"abc"')  # crash mid-append
+            self.assertEqual(len(store._manifest_read()[0]), 1)
+            self.assertFalse(store.verify_archive()["ok"])
+            store.append_batch([_trade(2)])
+            store.flush_parquet(reason="TEST")
+            self.assertTrue(store.verify_archive(full=True)["ok"])
+            self.assertEqual(len(store._manifest_read()[0]), 2)
+            store.close()
+
+    def test_partial_recovery_by_index_cap_never_reports_complete_and_resumes_idempotently(self):
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary), min_free_bytes=0, recovery_index_max_bytes=8192)
+            store = Storage(cfg)
+            store.open()
+            # Below parquet_flush_rows (2000), so nothing is auto-archived yet.
+            store.append_batch([_trade(i) for i in range(1500)])
+            _crash(store, cfg)
+
+            partial = Storage(cfg)
+            partial.open()
+            self.assertEqual(partial.parquet_recovery_state, "PARTIAL_RECOVERY_INDEX_BUDGET")
+            self.assertTrue(partial.archive_gap_pending)
+            self.assertEqual(partial.archive_integrity_state, "INCOMPLETE")
+            self.assertFalse(partial.archive_checkpoint_path.exists())
+            partial.connection.close()
+            partial.connection = None
+            _mark_unclean(cfg)
+
+            full = Storage(Settings(home=Path(temporary), min_free_bytes=0))
+            full.open()
+            self.assertEqual(full.archive_integrity_state, "VERIFIED_COMPLETE")
+            self.assertEqual(sorted(_archived_keys(cfg)), _expected(1500))  # no duplicates
+            full.close()
+
+    def test_restart_after_recovery_is_idempotent(self):
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary), min_free_bytes=0)
+            store, count = _flushed_store(cfg, [3])
+            store.append_batch([_trade(3), _trade(4)])
+            _crash(store, cfg)
+            for expected_rows in (2, 0, 0):
+                recovered = Storage(cfg)
+                recovered.open()
+                self.assertEqual(recovered.parquet_recovery_rows, expected_rows)
+                self.assertEqual(sorted(_archived_keys(cfg)), _expected(5))
+                recovered.connection.close()
+                recovered.connection = None
+                _mark_unclean(cfg)
+
+    def test_recovery_index_never_uses_temp_and_leaves_no_scratch(self):
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary), min_free_bytes=0)
+            store = Storage(cfg)
+            store.open()
+            store.append_batch([_trade(0)])
+            _crash(store, cfg)
+            with patch("kalshi15m.storage.sqlite3.connect", wraps=sqlite3.connect) as connect:
+                recovered = Storage(cfg)
+                recovered.open()
+            targets = [str(call.args[0]) for call in connect.call_args_list]
+            self.assertNotIn("", targets)
+            self.assertTrue(
+                any(str(cfg.recovery_workspace_dir) in target for target in targets), targets
+            )
+            self.assertEqual(list(cfg.recovery_workspace_dir.glob("archive-fingerprints-*")), [])
+            recovered.close()
+
+    def test_clean_stop_with_stale_checkpoint_runs_recovery_instead_of_assuming(self):
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary), min_free_bytes=0)
+            store, _ = _flushed_store(cfg, [2])
+            store.append_batch([_trade(2)])
+            with patch.object(store, "_write_archive_checkpoint_file", side_effect=OSError("disk")):
+                store.close()  # shutdown flush published the file; checkpoint write failed
+            (cfg.runtime_dir).mkdir(parents=True, exist_ok=True)
+            (cfg.runtime_dir / "status.json").write_text(
+                json.dumps({"service_state": "STOPPED", "raw_capture_state": "ENABLED"}),
+                encoding="utf-8",
+            )
+            recovered = Storage(cfg)
+            recovered.open()
+            self.assertNotEqual(recovered.parquet_recovery_state, "SKIPPED_PREVIOUS_RUN_STOPPED")
+            self.assertEqual(recovered.archive_integrity_state, "VERIFIED_COMPLETE")
+            self.assertEqual(sorted(_archived_keys(cfg)), _expected(3))
+            recovered.close()
+
 
 class WebSocketReconnectDedupeTests(unittest.TestCase):
     def test_reconnect_reusing_sid_and_seq_journals_new_events(self):
