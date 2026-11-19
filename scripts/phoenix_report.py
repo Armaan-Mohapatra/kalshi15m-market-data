@@ -58,7 +58,9 @@ def growth(home: Path) -> dict:
 
 
 def ledger(home: Path) -> dict:
-    db = sqlite3.connect("file:" + (home / "data" / "paper_ledger.sqlite3").as_posix() + "?mode=ro", uri=True, timeout=30)
+    from kalshi15m.config import Settings  # ledger may live on another volume (pointer file)
+
+    db = sqlite3.connect("file:" + Settings(home=home).ledger_path.as_posix() + "?mode=ro", uri=True, timeout=30)
     try:
         counts = db.execute("select profile_id, record_type, count(*) from paper_ledger group by 1,2").fetchall()
         recent = db.execute(

@@ -90,13 +90,18 @@ def reconcile(ledger: Path, sleep: float) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ledger", default=r"E:\PhoenixLab\runtime\k15m-native\data\paper_ledger.sqlite3")
-    ap.add_argument("--out", default=r"E:\PhoenixLab\runtime\k15m-native\reports\settlement_reconciliation.json")
+    ap.add_argument("--home", default=r"E:\PhoenixLab\runtime\k15m-native")
+    ap.add_argument("--ledger", default=None, help="default: the runtime's configured ledger (Settings.ledger_path)")
+    ap.add_argument("--out", default=None)
     ap.add_argument("--sleep", type=float, default=0.4)
     args = ap.parse_args()
-    report = reconcile(Path(args.ledger), args.sleep)
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    Path(args.out).write_text(json.dumps(report, indent=2), encoding="utf-8")
+    from kalshi15m.config import Settings
+    cfg = Settings(home=Path(args.home))
+    ledger = Path(args.ledger) if args.ledger else cfg.ledger_path
+    out_path = args.out or str(cfg.home / "reports" / "settlement_reconciliation.json")
+    report = reconcile(ledger, args.sleep)
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(out_path).write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(json.dumps({k: report[k] for k in ("checked_utc", "settlements", "counts", "net_pnl_recorded_by_profile")}))
     for item in report["unmatched"]:
         print("UNMATCHED", item["ticker"], item["status"], item["issues"])

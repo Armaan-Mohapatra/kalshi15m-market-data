@@ -50,7 +50,9 @@ def cycle(home: Path, seed: int = 7) -> dict:
         done = set(json.loads(checkpoint_path.read_text("utf-8"))["processed_keys"])
     except (OSError, ValueError, KeyError):
         done = set()
-    settlements = load_settlements(home / "data" / "paper_ledger.sqlite3")
+    from kalshi15m.config import Settings  # ledger may live on another volume (pointer file)
+
+    settlements = load_settlements(Settings(home=home).ledger_path)
     fresh = [k for k, _, _ in settlements if k not in done]
     if not fresh and checkpoint_path.exists():
         return {"result": "NO_NEW_FINALIZED_MARKETS", "settlements_seen": len(settlements)}

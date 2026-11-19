@@ -56,11 +56,15 @@ def export(ledger: Path, ticker: str, out: Path) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ledger", default=r"E:\PhoenixLab\runtime\k15m-native\data\paper_ledger.sqlite3")
+    ap.add_argument("--home", default=r"E:\PhoenixLab\runtime\k15m-native")
+    ap.add_argument("--ledger", default=None, help="default: the runtime's configured ledger")
     ap.add_argument("--ticker", required=True)
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
-    print(json.dumps(export(Path(a.ledger), a.ticker, Path(a.out))))
+    from kalshi15m.config import Settings
+
+    ledger = Path(a.ledger) if a.ledger else Settings(home=Path(a.home)).ledger_path
+    print(json.dumps(export(ledger, a.ticker, Path(a.out))))
     return 0
 
 

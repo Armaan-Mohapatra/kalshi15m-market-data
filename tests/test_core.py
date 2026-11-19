@@ -480,6 +480,20 @@ class LedgerVolumeTests(unittest.TestCase):
             self.assertEqual(store.sqlite_open_path, elsewhere.resolve())
             store.close()
 
+    def test_pointer_file_relocates_the_ledger_and_env_wins(self):
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp) / "h"
+            cfg = Settings(home=home)
+            self.assertEqual(cfg.ledger_path, home / "data" / "paper_ledger.sqlite3")
+            (home / "runtime").mkdir(parents=True)
+            target = Path(tmp) / "fast" / "ledger.sqlite3"
+            (home / "runtime" / "ledger_path.txt").write_text(f"{target}\n", encoding="utf-8")
+            self.assertEqual(Settings(home=home).ledger_path, target)  # every consumer follows it
+            other = Path(tmp) / "env.sqlite3"
+            self.assertEqual(Settings(home=home, ledger_override=str(other)).ledger_path, other)
+            (home / "runtime" / "ledger_path.txt").write_text("  \n", encoding="utf-8")  # blank = unset
+            self.assertEqual(Settings(home=home).ledger_path, home / "data" / "paper_ledger.sqlite3")
+
     def test_volume_state_thresholds(self):
         cfg = Settings(ledger_min_free_bytes=5000, ledger_critical_free_bytes=1000)
         self.assertEqual(

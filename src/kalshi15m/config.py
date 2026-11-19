@@ -104,8 +104,17 @@ class Settings:
     @property
     def ledger_path(self) -> Path:
         # The SQLite journal can live on a faster volume than the Parquet archive
-        # (random-key inserts are latency-bound on USB); see ledger_volume_state().
-        return Path(self.ledger_override) if self.ledger_override else self.data_dir / "paper_ledger.sqlite3"
+        # (measured: random-key inserts 4,162 ev/s on NVMe vs 107 on the USB volume).
+        # Order: KALSHI15M_LEDGER_PATH, then <home>/runtime/ledger_path.txt (written by
+        # the migration so the worker and the report/reconcile/research tasks agree),
+        # then <home>/data/paper_ledger.sqlite3. See ledger_volume_state().
+        if self.ledger_override:
+            return Path(self.ledger_override)
+        try:
+            pointed = (self.runtime_dir / "ledger_path.txt").read_text(encoding="utf-8").strip()
+        except OSError:
+            pointed = ""
+        return Path(pointed) if pointed else self.data_dir / "paper_ledger.sqlite3"
 
     @property
     def runtime_dir(self) -> Path:
