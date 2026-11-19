@@ -415,6 +415,11 @@ def status_server(status: RuntimeStatus, cfg: Settings) -> ThreadingHTTPServer:
 
 
 class Collector:
+    # Group commit: one fsync per drain of up to this many queued events. Measured
+    # ~1.3 s per commit on the USB research volume, so 500/commit capped throughput
+    # near 400 events/s. Never waits for more events; durability is unchanged.
+    WRITER_BATCH_MAX = 4000
+
     def __init__(self, cfg: Settings = settings) -> None:
         self.cfg = cfg
         self.api = PublicKalshiAPI()
@@ -808,7 +813,7 @@ class Collector:
             except TimeoutError:
                 await flush_aged_buffer("IDLE_BUFFER_AGE")
                 continue
-            while len(batch) < 500:
+            while len(batch) < self.WRITER_BATCH_MAX:
                 try:
                     batch.append(self.queue.get_nowait())
                 except asyncio.QueueEmpty:

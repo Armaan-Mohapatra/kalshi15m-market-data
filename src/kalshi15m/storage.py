@@ -157,7 +157,7 @@ class Storage:
         self.connection.execute("PRAGMA busy_timeout=15000")
         # Default 2 MiB cache re-reads B-tree interior pages from disk on every
         # dedupe lookup once the journal reaches GBs (slow on the USB data volume).
-        self.connection.execute("PRAGMA cache_size=-65536")
+        self.connection.execute(f"PRAGMA cache_size=-{self.cfg.sqlite_cache_kib}")
         self.connection.execute(
             """CREATE TABLE IF NOT EXISTS market_events (
                 dedupe_key TEXT PRIMARY KEY,

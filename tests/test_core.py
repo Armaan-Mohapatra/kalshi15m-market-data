@@ -2426,6 +2426,41 @@ class WriterLoopTests(unittest.IsolatedAsyncioTestCase):
                 await loop.run_in_executor(pool, store.close)
                 pool.shutdown(wait=True)
 
+    async def test_writer_group_commits_a_full_queue_in_one_batch(self):
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary), min_free_bytes=0)
+            store = Storage(cfg)
+            pool = ThreadPoolExecutor(max_workers=1)
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(pool, store.open)
+            collector = Collector.__new__(Collector)
+            collector.stopping = asyncio.Event()
+            collector.queue = asyncio.Queue(maxsize=2000)
+            collector.storage = store
+            collector.writer_pool = pool
+            collector.status = RuntimeStatus(cfg)
+            for index in range(1200):
+                collector.queue.put_nowait(_trade(index))
+            sizes = []
+            real_append = store.append_batch
+
+            def recording_append(batch):
+                sizes.append(len(batch))
+                return real_append(batch)
+
+            store.append_batch = recording_append
+            writer = asyncio.create_task(collector.writer_loop())
+            try:
+                await asyncio.wait_for(collector.queue.join(), timeout=10)
+                # One drain, one fsync: not three 500-event commits.
+                self.assertEqual(sizes, [1200])
+                self.assertEqual(store.events_inserted, 1200)
+            finally:
+                collector.stopping.set()
+                await asyncio.wait_for(writer, timeout=4)
+                await loop.run_in_executor(pool, store.close)
+                pool.shutdown(wait=True)
+
     async def test_writer_retains_batch_until_transient_sqlite_failure_recovers(self):
         with TemporaryDirectory() as temporary:
             cfg = Settings(home=Path(temporary))
@@ -2607,6 +2642,7 @@ class WriterLoopTests(unittest.IsolatedAsyncioTestCase):
             collector.storage = store
             collector.writer_pool = ThreadPoolExecutor(max_workers=1)
             collector.status = RuntimeStatus(cfg)
+            collector.WRITER_BATCH_MAX = 500  # this test needs two batches (500 + 1)
             for index in range(501):
                 event_id = f"busy-flush-{index}"
                 collector.queue.put_nowait(

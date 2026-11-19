@@ -67,6 +67,10 @@ class Settings:
     # Archive recovery keeps its fingerprint index in a file under home (so it
     # lives on the research volume, never %TEMP%) and refuses to grow past this.
     recovery_index_max_bytes: int = 4 * 1024**3
+    # Journal page cache. dedupe_key is a random SHA-256, so the primary-key index
+    # is a random-access B-tree: 64 MiB measured ~5.6 ms/event cold, 256 MiB ~1.3.
+    # 160 MiB trades speed against the host's scarce free RAM.
+    sqlite_cache_kib: int = int(os.environ.get("KALSHI15M_SQLITE_CACHE_KIB", 160 * 1024))
 
     @property
     def recovery_workspace_dir(self) -> Path:
