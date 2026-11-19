@@ -6,6 +6,7 @@ import logging
 import logging.handlers
 import os
 import shutil
+import sys
 import threading
 import time
 import uuid
@@ -65,6 +66,21 @@ def configure_logging(cfg: Settings) -> None:
     root.setLevel(logging.INFO)
     root.handlers.clear()
     root.addHandler(handler)
+
+
+GIL_SWITCH_INTERVAL_SECONDS = 0.0005
+
+
+def tune_gil_switch_interval() -> None:
+    """Stop the writer thread convoying behind the event loop for the GIL.
+
+    The writer calls the zstd compressor once per event; that call releases the GIL and
+    must re-acquire it from the busy event-loop thread, which at the default 5 ms switch
+    interval is handed over only every few ms. Measured on the same 4,000-event batch:
+    65 ms alone, 75,730 ms against a CPU-busy thread at 5 ms, 145 ms at 0.5 ms. Live
+    append_prepare was 3-4 s per cycle against ~120 ms of real work.
+    """
+    sys.setswitchinterval(GIL_SWITCH_INTERVAL_SECONDS)
 
 
 def source_fingerprint() -> dict[str, Any]:
@@ -436,6 +452,7 @@ class Collector:
     WRITER_BATCH_MAX = 4000
 
     def __init__(self, cfg: Settings = settings) -> None:
+        tune_gil_switch_interval()
         self.cfg = cfg
         self.writer_timing_ema = {}
         self.api = PublicKalshiAPI()

@@ -464,6 +464,24 @@ class RuntimeStatusTests(unittest.TestCase):
             self.assertEqual(idle["strategy_rest_poll_health"], "NOT_DUE_OUTSIDE_ENTRY_WINDOW")
 
 
+class GilSwitchIntervalTests(unittest.TestCase):
+    def test_tuning_shortens_the_switch_interval_and_collector_applies_it(self):
+        from kalshi15m.worker import GIL_SWITCH_INTERVAL_SECONDS, tune_gil_switch_interval
+
+        before = sys.getswitchinterval()
+        try:
+            sys.setswitchinterval(0.005)
+            tune_gil_switch_interval()
+            self.assertAlmostEqual(sys.getswitchinterval(), GIL_SWITCH_INTERVAL_SECONDS, places=6)
+            self.assertLessEqual(GIL_SWITCH_INTERVAL_SECONDS, 0.0005)  # 1 ms was NOT enough when measured
+            sys.setswitchinterval(0.005)
+            with TemporaryDirectory() as tmp:
+                Collector(Settings(home=Path(tmp), min_free_bytes=0))
+            self.assertAlmostEqual(sys.getswitchinterval(), GIL_SWITCH_INTERVAL_SECONDS, places=6)
+        finally:
+            sys.setswitchinterval(before)
+
+
 class ManifestHeadCacheTests(unittest.TestCase):
     def test_appends_and_checkpoints_do_not_reread_the_manifest(self):
         with TemporaryDirectory() as tmp:
