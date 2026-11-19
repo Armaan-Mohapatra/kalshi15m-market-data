@@ -138,7 +138,12 @@ def _child_main(cfg: Settings, conn) -> None:
             if kind == "append":
                 _, request_id, events = message
                 try:
-                    send(("ack", request_id, store.append_batch(events)))
+                    wall0, cpu0 = time.perf_counter(), time.thread_time()
+                    inserted = store.append_batch(events)
+                    send((
+                        "ack", request_id, inserted,
+                        (time.perf_counter() - wall0) * 1000, (time.thread_time() - cpu0) * 1000,
+                    ))
                 except Exception as exc:
                     LOG.exception("journal process append failed")
                     send(("err", request_id, f"{type(exc).__name__}: {exc}"))
@@ -191,6 +196,8 @@ class ProcessJournalStorage(Storage):
         self._next_id = 0
         self._id_lock = threading.Lock()
         self._cache_status: dict[str, Any] = {}
+        self._timing_ema: dict[str, float] = {}
+        self._last_ack_monotonic: float | None = None
         self._buffered_rows = 0
         self._raw_flag = True
         self._ready: Future = Future()
@@ -240,6 +247,11 @@ class ProcessJournalStorage(Storage):
             future.set_exception(RuntimeError(f"journal process pipe failed: {exc}"))
         return future
 
+    def _note(self, key: str, value: float) -> None:
+        """EMA (alpha 0.2) of one pipe-path timing, in ms: where does a batch's time go?"""
+        ema = self._timing_ema
+        ema[key] = value if key not in ema else 0.8 * ema[key] + 0.2 * value
+
     def _apply_state(self, state: dict[str, Any]) -> None:
         for name in _MIRRORED:
             if name == "raw_capture_enabled":
@@ -269,6 +281,9 @@ class ProcessJournalStorage(Storage):
                 else:
                     self._ready.set_exception(RuntimeError(f"journal process failed to start: {message[2]}"))
             else:  # ack / rpc / err
+                if kind == "ack" and len(message) >= 5:
+                    self._note("child_wall", message[3])
+                    self._note("child_cpu", message[4])
                 future = self._pending.pop(message[1], None)
                 if future is None:
                     continue
@@ -303,7 +318,15 @@ class ProcessJournalStorage(Storage):
         self.parquet_recovery_state = recovery_state
 
     def append_batch(self, events: list[dict[str, Any]]) -> int:
-        return int(self._request("append", events).result(timeout=CALL_TIMEOUT_SECONDS))
+        started = time.perf_counter()
+        if self._last_ack_monotonic is not None:  # parent-side time between two batches
+            self._note("gap", (time.monotonic() - self._last_ack_monotonic) * 1000)
+        future = self._request("append", events)
+        self._note("send", (time.perf_counter() - started) * 1000)  # pickle + pipe write
+        result = int(future.result(timeout=CALL_TIMEOUT_SECONDS))
+        self._note("rpc", (time.perf_counter() - started) * 1000)
+        self._last_ack_monotonic = time.monotonic()
+        return result
 
     def _call(self, method: str, *args: Any, **kwargs: Any) -> Any:
         return self._request("call", method, args, kwargs).result(timeout=CALL_TIMEOUT_SECONDS)
@@ -335,6 +358,7 @@ class ProcessJournalStorage(Storage):
             # recomputed against our own fresh read: the child's probe predates our commits
             storage_paper_watermark_matches_disk=(latest_paper == self.latest_paper_record_utc),
             journal_process_alive=self.child_alive,
+            journal_pipe_ms_ema={k: round(v, 1) for k, v in self._timing_ema.items()},
             journal_process_pid=self._process.pid if self._process is not None else None,
         )
         if disk_paper is None:

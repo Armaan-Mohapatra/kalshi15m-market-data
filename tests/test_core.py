@@ -3922,3 +3922,20 @@ class AsyncFlushTests(unittest.TestCase):
             self.assertEqual(store.journal_pruned_rows, 12 - remaining)
             self.assertEqual(sorted(_archived_keys(cfg)), _expected(12))
             store.close()
+
+
+class JournalPipeTimingTests(unittest.TestCase):
+    def test_status_reports_where_a_batch_spends_its_time(self):
+        from kalshi15m.journal_process import ProcessJournalStorage
+
+        with TemporaryDirectory() as tmp:
+            store = ProcessJournalStorage(Settings(home=Path(tmp), min_free_bytes=0))
+            store.open()
+            try:
+                store.append_batch([_trade(i) for i in range(20)])
+                store.append_batch([_trade(i) for i in range(20, 40)])
+                timing = store.connection_status()["journal_pipe_ms_ema"]
+                self.assertTrue({"rpc", "send", "gap", "child_wall", "child_cpu"} <= set(timing))
+                self.assertGreaterEqual(timing["rpc"], timing["child_wall"])  # transit is never negative
+            finally:
+                store.close()
