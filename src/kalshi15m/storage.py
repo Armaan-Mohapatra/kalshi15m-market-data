@@ -344,6 +344,7 @@ class Storage:
             "parquet_last_flush_reason": self.parquet_last_flush_reason,
             "parquet_dropped_rows": self.parquet_dropped_rows,
             "writer_phase_ms_ema": {k: round(v, 1) for k, v in self.phase_ms_ema.items()},
+            "parquet_flush_rows_threshold": self.parquet_flush_rows,
             "archive_integrity_state": self.archive_integrity_state,
             "archive_recovery_reason": self.parquet_recovery_reason,
             "archive_recovery_files_scanned": self.parquet_recovery_files_scanned,
@@ -977,7 +978,7 @@ class Storage:
         rows = self.parquet_buffer
         # _write_partitioned_parquet adds each published file's size to
         # parquet_bytes; the periodic audit reconciles with a directory walk.
-        flush_clock = time.perf_counter()
+        flush_clock = flush_started = time.perf_counter()
         published = self._write_partitioned_parquet(rows)
         flush_clock = self._phase("flush_write_files", flush_clock)
         through = self.parquet_buffer_through
@@ -1004,7 +1005,22 @@ class Storage:
         self.parquet_last_flush_utc = datetime.now(timezone.utc).isoformat()
         self.parquet_last_flush_rows = len(rows)
         self.parquet_last_flush_reason = reason
+        self._adapt_flush_rows(time.perf_counter() - flush_started)
         return self.parquet_last_flush_rows
+
+    FLUSH_ROWS_BASE = 2000
+    FLUSH_ROWS_CAP = 16000  # ~60 MB buffered; the SQLite journal already holds these rows durably
+
+    def _adapt_flush_rows(self, seconds: float) -> None:
+        """A flush is ~8 fsyncs on the research volume, measured at 5-18 s under load.
+
+        When flushes are slow, flush less often (bigger, fewer files); when fast, return
+        toward the base. Never shrinks below a smaller value set explicitly.
+        """
+        if seconds > 1.0:
+            self.parquet_flush_rows = min(self.FLUSH_ROWS_CAP, self.parquet_flush_rows * 2)
+        elif seconds < 0.25 and self.parquet_flush_rows > self.FLUSH_ROWS_BASE:
+            self.parquet_flush_rows = max(self.FLUSH_ROWS_BASE, self.parquet_flush_rows // 2)
 
     def flush_parquet_if_due(self, reason: str = "AGED_BUFFER") -> int:
         """Flush an aged buffer regardless of whether the event queue is busy."""

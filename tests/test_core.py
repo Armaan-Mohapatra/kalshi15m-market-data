@@ -464,6 +464,34 @@ class RuntimeStatusTests(unittest.TestCase):
             self.assertEqual(idle["strategy_rest_poll_health"], "NOT_DUE_OUTSIDE_ENTRY_WINDOW")
 
 
+class AdaptiveFlushThresholdTests(unittest.TestCase):
+    def test_slow_flushes_double_the_threshold_to_a_cap_and_fast_ones_decay_to_base(self):
+        with TemporaryDirectory() as tmp:
+            store = Storage(Settings(home=Path(tmp), min_free_bytes=0))
+            self.assertEqual(store.parquet_flush_rows, 2000)
+            seen = []
+            for _ in range(5):
+                store._adapt_flush_rows(5.0)  # slow flush
+                seen.append(store.parquet_flush_rows)
+            self.assertEqual(seen, [4000, 8000, 16000, 16000, 16000])  # capped
+            for _ in range(5):
+                store._adapt_flush_rows(0.05)  # fast flush
+            self.assertEqual(store.parquet_flush_rows, 2000)  # back to base, not below
+            store._adapt_flush_rows(0.5)  # in between: unchanged
+            self.assertEqual(store.parquet_flush_rows, 2000)
+            store.parquet_flush_rows = 1  # an explicit smaller value is left alone by fast flushes
+            store._adapt_flush_rows(0.05)
+            self.assertEqual(store.parquet_flush_rows, 1)
+
+    def test_real_flush_reports_threshold_in_status(self):
+        with TemporaryDirectory() as tmp:
+            store = Storage(Settings(home=Path(tmp), min_free_bytes=0))
+            store.open()
+            store.append_batch([_trade(i) for i in range(2100)])
+            self.assertIn("parquet_flush_rows_threshold", store.connection_status())
+            store.close()
+
+
 class WriterPhaseTimingTests(unittest.TestCase):
     def test_phases_are_recorded_and_exposed_in_status(self):
         with TemporaryDirectory() as tmp:
