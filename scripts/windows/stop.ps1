@@ -1,5 +1,7 @@
 param(
-    [ValidateRange(1,30)][int]$GracefulWaitSeconds = 30,
+    # A saturated queue takes 110-281 s to drain before the worker exits; a 30 s
+    # wait then deleted stop.request before the worker's loop ever read it.
+    [ValidateRange(1,900)][int]$GracefulWaitSeconds = 600,
     [switch]$KeepSupervisorPausedOnTimeout
 )
 $ErrorActionPreference = 'Stop'
