@@ -33,7 +33,7 @@ class ResearchCycleTests(unittest.TestCase):
             first = rc.cycle(home)
             self.assertEqual((first["result"], first["new_settlements"]), ("PROCESSED", 6))
             self.assertEqual(first["profiles"]["P"]["net_pnl"], 0.75)
-            self.assertEqual(first["profiles"]["P"]["verdict"], "NO_DEMONSTRATED_EDGE_KEEP_PAPER_ONLY")
+            self.assertEqual(first["profiles"]["P"]["verdict"], "INSUFFICIENT_DATA_KEEP_PAPER_ONLY")  # 6 markets
             self.assertEqual(rc.cycle(home)["result"], "NO_NEW_FINALIZED_MARKETS")
             db = sqlite3.connect(home / "data" / "paper_ledger.sqlite3")
             add_settlements(db, ["0.1", "0.1"], 6)
@@ -42,6 +42,15 @@ class ResearchCycleTests(unittest.TestCase):
             third = rc.cycle(home)
             self.assertEqual((third["result"], third["new_settlements"]), ("PROCESSED", 2))
             self.assertEqual(third["profiles"]["P"]["settlements"], 8)
+
+    def test_verdict_is_derived_from_the_interval_and_never_promotes(self):
+        self.assertEqual(rc.verdict(10, (1.0, 2.0)), "INSUFFICIENT_DATA_KEEP_PAPER_ONLY")  # too few markets
+        self.assertEqual(rc.verdict(100, None), "INSUFFICIENT_DATA_KEEP_PAPER_ONLY")
+        self.assertEqual(rc.verdict(100, (-3.0, 4.0)), "NO_DEMONSTRATED_EDGE_KEEP_PAPER_ONLY")  # interval spans 0
+        self.assertEqual(rc.verdict(100, (-9.0, -1.0)), "NEGATIVE_NET_RETURN_KEEP_PAPER_ONLY")
+        positive = rc.verdict(100, (0.5, 8.0))
+        self.assertTrue(positive.startswith("POSITIVE_FORWARD_PAPER"))
+        self.assertTrue(positive.endswith("KEEP_PAPER_ONLY"))  # a good number still needs protected OOS
 
     def test_too_few_events_gives_no_interval(self):
         self.assertIsNone(rc.cluster_ci([[1.0], [2.0]], 1))

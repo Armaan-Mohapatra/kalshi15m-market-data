@@ -48,6 +48,20 @@ def cluster_ci(clusters: list[list[float]], seed: int) -> tuple[float, float] | 
     return round(totals[int(0.025 * BOOTSTRAP)], 4), round(totals[int(0.975 * BOOTSTRAP)], 4)
 
 
+MIN_MARKETS_FOR_VERDICT = 30  # below this the bootstrap interval is not worth reading
+
+
+def verdict(markets: int, ci: tuple[float, float] | None) -> str:
+    """Label from the numbers. Never promotes: every label keeps the profile paper-only."""
+    if ci is None or markets < MIN_MARKETS_FOR_VERDICT:
+        return "INSUFFICIENT_DATA_KEEP_PAPER_ONLY"
+    if ci[0] > 0:
+        return "POSITIVE_FORWARD_PAPER_NEEDS_OOS_VALIDATION_KEEP_PAPER_ONLY"
+    if ci[1] < 0:
+        return "NEGATIVE_NET_RETURN_KEEP_PAPER_ONLY"
+    return "NO_DEMONSTRATED_EDGE_KEEP_PAPER_ONLY"
+
+
 def cycle(home: Path, seed: int = 7) -> dict:
     checkpoint_path = home / "reports" / "research_checkpoint.json"
     try:
@@ -66,12 +80,13 @@ def cycle(home: Path, seed: int = 7) -> dict:
     profiles = {}
     for profile, markets in by_profile.items():
         values = [v for m in markets.values() for v in m]
+        ci = cluster_ci(list(markets.values()), seed)
         profiles[profile] = {
             "settlements": len(values), "markets": len(markets), "net_pnl": round(sum(values), 4),
             "mean_per_settlement": round(sum(values) / len(values), 4),
             "hit_rate": round(sum(v > 0 for v in values) / len(values), 3),
-            "net_pnl_ci95_cluster_bootstrap": cluster_ci(list(markets.values()), seed),
-            "verdict": "NO_DEMONSTRATED_EDGE_KEEP_PAPER_ONLY",  # never auto-promotes
+            "net_pnl_ci95_cluster_bootstrap": ci,
+            "verdict": verdict(len(markets), ci),
         }
     report = {"completed_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "result": "PROCESSED",
               "new_settlements": len(fresh), "profiles": profiles, "partition": "FORWARD_PAPER_ONLY",
