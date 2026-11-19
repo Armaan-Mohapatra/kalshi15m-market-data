@@ -13,10 +13,14 @@ import argparse
 import json
 import random
 import sqlite3
+import sys
 import time
 from collections import defaultdict
 from decimal import Decimal
 from pathlib import Path
+
+# Task Scheduler runs `python -I script.py` (isolated: no cwd, no PYTHONPATH).
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 BOOTSTRAP = 2000
 

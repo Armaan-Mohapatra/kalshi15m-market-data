@@ -11,10 +11,15 @@ import csv
 import html
 import json
 import sqlite3
+import sys
 import time
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+
+# Task Scheduler runs `python -I script.py` (isolated: no cwd, no PYTHONPATH), so the
+# collector's own package must be added explicitly.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 STATUS_KEYS = (
     "service_state", "mode", "heartbeat_utc", "storage_latest_market_event_received_utc", "rest_state",
