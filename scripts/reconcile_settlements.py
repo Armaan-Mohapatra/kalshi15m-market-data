@@ -1,0 +1,107 @@
+"""Read-only settlement reconciliation of the paper ledger against Kalshi public REST.
+
+For every PAPER_SETTLEMENT_FINAL record: re-fetch the market, compare result and
+status with what the ledger recorded, and recompute payout/gross/net from the
+recorded quantity, entry price and fees. Anything that cannot be confirmed is
+reported UNRESOLVED; nothing is inferred from prices. Never writes to the ledger.
+
+usage: python scripts/reconcile_settlements.py [--ledger PATH] [--out PATH] [--sleep 0.4]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sqlite3
+import sys
+import time
+import urllib.error
+import urllib.request
+from decimal import Decimal
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from kalshi15m.config import REST_BASE  # noqa: E402
+
+D = Decimal
+
+
+def fetch_market(ticker: str) -> dict | None:
+    request = urllib.request.Request(
+        f"{REST_BASE}/markets/{ticker}", headers={"Accept": "application/json", "User-Agent": "k15m-reconcile/1"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            return json.load(response).get("market")
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        return None
+
+
+def recompute(p: dict) -> dict:
+    qty, cost = D(p["quantity"]), D(p["cost_dollars"])
+    won = p["side"] == p["settlement_result"]
+    payout = qty if won else D(0)
+    gross = payout - cost
+    net = gross - D(p["entry_fee_dollars"]) - D(p["settlement_fee_dollars"])
+    return {"payout": payout, "gross": gross, "net": net}
+
+
+def reconcile(ledger: Path, sleep: float) -> dict:
+    db = sqlite3.connect("file:" + ledger.as_posix() + "?mode=ro", uri=True, timeout=30)
+    rows = db.execute(
+        "select profile_id, idempotency_key, payload_json from paper_ledger "
+        "where record_type = 'PAPER_SETTLEMENT_FINAL' order by created_utc"
+    ).fetchall()
+    db.close()  # release the file handle (Windows keeps it locked otherwise)
+    out, cache = [], {}
+    for profile, key, raw in rows:
+        p = json.loads(raw)
+        ticker = p["market_ticker"]
+        if ticker not in cache:
+            cache[ticker] = fetch_market(ticker)
+            time.sleep(sleep)
+        market = cache[ticker]
+        calc = recompute(p)
+        issues = []
+        if market is None:
+            status = "UNRESOLVED_OFFICIAL_OUTCOME_UNAVAILABLE"
+        else:
+            if market.get("status") not in ("finalized", "settled"):
+                issues.append(f"official_status={market.get('status')}")
+            if market.get("result") != p["settlement_result"]:
+                issues.append(f"result ledger={p['settlement_result']} official={market.get('result')}")
+            status = "MATCH"
+        for name, field in (("payout", "payout_dollars"), ("gross", "gross_pnl_dollars"), ("net", "net_pnl_dollars")):
+            if calc[name] != D(p[field]):
+                issues.append(f"{name} recorded={p[field]} recomputed={calc[name]}")
+        if issues:
+            status = "DISCREPANCY" if market is not None else status
+        out.append({"profile": profile, "ticker": ticker, "side": p["side"], "status": status,
+                    "issues": issues, "net_pnl_recorded": p["net_pnl_dollars"], "key": key})
+    counts: dict[str, int] = {}
+    for item in out:
+        counts[item["status"]] = counts.get(item["status"], 0) + 1
+    by_profile: dict[str, str] = {}
+    for item in out:
+        by_profile[item["profile"]] = str(D(by_profile.get(item["profile"], "0")) + D(item["net_pnl_recorded"]))
+    return {"checked_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "settlements": len(out),
+            "counts": counts, "net_pnl_recorded_by_profile": by_profile,
+            "unmatched": [i for i in out if i["status"] != "MATCH"]}
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ledger", default=r"E:\PhoenixLab\runtime\k15m-native\data\paper_ledger.sqlite3")
+    ap.add_argument("--out", default=r"E:\PhoenixLab\runtime\k15m-native\reports\settlement_reconciliation.json")
+    ap.add_argument("--sleep", type=float, default=0.4)
+    args = ap.parse_args()
+    report = reconcile(Path(args.ledger), args.sleep)
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.out).write_text(json.dumps(report, indent=2), encoding="utf-8")
+    print(json.dumps({k: report[k] for k in ("checked_utc", "settlements", "counts", "net_pnl_recorded_by_profile")}))
+    for item in report["unmatched"]:
+        print("UNMATCHED", item["ticker"], item["status"], item["issues"])
+    return 0 if not report["unmatched"] else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
