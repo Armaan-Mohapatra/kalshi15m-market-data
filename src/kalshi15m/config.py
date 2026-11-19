@@ -77,6 +77,10 @@ class Settings:
     # Free space guards on the journal's own volume (it may not be the research volume):
     # below LOW optional capture is throttled; below CRITICAL the worker stops
     # gracefully before a full disk can corrupt the journal.
+    # Rows older than this that the manifest-backed Parquet checkpoint already covers
+    # are deleted from the SQLite journal so it stops growing (owner-approved
+    # 2026-11-19 for P8). 0 = never prune (default).
+    journal_retention_seconds: int = int(float(os.environ.get("KALSHI15M_JOURNAL_RETENTION_HOURS", "0")) * 3600)
     ledger_min_free_bytes: int = 5 * 1024**3
     ledger_critical_free_bytes: int = 1 * 1024**3
     # Durability of market-event batch commits (owner-approved 2026-11-19: the USB

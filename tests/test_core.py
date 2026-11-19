@@ -3390,6 +3390,67 @@ def _expected(count):
     return sorted(f"trade-{i}" for i in range(count))
 
 
+class JournalRetentionTests(unittest.TestCase):
+    def _store(self, tmp, retention=3600):
+        cfg = Settings(home=Path(tmp), min_free_bytes=0, journal_retention_seconds=retention)
+        store = Storage(cfg)
+        store.open()
+        store.PRUNE_BATCH_ROWS = 3
+        store.PRUNE_MIN_INTERVAL_SECONDS = 0
+        return cfg, store
+
+    def test_only_archived_old_rows_are_pruned_and_a_restart_still_verifies(self):
+        with TemporaryDirectory() as tmp:
+            cfg, store = self._store(tmp)
+            store.append_batch([_trade(i) for i in range(10)])
+            store.flush_parquet(reason="TEST")  # checkpoint through row 10, prunes rows 1-3
+            while store.prune_journal():
+                pass
+            count = lambda: store.connection.execute("SELECT count(*) FROM market_events").fetchone()[0]
+            self.assertEqual(count(), 1)  # the checkpoint row itself is always kept
+            self.assertEqual(store.journal_pruned_rows, 9)
+            self.assertEqual(sorted(_archived_keys(cfg)), _expected(10))  # nothing lost
+            store.append_batch([_trade(10)])
+            self.assertEqual(store.latest_event[0], 11)  # rowids keep counting, none reused
+            store.flush_parquet(reason="TEST")
+            store.close()
+            again = Storage(cfg)
+            again.open()
+            self.assertEqual(again.archive_integrity_state, "VERIFIED_COMPLETE_CLEAN_STOP_CHECKPOINT")
+            self.assertTrue(again.verify_archive(full=True)["ok"])
+            again.close()
+
+    def test_nothing_is_pruned_while_a_gap_is_pending_or_retention_is_off(self):
+        with TemporaryDirectory() as tmp:
+            cfg, store = self._store(tmp)
+            store.append_batch([_trade(i) for i in range(10)])
+            store.archive_gap_pending = True  # e.g. rows dropped before reaching Parquet
+            store.flush_parquet(reason="TEST")
+            self.assertEqual(store.prune_journal(), 0)
+            self.assertEqual(store.journal_prune_blocked, "NO_CHECKPOINT_THIS_RUN")
+            store.checkpoint_rowid_this_run = 10  # even with a stale checkpoint in hand
+            self.assertEqual(store.prune_journal(), 0)
+            self.assertEqual(store.journal_prune_blocked, "ARCHIVE_GAP_OR_MANIFEST_FAILURE")
+            store.close()
+        with TemporaryDirectory() as tmp:
+            cfg, store = self._store(tmp, retention=0)
+            store.append_batch([_trade(i) for i in range(10)])
+            store.flush_parquet(reason="TEST")
+            self.assertEqual(store.prune_journal(), 0)
+            self.assertEqual(store.connection.execute("SELECT count(*) FROM market_events").fetchone()[0], 10)
+            store.close()
+
+    def test_rows_inside_the_retention_window_are_kept(self):
+        with TemporaryDirectory() as tmp:
+            cfg, store = self._store(tmp, retention=3600)
+            fresh = datetime.now(timezone.utc).isoformat()
+            store.append_batch([dict(_trade(i), received_utc=fresh) for i in range(10)])
+            store.flush_parquet(reason="TEST")
+            self.assertEqual(store.prune_journal(), 0)
+            self.assertEqual(store.connection.execute("SELECT count(*) FROM market_events").fetchone()[0], 10)
+            store.close()
+
+
 class ArchiveManifestIntegrityTests(unittest.TestCase):
     def test_same_size_corruption_of_newest_file_forces_full_scan_without_loss_or_dupes(self):
         with TemporaryDirectory() as temporary:

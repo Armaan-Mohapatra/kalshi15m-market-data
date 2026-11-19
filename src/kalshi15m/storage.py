@@ -147,6 +147,12 @@ class Storage:
         self.archive_manifest_failures = 0
         self.archive_checkpoint_write_failures = 0
         self.archive_quarantined_files = 0
+        # Journal retention: rowid of the checkpoint THIS process wrote (None until
+        # the first one, so a fresh start never prunes on an inherited checkpoint).
+        self.checkpoint_rowid_this_run: int | None = None
+        self.journal_pruned_rows = 0
+        self.journal_prune_last_monotonic = 0.0
+        self.journal_prune_blocked: str | None = None
         self.parquet_size_reconcile_interval_seconds = 300.0
         self.parquet_size_reconcile_last_monotonic = 0.0
         self.persistence_audit_interval_seconds = 15.0
@@ -354,6 +360,9 @@ class Storage:
             "archive_manifest_failures": self.archive_manifest_failures,
             "archive_checkpoint_write_failures": self.archive_checkpoint_write_failures,
             "archive_quarantined_files": self.archive_quarantined_files,
+            "journal_retention_seconds": self.cfg.journal_retention_seconds,
+            "journal_pruned_rows": self.journal_pruned_rows,
+            "journal_prune_blocked": self.journal_prune_blocked,
         }
 
     def _refresh_persistence_audit(self) -> None:
@@ -586,9 +595,70 @@ class Storage:
         """
         try:
             self._write_archive_checkpoint_file(through)
+            self.checkpoint_rowid_this_run = int(through[0])
         except OSError:
             self.archive_checkpoint_write_failures += 1
             LOG.warning("archive checkpoint write failed; older checkpoint kept", exc_info=True)
+
+    PRUNE_BATCH_ROWS = 10_000
+    PRUNE_MIN_INTERVAL_SECONDS = 5.0
+
+    def prune_journal(self, *, now: datetime | None = None) -> int:
+        """Delete one bounded batch of journal rows that are verifiably archived.
+
+        Only rows strictly below the checkpoint this process wrote (files fsynced,
+        manifest-listed, journal WAL-durable) and older than the retention window go.
+        Nothing is deleted while a gap is pending or integrity is not VERIFIED_COMPLETE*,
+        so a row whose only copy is the journal is never removed. Freed pages are reused,
+        so the file stops growing instead of shrinking. paper_ledger is never touched.
+        """
+        retention = self.cfg.journal_retention_seconds
+        if retention <= 0 or self.connection is None:
+            return 0
+        blocked = None
+        if self.checkpoint_rowid_this_run is None:
+            blocked = "NO_CHECKPOINT_THIS_RUN"
+        elif self.archive_gap_pending or self.archive_manifest_failures:
+            blocked = "ARCHIVE_GAP_OR_MANIFEST_FAILURE"
+        elif not self.archive_integrity_state.startswith("VERIFIED_COMPLETE"):
+            blocked = f"INTEGRITY_{self.archive_integrity_state}"
+        elif self.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='market_event_versions'"
+        ).fetchone():
+            blocked = "LEGACY_VERSIONS_TABLE"  # a checkpoint cannot vouch for it
+        self.journal_prune_blocked = blocked
+        if blocked:
+            return 0
+        tick = time.monotonic()
+        if tick - self.journal_prune_last_monotonic < self.PRUNE_MIN_INTERVAL_SECONDS:
+            return 0
+        self.journal_prune_last_monotonic = tick
+        edge = self.connection.execute(  # OFFSET scans only one batch from the oldest row
+            "SELECT rowid, received_utc FROM market_events ORDER BY rowid LIMIT 1 OFFSET ?",
+            (self.PRUNE_BATCH_ROWS - 1,),
+        ).fetchone()
+        if edge is None or int(edge[0]) >= self.checkpoint_rowid_this_run:
+            return 0
+        try:
+            received = datetime.fromisoformat(str(edge[1]).replace("Z", "+00:00"))
+        except ValueError:
+            return 0  # unparseable timestamp: keep the rows
+        if received.tzinfo is None:
+            received = received.replace(tzinfo=timezone.utc)
+        cutoff = (now or datetime.now(timezone.utc)).timestamp() - retention
+        if received.timestamp() >= cutoff:
+            return 0
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            deleted = self.connection.execute(
+                "DELETE FROM market_events WHERE rowid <= ?", (int(edge[0]),)
+            ).rowcount
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+        self.journal_pruned_rows += max(0, deleted)
+        return deleted
 
     def _write_archive_checkpoint_file(self, through: tuple[int, str]) -> None:
         manifest_seq, manifest_head, _ = self._manifest_state()
@@ -1013,7 +1083,12 @@ class Storage:
             flush_clock = self._phase("flush_wal_barrier", flush_clock)
             if durable:
                 self._write_archive_checkpoint(through)
-                self._phase("flush_checkpoint_file", flush_clock)
+                flush_clock = self._phase("flush_checkpoint_file", flush_clock)
+                try:
+                    self.prune_journal()
+                except sqlite3.Error:
+                    LOG.warning("journal prune failed; rows kept", exc_info=True)
+                self._phase("flush_prune", flush_clock)
             else:
                 self.archive_checkpoint_write_failures += 1
         self.parquet_buffer = []
@@ -1299,8 +1374,9 @@ class Storage:
     def database_metrics(self, *, full_integrity_check: bool = False) -> dict[str, Any]:
         """Cheap shutdown metrics; the full-page integrity scan is opt-in.
 
-        market_events rows are never deleted and INSERT OR IGNORE consumes no
-        rowid when it ignores, so max(rowid) equals the row count without a scan.
+        INSERT OR IGNORE consumes no rowid when it ignores, so max(rowid) is the
+        number of rows ever journaled (journal_pruned_rows of them may be deleted
+        under the retention policy) without a scan.
         """
         if self.connection is None:
             self.open()
