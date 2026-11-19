@@ -464,6 +464,20 @@ class RuntimeStatusTests(unittest.TestCase):
             self.assertEqual(idle["strategy_rest_poll_health"], "NOT_DUE_OUTSIDE_ENTRY_WINDOW")
 
 
+class SourceFingerprintTests(unittest.TestCase):
+    def test_status_reports_git_head_or_explicit_unknown(self):
+        from kalshi15m.worker import source_fingerprint
+
+        fingerprint = source_fingerprint()
+        commit = fingerprint["source_commit"]
+        self.assertTrue(commit == "UNKNOWN" or (len(commit) == 40 and int(commit, 16) >= 0))
+        with patch("subprocess.run", side_effect=FileNotFoundError):
+            self.assertEqual(source_fingerprint(), {"source_commit": "UNKNOWN", "source_dirty": None})
+        with TemporaryDirectory() as temporary:
+            status = RuntimeStatus(Settings(home=Path(temporary)))
+            self.assertIn("source_commit", status.snapshot())
+
+
 class WebSocketAuthTests(unittest.TestCase):
     def test_generic_exchange_credentials_do_not_enable_market_data_socket(self):
         with patch.dict(

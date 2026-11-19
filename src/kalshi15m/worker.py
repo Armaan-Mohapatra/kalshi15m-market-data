@@ -67,6 +67,20 @@ def configure_logging(cfg: Settings) -> None:
     root.addHandler(handler)
 
 
+def source_fingerprint() -> dict[str, Any]:
+    """Git HEAD of the running checkout, so status proves which code is live."""
+    import subprocess
+
+    root = Path(__file__).resolve().parents[2]
+    try:
+        run = lambda *a: subprocess.run(  # noqa: E731
+            ["git", "-C", str(root), *a], capture_output=True, text=True, timeout=10, check=True
+        ).stdout.strip()
+        return {"source_commit": run("rev-parse", "HEAD"), "source_dirty": bool(run("status", "--porcelain"))}
+    except Exception:  # no git on PATH or not a checkout: say so, never guess
+        return {"source_commit": "UNKNOWN", "source_dirty": None}
+
+
 class RuntimeStatus:
     def __init__(self, cfg: Settings) -> None:
         self.cfg = cfg
@@ -76,6 +90,7 @@ class RuntimeStatus:
         self.started_utc = utc_now()
         self.data: dict[str, Any] = {
             "service": "kalshi-15m-native",
+            **source_fingerprint(),
             "service_state": "STARTING",
             "mode": "PAPER_ONLY",
             "runtime_home": str(cfg.home.resolve()),
