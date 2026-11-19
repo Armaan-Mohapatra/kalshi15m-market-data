@@ -3991,3 +3991,24 @@ class PipelinedAppendTests(unittest.TestCase):
         self.assertEqual(stub._failed, [["b1"]])  # kept for the next attempt, nothing dropped
         self.assertEqual([p for _, p in stub.sent], [["b1"], ["b2"], ["b1"]])  # b3 never sent
 
+
+
+class NamedStackSamplingTests(unittest.TestCase):
+    def test_a_named_request_is_consumed_and_logged_separately(self):
+        import faulthandler
+        from kalshi15m.worker import start_stack_sampling
+
+        with TemporaryDirectory() as tmp:
+            runtime, logs = Path(tmp) / "runtime", Path(tmp) / "logs"
+            runtime.mkdir()
+            logs.mkdir()
+            (runtime / "journal_stack_sample.txt").write_text("0.2 1", encoding="utf-8")
+            (runtime / "stack_sample.txt").write_text("0.2 1", encoding="utf-8")  # the worker's own request
+            try:
+                self.assertTrue(start_stack_sampling(runtime, logs, "journal_stack_sample", "journal_stack_samples.log"))
+                self.assertFalse((runtime / "journal_stack_sample.txt").exists())
+                self.assertTrue((runtime / "journal_stack_sample.started.txt").exists())
+                self.assertTrue((runtime / "stack_sample.txt").exists())  # the other process's request is untouched
+                self.assertTrue((logs / "journal_stack_samples.log").exists())
+            finally:
+                faulthandler.cancel_dump_traceback_later()

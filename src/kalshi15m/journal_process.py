@@ -166,6 +166,14 @@ def _child_main(cfg: Settings, conn) -> None:
             if time.monotonic() - last_state >= STATE_INTERVAL_SECONDS:
                 send(("state", _snapshot(store, full=True)))
                 last_state = time.monotonic()
+                # On-demand profiling of THIS process: runtime/journal_stack_sample.txt holds
+                # '<interval> <duration>'; samples go to logs/journal_stack_samples.log.
+                if (cfg.runtime_dir / "journal_stack_sample.txt").exists():
+                    from .worker import start_stack_sampling
+
+                    start_stack_sampling(
+                        cfg.runtime_dir, cfg.log_dir, "journal_stack_sample", "journal_stack_samples.log"
+                    )
         try:
             store.close()
         except Exception:

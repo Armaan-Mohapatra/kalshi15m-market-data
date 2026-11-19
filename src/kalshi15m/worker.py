@@ -94,7 +94,12 @@ def parse_stack_sample_config(text: str) -> tuple[float, float] | None:
     return (interval, duration) if 0.2 <= interval <= 60 and 1 <= duration <= 1800 else None
 
 
-def start_stack_sampling(runtime_dir: Path, log_dir: Path) -> bool:
+def start_stack_sampling(
+    runtime_dir: Path,
+    log_dir: Path,
+    request: str = "stack_sample",
+    log_name: str = "stack_samples.log",
+) -> bool:
     """Opt-in poor-man's profiler: dump every thread's stack every N seconds for a bounded time.
 
     Enabled only if <runtime>/stack_sample.txt holds '<interval> <duration>'. Uses stdlib
@@ -103,17 +108,17 @@ def start_stack_sampling(runtime_dir: Path, log_dir: Path) -> bool:
     import faulthandler
 
     try:
-        config = parse_stack_sample_config((runtime_dir / "stack_sample.txt").read_text(encoding="utf-8"))
+        config = parse_stack_sample_config((runtime_dir / f"{request}.txt").read_text(encoding="utf-8"))
     except OSError:
         return False
     if config is None:
         return False
     interval, duration = config
     try:  # consume the request so a running process starts exactly one window per file
-        os.replace(runtime_dir / "stack_sample.txt", runtime_dir / "stack_sample.started.txt")
+        os.replace(runtime_dir / f"{request}.txt", runtime_dir / f"{request}.started.txt")
     except OSError:
         return False
-    handle = (log_dir / "stack_samples.log").open("a", buffering=1, encoding="utf-8")
+    handle = (log_dir / log_name).open("a", buffering=1, encoding="utf-8")
     faulthandler.dump_traceback_later(interval, repeat=True, file=handle)
     timer = threading.Timer(duration, faulthandler.cancel_dump_traceback_later)
     timer.daemon = True
