@@ -101,6 +101,9 @@ def _child_main(cfg: Settings, conn) -> None:
             send(("ready", False, "JOURNAL_PROCESS_ALREADY_RUNNING"))
             return
         store = Storage(cfg)
+        # Parquet/manifest/prune I/O (seconds per flush on the USB volume) must not stall
+        # appends: measured flush ~6 s vs ~0.2 s for everything else in an append.
+        store.async_flush = True
         done = threading.Event()
 
         def progress() -> None:  # recovery can take minutes: keep the parent informed

@@ -9,6 +9,7 @@ import sqlite3
 import time
 import uuid
 from collections import defaultdict
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -149,6 +150,12 @@ class Storage:
         self.archive_quarantined_files = 0
         # Journal retention: rowid of the checkpoint THIS process wrote (None until
         # the first one, so a fresh start never prunes on an inherited checkpoint).
+        self.async_flush = False  # the journal process turns this on
+        self._flush_executor: ThreadPoolExecutor | None = None
+        self._flush_future: Future | None = None
+        self._flush_inflight: tuple[list[dict[str, Any]], tuple[int, str] | None] | None = None
+        self._flush_conn: sqlite3.Connection | None = None
+        self.archive_async_flush_failures = 0
         self.checkpoint_rowid_this_run: int | None = None
         self.journal_pruned_rows = 0
         self.journal_prune_last_monotonic = 0.0
@@ -262,11 +269,12 @@ class Storage:
             self.connection.execute(f"PRAGMA synchronous={mode}")
             self.synchronous_mode = mode
 
-    def _make_journal_durable(self) -> bool:
+    def _make_journal_durable(self, connection: sqlite3.Connection | None = None) -> bool:
         """fsync everything committed so far; the archive checkpoint must not outrun it."""
-        assert self.connection is not None
+        connection = connection or self.connection
+        assert connection is not None
         try:
-            self.connection.execute("PRAGMA wal_checkpoint(FULL)").fetchall()
+            connection.execute("PRAGMA wal_checkpoint(FULL)").fetchall()
             return True
         except sqlite3.Error:
             LOG.warning("journal durability barrier failed; checkpoint not advanced", exc_info=True)
@@ -371,6 +379,8 @@ class Storage:
             "journal_retention_seconds": self.cfg.journal_retention_seconds,
             "journal_pruned_rows": self.journal_pruned_rows,
             "journal_prune_blocked": self.journal_prune_blocked,
+            "parquet_flush_in_flight": bool(self._flush_future is not None and not self._flush_future.done()),
+            "archive_async_flush_failures": self.archive_async_flush_failures,
         }
 
     def _refresh_persistence_audit(self) -> None:
@@ -608,20 +618,26 @@ class Storage:
             self.archive_checkpoint_write_failures += 1
             LOG.warning("archive checkpoint write failed; older checkpoint kept", exc_info=True)
 
-    PRUNE_BATCH_ROWS = 10_000
+    PRUNE_BATCH_ROWS = 5_000
     PRUNE_MIN_INTERVAL_SECONDS = 5.0
+    PRUNE_TIME_BUDGET_SECONDS = 3.0
 
-    def prune_journal(self, *, now: datetime | None = None) -> int:
-        """Delete one bounded batch of journal rows that are verifiably archived.
+    def prune_journal(
+        self, *, now: datetime | None = None, connection: sqlite3.Connection | None = None
+    ) -> int:
+        """Delete journal rows that are verifiably archived, in bounded batches.
 
         Only rows strictly below the checkpoint this process wrote (files fsynced,
         manifest-listed, journal WAL-durable) and older than the retention window go.
         Nothing is deleted while a gap is pending or integrity is not VERIFIED_COMPLETE*,
         so a row whose only copy is the journal is never removed. Freed pages are reused,
         so the file stops growing instead of shrinking. paper_ledger is never touched.
+        Runs until nothing more is eligible or the time budget is spent, so pruning keeps
+        pace with a steady inflow instead of lagging by a fixed batch per flush.
         """
+        connection = connection or self.connection
         retention = self.cfg.journal_retention_seconds
-        if retention <= 0 or self.connection is None:
+        if retention <= 0 or connection is None:
             return 0
         blocked = None
         if self.checkpoint_rowid_this_run is None:
@@ -630,7 +646,7 @@ class Storage:
             blocked = "ARCHIVE_GAP_OR_MANIFEST_FAILURE"
         elif not self.archive_integrity_state.startswith("VERIFIED_COMPLETE"):
             blocked = f"INTEGRITY_{self.archive_integrity_state}"
-        elif self.connection.execute(
+        elif connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='market_event_versions'"
         ).fetchone():
             blocked = "LEGACY_VERSIONS_TABLE"  # a checkpoint cannot vouch for it
@@ -641,32 +657,37 @@ class Storage:
         if tick - self.journal_prune_last_monotonic < self.PRUNE_MIN_INTERVAL_SECONDS:
             return 0
         self.journal_prune_last_monotonic = tick
-        edge = self.connection.execute(  # OFFSET scans only one batch from the oldest row
-            "SELECT rowid, received_utc FROM market_events ORDER BY rowid LIMIT 1 OFFSET ?",
-            (self.PRUNE_BATCH_ROWS - 1,),
-        ).fetchone()
-        if edge is None or int(edge[0]) >= self.checkpoint_rowid_this_run:
-            return 0
-        try:
-            received = datetime.fromisoformat(str(edge[1]).replace("Z", "+00:00"))
-        except ValueError:
-            return 0  # unparseable timestamp: keep the rows
-        if received.tzinfo is None:
-            received = received.replace(tzinfo=timezone.utc)
         cutoff = (now or datetime.now(timezone.utc)).timestamp() - retention
-        if received.timestamp() >= cutoff:
-            return 0
-        self.connection.execute("BEGIN IMMEDIATE")
-        try:
-            deleted = self.connection.execute(
-                "DELETE FROM market_events WHERE rowid <= ?", (int(edge[0]),)
-            ).rowcount
-            self.connection.commit()
-        except Exception:
-            self.connection.rollback()
-            raise
-        self.journal_pruned_rows += max(0, deleted)
-        return deleted
+        total = 0
+        deadline = tick + self.PRUNE_TIME_BUDGET_SECONDS
+        while True:
+            edge = connection.execute(  # OFFSET scans only one batch from the oldest row
+                "SELECT rowid, received_utc FROM market_events ORDER BY rowid LIMIT 1 OFFSET ?",
+                (self.PRUNE_BATCH_ROWS - 1,),
+            ).fetchone()
+            if edge is None or int(edge[0]) >= self.checkpoint_rowid_this_run:
+                return total
+            try:
+                received = datetime.fromisoformat(str(edge[1]).replace("Z", "+00:00"))
+            except ValueError:
+                return total  # unparseable timestamp: keep the rows
+            if received.tzinfo is None:
+                received = received.replace(tzinfo=timezone.utc)
+            if received.timestamp() >= cutoff:
+                return total
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                deleted = connection.execute(
+                    "DELETE FROM market_events WHERE rowid <= ?", (int(edge[0]),)
+                ).rowcount
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            self.journal_pruned_rows += max(0, deleted)
+            total += max(0, deleted)
+            if time.monotonic() >= deadline:
+                return total
 
     def _write_archive_checkpoint_file(self, through: tuple[int, str]) -> None:
         manifest_seq, manifest_head, _ = self._manifest_state()
@@ -992,6 +1013,7 @@ class Storage:
         """Resume Parquet capture after disk pressure clears, repairing gaps first."""
         if self.raw_capture_enabled:
             return True
+        self._drain_async_flush()  # recovery must not race a background manifest append
         self.parquet_bytes = self._parquet_directory_size()
         if self.parquet_bytes >= self.cfg.raw_data_budget_bytes:
             self.parquet_recovery_state = "SKIPPED_RAW_BUDGET"
@@ -1049,12 +1071,18 @@ class Storage:
 
     def close(self) -> None:
         self.flush_parquet(reason="SHUTDOWN")
+        self._stop_flush_thread()
         if self.connection is not None:
             self.connection.commit()
             self.connection.close()
             self.connection = None
 
     def flush_parquet(self, *, reason: str = "MANUAL") -> int:
+        """Write everything buffered, synchronously (waits for any background flush first)."""
+        self._drain_async_flush()
+        return self._flush_now(reason)
+
+    def _flush_now(self, reason: str) -> int:
         """Write one buffered batch, leaving the SQLite journal immediately durable."""
         if not self.parquet_buffer:
             return 0
@@ -1070,15 +1098,29 @@ class Storage:
         if self.parquet_bytes >= self.cfg.raw_data_budget_bytes:
             self.raw_capture_enabled = False
             LOG.warning("raw Parquet budget reached; SQLite critical journal remains enabled")
-            return self.flush_parquet(reason="RAW_CAPTURE_DISABLED")
-        rows = self.parquet_buffer
+            return self._flush_now("RAW_CAPTURE_DISABLED")
+        rows, through = self.parquet_buffer, self.parquet_buffer_through
+        self._publish_batch(rows, through, reason, self.connection)
+        self.parquet_buffer_through = None
+        self.parquet_buffer = []
+        self.parquet_buffer_bytes_estimate = 0
+        self.parquet_buffer_started_monotonic = None
+        return len(rows)
+
+    def _publish_batch(
+        self,
+        rows: list[dict[str, Any]],
+        through: tuple[int, str] | None,
+        reason: str,
+        connection: sqlite3.Connection | None,
+    ) -> None:
+        """Files -> manifest -> WAL barrier -> checkpoint -> prune. Raises before any
+        checkpoint move if the files could not be written (rows stay unarchived)."""
         # _write_partitioned_parquet adds each published file's size to
         # parquet_bytes; the periodic audit reconciles with a directory walk.
         flush_clock = flush_started = time.perf_counter()
         published = self._write_partitioned_parquet(rows)
         flush_clock = self._phase("flush_write_files", flush_clock)
-        through = self.parquet_buffer_through
-        self.parquet_buffer_through = None
         # Files are fsynced and published, then listed (fsynced) in the manifest,
         # and only then can the checkpoint move. A failed listing freezes the
         # checkpoint (archive_gap_pending); the next recovery adopts the files.
@@ -1087,27 +1129,97 @@ class Storage:
         # With synchronous=NORMAL for events, the checkpoint may only name journal
         # rows that are already on disk: force the WAL out first.
         if through is not None and listed and not self.archive_gap_pending:
-            durable = self._make_journal_durable()
+            durable = self._make_journal_durable(connection)
             flush_clock = self._phase("flush_wal_barrier", flush_clock)
             if durable:
                 self._write_archive_checkpoint(through)
                 flush_clock = self._phase("flush_checkpoint_file", flush_clock)
                 try:
-                    self.prune_journal()
+                    self.prune_journal(connection=connection)
                 except sqlite3.Error:
                     LOG.warning("journal prune failed; rows kept", exc_info=True)
                 self._phase("flush_prune", flush_clock)
             else:
                 self.archive_checkpoint_write_failures += 1
-        self.parquet_buffer = []
-        self.parquet_buffer_bytes_estimate = 0
-        self.parquet_buffer_started_monotonic = None
         self.parquet_flush_count += 1
         self.parquet_last_flush_utc = datetime.now(timezone.utc).isoformat()
         self.parquet_last_flush_rows = len(rows)
         self.parquet_last_flush_reason = reason
         self._adapt_flush_rows(time.perf_counter() - flush_started)
-        return self.parquet_last_flush_rows
+
+    # --- background flush (journal process only) -------------------------------
+    # One flush in flight at a time, so checkpoints stay ordered. The flush thread
+    # uses its own SQLite connection (WAL barrier + pruning); appends keep running.
+    ASYNC_BACKLOG_FACTOR = 3  # appends wait for the flush once 3 thresholds are buffered
+
+    def _flush_thread_connection(self) -> sqlite3.Connection:
+        if self._flush_conn is None:
+            conn = sqlite3.connect(self.cfg.ledger_path, timeout=15)
+            conn.execute("PRAGMA busy_timeout=15000")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute(f"PRAGMA cache_size=-{self.PAPER_ONLY_CACHE_KIB}")
+            self._flush_conn = conn
+        return self._flush_conn
+
+    def _publish_in_thread(self, rows, through, reason) -> None:
+        self._publish_batch(rows, through, reason, self._flush_thread_connection())
+
+    def _drain_async_flush(self) -> None:
+        """Wait for the in-flight flush; if it failed, put its rows back in the buffer."""
+        future, self._flush_future = self._flush_future, None
+        inflight, self._flush_inflight = self._flush_inflight, None
+        if future is None:
+            return
+        try:
+            future.result()
+        except Exception:
+            self.archive_async_flush_failures += 1
+            LOG.error("background Parquet flush failed; rows stay buffered", exc_info=True)
+            rows, through = inflight
+            self.parquet_buffer = rows + self.parquet_buffer
+            self.parquet_buffer_through = self.parquet_buffer_through or through
+            self.parquet_buffer_bytes_estimate += sum(
+                len(row["raw_json"].encode("utf-8")) + 192 for row in rows
+            )
+            if self.parquet_buffer_started_monotonic is None:
+                self.parquet_buffer_started_monotonic = time.monotonic()
+
+    def _flush_async(self, reason: str) -> int:
+        if not self.async_flush:
+            return self.flush_parquet(reason=reason)
+        future = self._flush_future
+        if future is not None and not future.done():
+            if len(self.parquet_buffer) < self.ASYNC_BACKLOG_FACTOR * self.parquet_flush_rows:
+                return 0  # keep buffering; the flush thread is still writing
+            self._drain_async_flush()  # backpressure: bounded memory
+        else:
+            self._drain_async_flush()
+        if not self.parquet_buffer:
+            return 0
+        if not self.raw_capture_enabled or self.parquet_bytes >= self.cfg.raw_data_budget_bytes:
+            return self._flush_now(reason)  # rare drop/budget paths stay synchronous
+        rows, through = self.parquet_buffer, self.parquet_buffer_through
+        self.parquet_buffer = []
+        self.parquet_buffer_through = None
+        self.parquet_buffer_bytes_estimate = 0
+        self.parquet_buffer_started_monotonic = None
+        if self._flush_executor is None:
+            self._flush_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="parquet-flush")
+        self._flush_inflight = (rows, through)
+        self._flush_future = self._flush_executor.submit(self._publish_in_thread, rows, through, reason)
+        return len(rows)
+
+    def _stop_flush_thread(self) -> None:
+        self._drain_async_flush()
+        if self._flush_executor is not None:
+            def close_connection() -> None:
+                if self._flush_conn is not None:
+                    self._flush_conn.close()
+                    self._flush_conn = None
+
+            self._flush_executor.submit(close_connection).result()
+            self._flush_executor.shutdown(wait=True)
+            self._flush_executor = None
 
     FLUSH_ROWS_BASE = 2000
     FLUSH_ROWS_CAP = 16000  # ~60 MB buffered; the SQLite journal already holds these rows durably
@@ -1130,7 +1242,7 @@ class Storage:
             return 0
         if time.monotonic() - started < self.parquet_flush_interval_seconds:
             return 0
-        return self.flush_parquet(reason=reason)
+        return self._flush_async(reason)
 
     @staticmethod
     def _normalized(event: dict[str, Any]) -> tuple[str, str, str]:
@@ -1327,7 +1439,7 @@ class Storage:
                 self.parquet_buffer_through = self.latest_event
                 self.parquet_buffer_bytes_estimate += incoming_estimate
                 if len(self.parquet_buffer) >= self.parquet_flush_rows:
-                    self.flush_parquet(reason="ROW_THRESHOLD")
+                    self._flush_async("ROW_THRESHOLD")
         elif new_parquet_rows:
             self.parquet_dropped_rows += len(new_parquet_rows)
             self.archive_gap_pending = True

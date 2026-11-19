@@ -3845,3 +3845,80 @@ class ProcessJournalStorageTests(unittest.TestCase):
                 store.append_batch([_trade(1)])
             self.assertFalse(store.connection_status()["journal_process_alive"])
             store.close()
+
+
+class AsyncFlushTests(unittest.TestCase):
+    def _store(self, tmp, **kw):
+        cfg = Settings(home=Path(tmp), min_free_bytes=0, **kw)
+        store = Storage(cfg)
+        store.open()
+        store.async_flush = True
+        store.parquet_flush_rows = 5
+        return cfg, store
+
+    def test_appends_continue_while_a_flush_is_stuck_and_everything_lands(self):
+        import threading
+
+        with TemporaryDirectory() as tmp:
+            cfg, store = self._store(tmp)
+            gate, started = threading.Event(), threading.Event()
+            real = store._write_partitioned_parquet
+
+            def slow(rows):
+                started.set()
+                gate.wait(10)
+                return real(rows)
+
+            store._write_partitioned_parquet = slow
+            store.append_batch([_trade(i) for i in range(5)])  # reaches the threshold: flush starts
+            self.assertTrue(started.wait(5))
+            began = time.monotonic()
+            store.append_batch([_trade(i) for i in range(5, 9)])  # must not wait for the stuck flush
+            self.assertLess(time.monotonic() - began, 2.0)
+            self.assertTrue(store.connection_status()["parquet_flush_in_flight"])
+            gate.set()
+            store._write_partitioned_parquet = real
+            store.flush_parquet(reason="TEST")  # drains the background flush, then writes the rest
+            self.assertEqual(sorted(_archived_keys(cfg)), _expected(9))
+            record = json.loads(store.archive_checkpoint_path.read_text(encoding="utf-8"))
+            self.assertEqual(record["through_rowid"], 9)  # checkpoints stayed ordered
+            self.assertTrue(store.verify_archive(full=True)["ok"])
+            store.close()
+
+    def test_failed_background_flush_keeps_its_rows_and_they_are_archived_later(self):
+        with TemporaryDirectory() as tmp:
+            cfg, store = self._store(tmp)
+            real, calls = store._write_partitioned_parquet, []
+
+            def fail_once(rows):
+                calls.append(1)
+                if len(calls) == 1:
+                    raise OSError(5, "I/O error")
+                return real(rows)
+
+            store._write_partitioned_parquet = fail_once
+            store.append_batch([_trade(i) for i in range(5)])
+            store._flush_future.exception(timeout=10)  # wait for the failure without draining
+            store.append_batch([_trade(5)])
+            store.flush_parquet(reason="TEST")  # drains: requeues the failed rows, writes all
+            self.assertEqual(store.archive_async_flush_failures, 1)
+            self.assertEqual(sorted(_archived_keys(cfg)), _expected(6))
+            store.close()
+            again = Storage(cfg)
+            again.open()
+            self.assertEqual(again.archive_integrity_state, "VERIFIED_COMPLETE_CLEAN_STOP_CHECKPOINT")
+            again.close()
+
+    def test_background_flush_prunes_with_its_own_connection(self):
+        with TemporaryDirectory() as tmp:
+            cfg, store = self._store(tmp, journal_retention_seconds=3600)
+            store.PRUNE_BATCH_ROWS = 2
+            store.PRUNE_MIN_INTERVAL_SECONDS = 0
+            store.append_batch([_trade(i) for i in range(12)])
+            store.flush_parquet(reason="TEST")
+            store.flush_parquet(reason="TEST")
+            remaining = store.connection.execute("SELECT count(*) FROM market_events").fetchone()[0]
+            self.assertLessEqual(remaining, 2)  # less than one batch plus the checkpoint row is left
+            self.assertEqual(store.journal_pruned_rows, 12 - remaining)
+            self.assertEqual(sorted(_archived_keys(cfg)), _expected(12))
+            store.close()
