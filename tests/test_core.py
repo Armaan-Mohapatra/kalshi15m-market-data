@@ -2942,7 +2942,7 @@ def _mark_unclean(cfg):
 class ArchiveCheckpointRecoveryTests(unittest.TestCase):
     def test_crash_recovers_only_rows_after_checkpoint_without_duplicates(self):
         with TemporaryDirectory() as temporary:
-            cfg = Settings(home=Path(temporary))
+            cfg = Settings(home=Path(temporary), min_free_bytes=0)
             store = Storage(cfg)
             store.open()
             store.append_batch([_trade(i) for i in range(5)])
@@ -2966,7 +2966,7 @@ class ArchiveCheckpointRecoveryTests(unittest.TestCase):
 
     def test_crash_after_publish_before_checkpoint_does_not_duplicate(self):
         with TemporaryDirectory() as temporary:
-            cfg = Settings(home=Path(temporary))
+            cfg = Settings(home=Path(temporary), min_free_bytes=0)
             store = Storage(cfg)
             store.open()
             store.append_batch([_trade(i) for i in range(3)])
@@ -2989,7 +2989,7 @@ class ArchiveCheckpointRecoveryTests(unittest.TestCase):
 
     def test_mismatched_or_shrunken_checkpoint_falls_back_to_full_scan(self):
         with TemporaryDirectory() as temporary:
-            cfg = Settings(home=Path(temporary))
+            cfg = Settings(home=Path(temporary), min_free_bytes=0)
             store = Storage(cfg)
             store.open()
             store.append_batch([_trade(i) for i in range(4)])
@@ -3017,7 +3017,7 @@ class ArchiveCheckpointRecoveryTests(unittest.TestCase):
 
     def test_checkpoint_does_not_advance_past_dropped_rows(self):
         with TemporaryDirectory() as temporary:
-            cfg = Settings(home=Path(temporary))
+            cfg = Settings(home=Path(temporary), min_free_bytes=0)
             store = Storage(cfg)
             store.open()
             store.append_batch([_trade(0)])
@@ -3038,6 +3038,27 @@ class ArchiveCheckpointRecoveryTests(unittest.TestCase):
             self.assertEqual(sorted(_archived_keys(cfg)), ["trade-0", "trade-1", "trade-2"])
             recovered.close()
 
+
+    def test_recovery_low_disk_refuses_to_advance_checkpoint(self):
+        # The positive recovery tests above use tiny synthetic fixtures and
+        # independently exercise recovery. This test checks the real disk guard.
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary), min_free_bytes=1 << 62)
+            store = Storage(cfg)
+            store.open()
+            store.append_batch([_trade(0)])
+            store.connection.close()
+            store.connection = None
+            _mark_unclean(cfg)
+
+            recovered = Storage(cfg)
+            recovered.open()
+            self.assertEqual(recovered.parquet_recovery_state, "SKIPPED_LOW_DISK")
+            self.assertEqual(recovered.parquet_recovery_mode, "SKIPPED_LOW_DISK")
+            self.assertTrue(recovered.archive_gap_pending)
+            self.assertEqual(_archived_keys(cfg), [])
+            recovered.connection.close()
+            recovered.connection = None
 
 class WebSocketReconnectDedupeTests(unittest.TestCase):
     def test_reconnect_reusing_sid_and_seq_journals_new_events(self):
