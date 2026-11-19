@@ -397,6 +397,7 @@ class Storage:
         if self.parquet_bytes >= self.cfg.raw_data_budget_bytes:
             self.raw_capture_enabled = False
             self.parquet_recovery_state = "SKIPPED_RAW_BUDGET"
+            self.parquet_recovery_mode = "SKIPPED_RAW_BUDGET"
             return 0
         try:
             free_bytes = shutil.disk_usage(self.cfg.home).free
@@ -405,6 +406,7 @@ class Storage:
         if free_bytes < self.cfg.min_free_bytes:
             self.raw_capture_enabled = False
             self.parquet_recovery_state = "SKIPPED_LOW_DISK"
+            self.parquet_recovery_mode = "SKIPPED_LOW_DISK"
             return 0
 
         has_versions = self.connection.execute(
@@ -503,6 +505,7 @@ class Storage:
                         break
                     if self.parquet_bytes >= self.cfg.raw_data_budget_bytes:
                         self.parquet_recovery_state = "PARTIAL_RECOVERY_RAW_BUDGET"
+                        self.parquet_recovery_mode = "PARTIAL_RECOVERY_RAW_BUDGET"
                         self.raw_capture_enabled = False
                         stop_recovery = True
                         break
@@ -555,6 +558,7 @@ class Storage:
         self.parquet_bytes = self._parquet_directory_size()
         if self.parquet_bytes >= self.cfg.raw_data_budget_bytes:
             self.parquet_recovery_state = "SKIPPED_RAW_BUDGET"
+            self.parquet_recovery_mode = "SKIPPED_RAW_BUDGET"
             return False
         try:
             free_bytes = shutil.disk_usage(self.cfg.home).free
@@ -562,6 +566,7 @@ class Storage:
             free_bytes = 0
         if free_bytes < self.cfg.min_free_bytes:
             self.parquet_recovery_state = "SKIPPED_LOW_DISK"
+            self.parquet_recovery_mode = "SKIPPED_LOW_DISK"
             return False
 
         self.parquet_recovery_state = "NOT_RUN"
