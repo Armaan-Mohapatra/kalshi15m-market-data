@@ -2668,6 +2668,7 @@ class Collector:
                     max_size=2**20,
                 ) as ws:
                     self.ws_connection_id = uuid.uuid4().hex[:12]
+                    connected_at = time.monotonic()
                     self.status.update(
                         websocket_state="READY",
                         websocket_connection_id=self.ws_connection_id,
@@ -2702,7 +2703,10 @@ class Collector:
                         if receiver in done:
                             ready_wait.cancel()
                             await receiver
-                            raise ConnectionError("WebSocket ended before subscriptions were ready")
+                            raise ConnectionError(
+                                "WebSocket ended before subscriptions were ready"
+                                + self._close_detail(ws, connected_at)
+                            )
                         if ready_wait not in done:
                             ready_wait.cancel()
                             raise TimeoutError("market-data subscriptions were not acknowledged")
@@ -2724,7 +2728,9 @@ class Collector:
                                 task.cancel()
                         await asyncio.gather(*tasks, return_exceptions=True)
                     if not self.stopping.is_set():
-                        raise ConnectionError("WebSocket receive loop ended")
+                        raise ConnectionError(
+                            "WebSocket receive loop ended" + self._close_detail(ws, connected_at)
+                        )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -2733,11 +2739,20 @@ class Collector:
                     websocket_state="RECONNECTING",
                     error_count=self.status.data.get("error_count", 0) + 1,
                     last_error=f"WebSocket connection ended: {type(exc).__name__}",
+                    last_websocket_disconnect_detail=str(exc)[:300],
                 )
-                LOG.warning("WebSocket disconnected: %s", type(exc).__name__)
+                # The type alone hid why the server ended the session (clean close vs reset).
+                LOG.warning("WebSocket disconnected: %s: %s", type(exc).__name__, str(exc)[:300])
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(30.0, reconnect_delay * 2)
         self.status.update(websocket_state="STOPPED")
+
+    @staticmethod
+    def _close_detail(ws: Any, connected_at: float) -> str:
+        """How the session ended: the peer's close code/reason and how long it lived."""
+        code = getattr(ws, "close_code", None)
+        reason = getattr(ws, "close_reason", None)
+        return f" (close_code={code}, close_reason={str(reason)[:120]!r}, session_s={time.monotonic() - connected_at:.1f})"
 
     def _invalidate_websocket_books(self) -> None:
         self._publish_orderbook_sequence_state(connected=False)

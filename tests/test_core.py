@@ -4012,3 +4012,18 @@ class NamedStackSamplingTests(unittest.TestCase):
                 self.assertTrue((logs / "journal_stack_samples.log").exists())
             finally:
                 faulthandler.cancel_dump_traceback_later()
+
+
+class WebSocketCloseDetailTests(unittest.TestCase):
+    def test_close_detail_names_code_reason_and_session_length(self):
+        from kalshi15m.worker import Collector
+
+        class FakeSocket:
+            close_code = 1001
+            close_reason = "going away"
+
+        detail = Collector._close_detail(FakeSocket(), time.monotonic() - 12.0)
+        self.assertIn("close_code=1001", detail)
+        self.assertIn("going away", detail)
+        self.assertRegex(detail, r"session_s=1[12]\.\d")
+        self.assertIn("close_code=None", Collector._close_detail(object(), time.monotonic()))  # no attribute: still safe
