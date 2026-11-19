@@ -32,6 +32,7 @@ from .discovery import (
     series_catalog_changes,
     utc_now,
 )
+from .journal_process import make_storage
 from .storage import Storage
 from .paper import (
     crossmarket_performance_summary,
@@ -496,7 +497,7 @@ class Collector:
         self.writer_timing_ema = {}
         self.api = PublicKalshiAPI()
         self.status = RuntimeStatus(cfg)
-        self.storage = Storage(cfg)
+        self.storage = make_storage(cfg)
         self.queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=cfg.max_queue_events)
         self.writer_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="journal-writer")
         self.stopping = asyncio.Event()

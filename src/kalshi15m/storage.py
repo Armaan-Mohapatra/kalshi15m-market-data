@@ -159,7 +159,11 @@ class Storage:
         self.persistence_audit_last_monotonic = 0.0
         self.persistence_audit_cache: dict[str, Any] = {}
 
-    def open(self) -> None:
+    PAPER_ONLY_CACHE_KIB = 8 * 1024
+
+    def open(self, *, paper_only: bool = False) -> None:
+        """Open the journal. paper_only=True is the second process's view: it only
+        reads/writes paper_ledger; the journal process owns events, Parquet and recovery."""
         if self.cfg.event_synchronous not in ("NORMAL", "FULL"):  # before a handle exists
             raise ValueError(f"unsupported synchronous mode {self.cfg.event_synchronous!r}")
         self.connection = sqlite3.connect(self.cfg.ledger_path, timeout=15)
@@ -169,7 +173,8 @@ class Storage:
         self.connection.execute("PRAGMA busy_timeout=15000")
         # Default 2 MiB cache re-reads B-tree interior pages from disk on every
         # dedupe lookup once the journal reaches GBs (slow on the USB data volume).
-        self.connection.execute(f"PRAGMA cache_size=-{self.cfg.sqlite_cache_kib}")
+        cache_kib = self.PAPER_ONLY_CACHE_KIB if paper_only else self.cfg.sqlite_cache_kib
+        self.connection.execute(f"PRAGMA cache_size=-{cache_kib}")
         self.connection.execute(
             """CREATE TABLE IF NOT EXISTS market_events (
                 dedupe_key TEXT PRIMARY KEY,
@@ -215,6 +220,9 @@ class Storage:
             "SELECT created_utc FROM paper_ledger ORDER BY rowid DESC LIMIT 1"
         ).fetchone()
         self.latest_paper_record_utc = str(latest_paper[0]) if latest_paper else None
+        if paper_only:
+            self.parquet_recovery_state = "DELEGATED_TO_JOURNAL_PROCESS"
+            return
         latest_event = self.connection.execute(
             "SELECT received_utc, rowid, dedupe_key FROM market_events ORDER BY rowid DESC LIMIT 1"
         ).fetchone()

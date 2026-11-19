@@ -3779,3 +3779,69 @@ class DiskFullFixtureTests(unittest.TestCase):
             self.assertEqual(record["through_rowid"], 3)
             self.assertEqual(sorted(_archived_keys(cfg)), ["trade-0", "trade-1", "trade-2"])
             store.close()
+
+
+class ProcessJournalStorageTests(unittest.TestCase):
+    def test_child_process_owns_the_journal_and_archive_while_parent_keeps_paper_ledger(self):
+        from kalshi15m.journal_process import ProcessJournalStorage
+
+        with TemporaryDirectory() as tmp:
+            cfg = Settings(home=Path(tmp), min_free_bytes=0)
+            store = ProcessJournalStorage(cfg)
+            store.open()
+            try:
+                self.assertEqual(store.append_batch([_trade(i) for i in range(5)]), 5)
+                self.assertEqual(store.append_batch([_trade(i) for i in range(3, 8)]), 3)  # 2 duplicates
+                self.assertTrue(store.append_paper_record("p1", "PROFILE", "DECISION", {"eligible": False}))
+                self.assertEqual(store.flush_parquet(reason="TEST"), 8)
+                self.assertEqual(sorted(_archived_keys(cfg)), _expected(8))
+                time.sleep(1.5)  # one state interval
+                status = store.connection_status()
+                self.assertTrue(status["journal_process_alive"])
+                self.assertNotEqual(status["journal_process_pid"], os.getpid())
+                self.assertEqual(store.events_inserted, 8)
+                self.assertEqual(store.events_duplicate, 2)
+                self.assertEqual(status["storage_paper_ledger_record_count"], 1)
+                self.assertTrue(status["storage_paper_watermark_matches_disk"])
+                self.assertEqual(len(store.paper_records("PROFILE")), 1)
+                store.raw_capture_enabled = False
+                time.sleep(1.5)
+                self.assertFalse(store.raw_capture_enabled)
+            finally:
+                store.close()
+            self.assertFalse(store.child_alive)
+            again = Storage(cfg)
+            again.open()
+            self.assertEqual(again.archive_integrity_state, "VERIFIED_COMPLETE_CLEAN_STOP_CHECKPOINT")
+            self.assertEqual(again.connection.execute("SELECT count(*) FROM market_events").fetchone()[0], 8)
+            again.close()
+
+    def test_a_second_journal_process_cannot_share_the_journal(self):
+        from kalshi15m.journal_process import ProcessJournalStorage
+
+        with TemporaryDirectory() as tmp:
+            cfg = Settings(home=Path(tmp), min_free_bytes=0)
+            first = ProcessJournalStorage(cfg)
+            first.open()
+            try:
+                second = ProcessJournalStorage(cfg)
+                with self.assertRaises(RuntimeError) as caught:
+                    second.open()
+                self.assertIn("ALREADY_RUNNING", str(caught.exception))
+            finally:
+                first.close()
+
+    def test_losing_the_child_makes_appends_fail_instead_of_dropping_events(self):
+        from kalshi15m.journal_process import ProcessJournalStorage
+
+        with TemporaryDirectory() as tmp:
+            cfg = Settings(home=Path(tmp), min_free_bytes=0)
+            store = ProcessJournalStorage(cfg)
+            store.open()
+            store._process.kill()
+            store._process.join(10)
+            time.sleep(0.5)
+            with self.assertRaises(RuntimeError):
+                store.append_batch([_trade(1)])
+            self.assertFalse(store.connection_status()["journal_process_alive"])
+            store.close()
