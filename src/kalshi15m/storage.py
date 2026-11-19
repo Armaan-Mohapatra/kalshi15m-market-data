@@ -748,8 +748,12 @@ class Storage:
                     self._quarantine(path, f"UNREADABLE_PARQUET:{type(exc).__name__}")
                     continue
                 fingerprint_db.executemany(insert_fingerprint, file_fingerprints)
-                fingerprint_db.commit()
                 self.parquet_recovery_files_scanned += 1
+                # The index is disposable scratch: batching commits avoids flushing
+                # ~1000 random dirty pages to the USB volume for every tiny file.
+                if self.parquet_recovery_files_scanned % 100 == 0:
+                    fingerprint_db.commit()
+            fingerprint_db.commit()
 
             assert self.connection is not None
             tables = ["market_events"]
