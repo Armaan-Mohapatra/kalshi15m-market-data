@@ -3246,11 +3246,13 @@ class ArchiveManifestIntegrityTests(unittest.TestCase):
     def test_partial_recovery_by_index_cap_never_reports_complete_and_resumes_idempotently(self):
         with TemporaryDirectory() as temporary:
             cfg = Settings(home=Path(temporary), min_free_bytes=0, recovery_index_max_bytes=8192)
-            store = Storage(cfg)
-            store.open()
-            # Below parquet_flush_rows (2000), so nothing is auto-archived yet.
-            store.append_batch([_trade(i) for i in range(1500)])
+            # Below parquet_flush_rows (2000): 1500 archived rows, then 10 journal-only.
+            store, _ = _flushed_store(cfg, [1500])
+            store.append_batch([_trade(i) for i in range(1500, 1510)])
             _crash(store, cfg)
+            # Only archive-side fingerprints grow the index (the journal pass just
+            # probes), so a full scan of 1500 archived rows exceeds the 8 KiB cap.
+            store.archive_checkpoint_path.unlink()
 
             partial = Storage(cfg)
             partial.open()
@@ -3265,7 +3267,7 @@ class ArchiveManifestIntegrityTests(unittest.TestCase):
             full = Storage(Settings(home=Path(temporary), min_free_bytes=0))
             full.open()
             self.assertEqual(full.archive_integrity_state, "VERIFIED_COMPLETE")
-            self.assertEqual(sorted(_archived_keys(cfg)), _expected(1500))  # no duplicates
+            self.assertEqual(sorted(_archived_keys(cfg)), _expected(1510))  # no duplicates
             full.close()
 
     def test_restart_after_recovery_is_idempotent(self):

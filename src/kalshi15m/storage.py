@@ -694,14 +694,16 @@ class Storage:
         try:
             fingerprint_db.execute("PRAGMA journal_mode=OFF")
             fingerprint_db.execute("PRAGMA synchronous=OFF")
-            fingerprint_db.execute("PRAGMA cache_size=-8192")
+            # Random-key B-tree: it must stay cache-resident or every probe is a
+            # random read on the (USB) research volume. 32-byte BLOB keys, not hex.
+            fingerprint_db.execute("PRAGMA cache_size=-131072")
             page_size = int(fingerprint_db.execute("PRAGMA page_size").fetchone()[0])
             fingerprint_db.execute(
                 f"PRAGMA max_page_count={max(1, self.cfg.recovery_index_max_bytes // page_size)}"
             )
             fingerprint_db.execute(
                 "CREATE TABLE archived_fingerprints "
-                "(fingerprint TEXT PRIMARY KEY) WITHOUT ROWID"
+                "(fingerprint BLOB PRIMARY KEY) WITHOUT ROWID"
             )
             insert_fingerprint = "INSERT OR IGNORE INTO archived_fingerprints VALUES (?)"
             for path in (
@@ -737,7 +739,9 @@ class Storage:
                             if "kind" not in row:
                                 row["kind"] = partition_kind
                             if row.get("dedupe_key") is not None:
-                                file_fingerprints.append((event_archive_fingerprint(row),))
+                                file_fingerprints.append(
+                                    (bytes.fromhex(event_archive_fingerprint(row)),)
+                                )
                 except (pa.ArrowException, OSError, ValueError) as exc:
                     # Nothing from an unreadable file enters the index, so the
                     # journal re-archives its rows; the file is kept as evidence.
@@ -791,10 +795,22 @@ class Storage:
                         if table == "market_events":
                             # ORDER BY rowid: the last row seen is the maximum.
                             max_scanned = (int(row[8]), str(row[0]))
-                        fingerprint = event_archive_fingerprint(event)
-                        was_new = fingerprint_db.execute(
-                            insert_fingerprint, (fingerprint,)
-                        ).rowcount
+                        fingerprint = bytes.fromhex(event_archive_fingerprint(event))
+                        if has_versions:
+                            # The legacy versions table can repeat market_events rows.
+                            was_new = fingerprint_db.execute(
+                                insert_fingerprint, (fingerprint,)
+                            ).rowcount
+                        else:
+                            # market_events.dedupe_key is unique, so journal rows never
+                            # collide with each other: probe only, keep the index small.
+                            was_new = (
+                                fingerprint_db.execute(
+                                    "SELECT 1 FROM archived_fingerprints WHERE fingerprint = ?",
+                                    (fingerprint,),
+                                ).fetchone()
+                                is None
+                            )
                         if was_new:
                             archive_rows.append(event)
                     fingerprint_db.commit()
