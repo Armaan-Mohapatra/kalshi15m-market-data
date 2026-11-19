@@ -464,6 +464,35 @@ class RuntimeStatusTests(unittest.TestCase):
             self.assertEqual(idle["strategy_rest_poll_health"], "NOT_DUE_OUTSIDE_ENTRY_WINDOW")
 
 
+class StackSamplingTests(unittest.TestCase):
+    def test_config_parsing_is_strict(self):
+        from kalshi15m.worker import parse_stack_sample_config as parse
+
+        self.assertEqual(parse("1 240\n"), (1.0, 240.0))
+        self.assertEqual(parse("  0.5   60 "), (0.5, 60.0))
+        for bad in ("", "x y", "1", "0.01 60", "1 0", "100 60", "1 99999"):
+            self.assertIsNone(parse(bad), bad)
+
+    def test_disabled_without_the_file_and_bounded_when_enabled(self):
+        import faulthandler
+
+        from kalshi15m.worker import start_stack_sampling
+
+        with TemporaryDirectory() as tmp:
+            runtime, logs = Path(tmp) / "runtime", Path(tmp) / "logs"
+            runtime.mkdir()
+            logs.mkdir()
+            self.assertFalse(start_stack_sampling(runtime, logs))
+            self.assertFalse((logs / "stack_samples.log").exists())
+            (runtime / "stack_sample.txt").write_text("0.2 1", encoding="utf-8")
+            try:
+                self.assertTrue(start_stack_sampling(runtime, logs))
+                time.sleep(0.7)
+            finally:
+                faulthandler.cancel_dump_traceback_later()
+            self.assertIn("most recent call first", (logs / "stack_samples.log").read_text(encoding="utf-8"))
+
+
 class GilSwitchIntervalTests(unittest.TestCase):
     def test_tuning_shortens_the_switch_interval_and_collector_applies_it(self):
         from kalshi15m.worker import GIL_SWITCH_INTERVAL_SECONDS, tune_gil_switch_interval

@@ -83,6 +83,39 @@ def tune_gil_switch_interval() -> None:
     sys.setswitchinterval(GIL_SWITCH_INTERVAL_SECONDS)
 
 
+def parse_stack_sample_config(text: str) -> tuple[float, float] | None:
+    """'<interval_s> <duration_s>' -> (interval, duration), or None if absent/invalid/out of range."""
+    parts = text.split()
+    try:
+        interval, duration = float(parts[0]), float(parts[1])
+    except (IndexError, ValueError):
+        return None
+    return (interval, duration) if 0.2 <= interval <= 60 and 1 <= duration <= 1800 else None
+
+
+def start_stack_sampling(runtime_dir: Path, log_dir: Path) -> bool:
+    """Opt-in poor-man's profiler: dump every thread's stack every N seconds for a bounded time.
+
+    Enabled only if <runtime>/stack_sample.txt holds '<interval> <duration>'. Uses stdlib
+    faulthandler, writes <logs>/stack_samples.log, and cancels itself after the duration.
+    """
+    import faulthandler
+
+    try:
+        config = parse_stack_sample_config((runtime_dir / "stack_sample.txt").read_text(encoding="utf-8"))
+    except OSError:
+        return False
+    if config is None:
+        return False
+    interval, duration = config
+    handle = (log_dir / "stack_samples.log").open("a", buffering=1, encoding="utf-8")
+    faulthandler.dump_traceback_later(interval, repeat=True, file=handle)
+    timer = threading.Timer(duration, faulthandler.cancel_dump_traceback_later)
+    timer.daemon = True
+    timer.start()
+    return True
+
+
 def source_fingerprint() -> dict[str, Any]:
     """Git HEAD of the running checkout, so status proves which code is live."""
     import subprocess
@@ -454,6 +487,8 @@ class Collector:
     def __init__(self, cfg: Settings = settings) -> None:
         tune_gil_switch_interval()
         self.cfg = cfg
+        cfg.ensure_dirs()
+        start_stack_sampling(cfg.runtime_dir, cfg.log_dir)
         self.writer_timing_ema = {}
         self.api = PublicKalshiAPI()
         self.status = RuntimeStatus(cfg)
