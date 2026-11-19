@@ -63,6 +63,14 @@ def ledger(home: Path) -> dict:
     db = sqlite3.connect("file:" + Settings(home=home).ledger_path.as_posix() + "?mode=ro", uri=True, timeout=30)
     try:
         counts = db.execute("select profile_id, record_type, count(*) from paper_ledger group by 1,2").fetchall()
+        # invariant: every ineligible decision must say why (no silent no-trades)
+        reasons = db.execute(
+            "select profile_id, coalesce(json_extract(payload_json,'$.rejection_reason'),'<MISSING>'), count(*) "
+            "from paper_ledger where record_type='DECISION' and json_extract(payload_json,'$.eligible') = 0 "
+            "group by 1,2").fetchall()
+        eligible = db.execute(
+            "select profile_id, count(*) from paper_ledger where record_type='DECISION' "
+            "and json_extract(payload_json,'$.eligible') = 1 group by 1").fetchall()
         recent = db.execute(
             "select created_utc, profile_id, record_type, payload_json from paper_ledger "
             "where record_type in ('PAPER_FILL','PAPER_SETTLEMENT_FINAL') order by created_utc desc limit 12").fetchall()
@@ -73,7 +81,46 @@ def ledger(home: Path) -> dict:
         p = json.loads(raw)
         trades.append({"utc": created, "profile": profile.split(":")[0], "type": kind, "ticker": p.get("market_ticker"),
                        "side": p.get("side"), "net_pnl": p.get("net_pnl_dollars")})
-    return {"counts": {f"{p.split(':')[0]}/{t}": n for p, t, n in counts}, "recent": trades}
+    decisions: dict[str, dict] = {}
+    for profile, n in eligible:
+        decisions.setdefault(profile.split(":")[0], {"eligible": 0, "ineligible": 0, "missing_reason": 0, "reasons": {}})["eligible"] = n
+    for profile, reason, n in reasons:
+        d = decisions.setdefault(profile.split(":")[0], {"eligible": 0, "ineligible": 0, "missing_reason": 0, "reasons": {}})
+        d["ineligible"] += n
+        d["reasons"][str(reason)] = n
+        if reason == "<MISSING>":
+            d["missing_reason"] += n
+    return {"counts": {f"{p.split(':')[0]}/{t}": n for p, t, n in counts}, "recent": trades, "decisions": decisions}
+
+
+def alerts(report: dict) -> list[str]:
+    """Explicit fault alarms. Unknown or missing evidence is an alarm, never silence."""
+    out: list[str] = []
+    s = report["status"]
+    if report["status_source"] != "status_api":
+        out.append(f"CRITICAL worker status unavailable ({report['status_source']})")
+    if s.get("exchange_write_calls") not in (0, None) or s.get("orders_submitted_to_exchange") not in (0, None):
+        out.append("CRITICAL exchange write or order observed; paper-only invariant broken")
+    if s and s.get("mode") != "PAPER_ONLY":
+        out.append(f"CRITICAL mode is {s.get('mode')}, expected PAPER_ONLY")
+    age = report.get("persisted_event_age_s")
+    if s and (age is None or age > 120):
+        out.append(f"WARNING newest persisted market event is {age}s old (limit 120s)")
+    if s and s.get("queue_depth", 0) >= 10800:
+        out.append(f"WARNING writer queue at {s.get('queue_depth')} (cap 12000): persistence is behind")
+    if s and s.get("ledger_volume_state") not in (None, "OK"):
+        out.append(f"CRITICAL journal volume {s.get('ledger_volume_state')}")
+    if s and s.get("archive_integrity_state", "VERIFIED_COMPLETE").startswith(("INCOMPLETE", "UNKNOWN")):
+        out.append(f"CRITICAL archive integrity {s.get('archive_integrity_state')}")
+    for profile, d in report.get("ledger", {}).get("decisions", {}).items():
+        if d["missing_reason"]:
+            out.append(f"CRITICAL {d['missing_reason']} no-trade decisions without a reason in {profile}")
+    recon = report.get("settlement_reconciliation", {})
+    if recon.get("state") == "NOT_RUN":
+        out.append("WARNING settlement reconciliation has not run")
+    elif recon.get("counts", {}).get("MATCH", 0) != recon.get("settlements", 0):
+        out.append(f"CRITICAL settlement reconciliation mismatches: {recon.get('counts')}")
+    return out
 
 
 def build(home: Path, port: int) -> dict:
@@ -89,10 +136,12 @@ def build(home: Path, port: int) -> dict:
     except Exception as exc:
         led = {"error": type(exc).__name__}
     s = {k: status.get(k) for k in STATUS_KEYS if k in status}
-    return {"generated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"), "status_source": source,
-            "persisted_event_age_s": age(status.get("storage_latest_market_event_received_utc")),
-            "heartbeat_age_s": age(status.get("heartbeat_utc")), "status": s, "growth": growth(home),
-            "settlement_reconciliation": recon, "ledger": led}
+    report = {"generated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"), "status_source": source,
+              "persisted_event_age_s": age(status.get("storage_latest_market_event_received_utc")),
+              "heartbeat_age_s": age(status.get("heartbeat_utc")), "status": s, "growth": growth(home),
+              "settlement_reconciliation": recon, "ledger": led}
+    report["alerts"] = alerts(report)
+    return report
 
 
 def render(report: dict) -> str:
@@ -101,7 +150,13 @@ def render(report: dict) -> str:
         return f"<table><tr>{''.join(f'<th>{h}</th>' for h in head)}</tr>{body}</table>"
     st = report["status"]
     safe = st.get("exchange_write_calls") == 0 and st.get("orders_submitted_to_exchange") == 0
+    banner = (
+        "<div style='border:3px solid #b00;padding:8px;margin:8px 0'><b>ALERTS</b><ul>"
+        + "".join(f"<li>{html.escape(a)}</li>" for a in report.get("alerts", [])) + "</ul></div>"
+        if report.get("alerts") else "<div style='border:3px solid #080;padding:6px;margin:8px 0'>no active alerts</div>"
+    )
     parts = [
+        banner,
         f"<h1>Phoenix paper collector</h1><p>generated {report['generated_utc']} via {report['status_source']} "
         f"| persisted event age {report['persisted_event_age_s']}s | heartbeat age {report['heartbeat_age_s']}s "
         f"| exchange orders: <b>{'0 (paper only)' if safe else 'CHECK!'}</b></p>",
@@ -109,6 +164,11 @@ def render(report: dict) -> str:
         "<h2>Growth</h2>" + table(report["growth"].items(), ("metric", "value")),
         "<h2>Settlement reconciliation</h2><pre>" + html.escape(json.dumps(report["settlement_reconciliation"], indent=1)) + "</pre>",
         "<h2>Ledger records</h2>" + table(report["ledger"].get("counts", {}).items(), ("profile/type", "count")),
+        "<h2>Decisions: eligible vs explained no-trades</h2>" + table(
+            [(p, d["eligible"], d["ineligible"], d["missing_reason"],
+              "; ".join(f"{r}={n}" for r, n in sorted(d["reasons"].items(), key=lambda kv: -kv[1])[:6]))
+             for p, d in report["ledger"].get("decisions", {}).items()],
+            ("profile", "eligible", "no-trade", "no-trade WITHOUT reason (must be 0)", "top reasons")),
         "<h2>Recent fills and settlements</h2>" + table(
             [(t["utc"], t["profile"], t["type"], t["ticker"], t["side"], t["net_pnl"]) for t in report["ledger"].get("recent", [])],
             ("utc", "profile", "type", "ticker", "side", "net P&L")),
@@ -127,6 +187,16 @@ def main() -> int:
     report = build(home, a.port)
     out = home / "reports"
     out.mkdir(parents=True, exist_ok=True)
+    try:
+        before = set(json.loads((out / "report.json").read_text("utf-8")).get("alerts", []))
+    except Exception:
+        before = set()
+    now = set(report["alerts"])
+    with (out / "alerts.log").open("a", encoding="utf-8") as log:  # history: when each alert appeared / cleared
+        for a_ in sorted(now - before):
+            log.write(f"{report['generated_utc']} NEW {a_}\n")
+        for a_ in sorted(before - now):
+            log.write(f"{report['generated_utc']} CLEARED {a_}\n")
     for name, text in (("report.json", json.dumps(report, indent=1)), ("dashboard.html", render(report))):
         tmp = out / (name + ".tmp")
         tmp.write_text(text, encoding="utf-8")
