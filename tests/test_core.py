@@ -464,6 +464,30 @@ class RuntimeStatusTests(unittest.TestCase):
             self.assertEqual(idle["strategy_rest_poll_health"], "NOT_DUE_OUTSIDE_ENTRY_WINDOW")
 
 
+class LedgerVolumeTests(unittest.TestCase):
+    def test_ledger_path_override_and_default(self):
+        with TemporaryDirectory() as tmp:
+            self.assertEqual(Settings(home=Path(tmp)).ledger_path, Path(tmp) / "data" / "paper_ledger.sqlite3")
+            elsewhere = Path(tmp) / "fast" / "j.sqlite3"
+            cfg = Settings(home=Path(tmp) / "h", ledger_override=str(elsewhere))
+            cfg.ensure_dirs()
+            self.assertEqual(cfg.ledger_path, elsewhere)
+            self.assertTrue(elsewhere.parent.is_dir())
+            store = Storage(cfg)
+            store.open()
+            store.append_batch([_trade(1)])
+            self.assertTrue(elsewhere.exists())
+            self.assertEqual(store.sqlite_open_path, elsewhere.resolve())
+            store.close()
+
+    def test_volume_state_thresholds(self):
+        cfg = Settings(ledger_min_free_bytes=5000, ledger_critical_free_bytes=1000)
+        self.assertEqual(
+            [cfg.ledger_volume_state(v) for v in (999, 1000, 4999, 5000)],
+            ["CRITICAL", "LOW", "LOW", "OK"],
+        )
+
+
 class JournalDurabilityPolicyTests(unittest.TestCase):
     def test_events_use_configured_mode_but_paper_records_commit_full(self):
         with TemporaryDirectory() as temporary:

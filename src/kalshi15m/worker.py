@@ -3378,7 +3378,15 @@ class Collector:
                         )
                         next_trades = time.monotonic() + self.cfg.trades_poll_interval_seconds
                 disk_free = shutil.disk_usage(self.cfg.home).free
-                low_disk = disk_free < self.cfg.min_free_bytes
+                ledger_free = shutil.disk_usage(self.cfg.ledger_path.parent).free
+                ledger_state = self.cfg.ledger_volume_state(ledger_free)
+                self.status.update(ledger_volume_free_bytes=ledger_free, ledger_volume_state=ledger_state)
+                if ledger_state == "CRITICAL":
+                    # Fail closed: a clean stop now beats a journal corrupted by a full disk.
+                    LOG.error("ledger volume critically low (%d bytes free); stopping", ledger_free)
+                    self.stopping.set()
+                    break
+                low_disk = disk_free < self.cfg.min_free_bytes or ledger_state == "LOW"
                 if low_disk:
                     self.storage.raw_capture_enabled = False
                 elif (

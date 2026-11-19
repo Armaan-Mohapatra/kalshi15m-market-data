@@ -72,6 +72,13 @@ class Settings:
     # Archive recovery keeps its fingerprint index in a file under home (so it
     # lives on the research volume, never %TEMP%) and refuses to grow past this.
     recovery_index_max_bytes: int = 4 * 1024**3
+    # Optional absolute path of the SQLite journal (empty = <home>/data/paper_ledger.sqlite3).
+    ledger_override: str = os.environ.get("KALSHI15M_LEDGER_PATH", "")
+    # Free space guards on the journal's own volume (it may not be the research volume):
+    # below LOW optional capture is throttled; below CRITICAL the worker stops
+    # gracefully before a full disk can corrupt the journal.
+    ledger_min_free_bytes: int = 5 * 1024**3
+    ledger_critical_free_bytes: int = 1 * 1024**3
     # Durability of market-event batch commits (owner-approved 2026-11-19: the USB
     # volume needs ~1.3 s per fsync). NORMAL keeps the database consistent but a
     # power loss can drop the last few seconds of events. Paper-ledger commits are
@@ -96,7 +103,9 @@ class Settings:
 
     @property
     def ledger_path(self) -> Path:
-        return self.data_dir / "paper_ledger.sqlite3"
+        # The SQLite journal can live on a faster volume than the Parquet archive
+        # (random-key inserts are latency-bound on USB); see ledger_volume_state().
+        return Path(self.ledger_override) if self.ledger_override else self.data_dir / "paper_ledger.sqlite3"
 
     @property
     def runtime_dir(self) -> Path:
@@ -112,6 +121,13 @@ class Settings:
         self.parquet_dir.mkdir(parents=True, exist_ok=True)
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def ledger_volume_state(self, free_bytes: int) -> str:
+        """OK / LOW (throttle optional capture) / CRITICAL (stop before the disk fills)."""
+        if free_bytes < self.ledger_critical_free_bytes:
+            return "CRITICAL"
+        return "LOW" if free_bytes < self.ledger_min_free_bytes else "OK"
 
 
 settings = Settings()
