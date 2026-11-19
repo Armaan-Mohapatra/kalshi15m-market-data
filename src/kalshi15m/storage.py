@@ -135,6 +135,7 @@ class Storage:
         self.parquet_buffer_through: tuple[int, str] | None = None
         self.archive_gap_pending = False
         self._recent_keys: dict[str, None] = {}
+        self.phase_ms_ema: dict[str, float] = {}
         self.parquet_recovery_reason: str | None = None
         self.parquet_recovery_files_scanned = 0
         self.parquet_recovery_rows_scanned = 0
@@ -256,6 +257,14 @@ class Storage:
             LOG.warning("journal durability barrier failed; checkpoint not advanced", exc_info=True)
             return False
 
+    def _phase(self, name: str, since: float) -> float:
+        """Record how long a writer phase took (EMA, alpha 0.2); returns now for chaining."""
+        now = time.perf_counter()
+        ms = (now - since) * 1000
+        ema = self.phase_ms_ema
+        ema[name] = ms if name not in ema else 0.8 * ema[name] + 0.2 * ms
+        return now
+
     def _checkpoint_current(self) -> bool:
         """True only if a manifest-verified checkpoint already covers the journal head.
 
@@ -334,6 +343,7 @@ class Storage:
             "parquet_last_flush_rows": self.parquet_last_flush_rows,
             "parquet_last_flush_reason": self.parquet_last_flush_reason,
             "parquet_dropped_rows": self.parquet_dropped_rows,
+            "writer_phase_ms_ema": {k: round(v, 1) for k, v in self.phase_ms_ema.items()},
             "archive_integrity_state": self.archive_integrity_state,
             "archive_recovery_reason": self.parquet_recovery_reason,
             "archive_recovery_files_scanned": self.parquet_recovery_files_scanned,
@@ -967,18 +977,24 @@ class Storage:
         rows = self.parquet_buffer
         # _write_partitioned_parquet adds each published file's size to
         # parquet_bytes; the periodic audit reconciles with a directory walk.
+        flush_clock = time.perf_counter()
         published = self._write_partitioned_parquet(rows)
+        flush_clock = self._phase("flush_write_files", flush_clock)
         through = self.parquet_buffer_through
         self.parquet_buffer_through = None
         # Files are fsynced and published, then listed (fsynced) in the manifest,
         # and only then can the checkpoint move. A failed listing freezes the
         # checkpoint (archive_gap_pending); the next recovery adopts the files.
         listed = self._record_published_files(published)
+        flush_clock = self._phase("flush_manifest", flush_clock)
         # With synchronous=NORMAL for events, the checkpoint may only name journal
         # rows that are already on disk: force the WAL out first.
         if through is not None and listed and not self.archive_gap_pending:
-            if self._make_journal_durable():
+            durable = self._make_journal_durable()
+            flush_clock = self._phase("flush_wal_barrier", flush_clock)
+            if durable:
                 self._write_archive_checkpoint(through)
+                self._phase("flush_checkpoint_file", flush_clock)
             else:
                 self.archive_checkpoint_write_failures += 1
         self.parquet_buffer = []
@@ -1085,6 +1101,7 @@ class Storage:
         if self.connection is None:
             self.open()
         assert self.connection is not None
+        phase_clock = time.perf_counter()
         rows: list[tuple[Any, ...]] = []
         parquet_rows: list[dict[str, Any]] = []
         prepared: list[tuple[dict[str, Any], str, str | None, str | None]] = []
@@ -1135,6 +1152,7 @@ class Storage:
                 }
             )
 
+        phase_clock = self._phase("append_prepare", phase_clock)
         inserted_keys: set[str] = set()
         try:
             if rows:
@@ -1148,7 +1166,9 @@ class Storage:
                         [value for row in chunk for value in row],
                     )
                     inserted_keys.update(item[0] for item in returned.fetchall())
+                phase_clock = self._phase("append_insert", phase_clock)
                 self.connection.commit()
+                phase_clock = self._phase("append_commit", phase_clock)
         except Exception:
             try:
                 self.connection.rollback()
@@ -1170,6 +1190,7 @@ class Storage:
         ).fetchone()
         self.latest_market_event_received_utc = str(latest_event[0]) if latest_event else None
         self.latest_event = (int(latest_event[1]), str(latest_event[2])) if latest_event else None
+        phase_clock = self._phase("append_tail", phase_clock)
 
         if self.raw_capture_enabled and new_parquet_rows:
             incoming_estimate = sum(
@@ -1193,6 +1214,7 @@ class Storage:
         elif new_parquet_rows:
             self.parquet_dropped_rows += len(new_parquet_rows)
             self.archive_gap_pending = True
+        self._phase("append_parquet_buffer_and_flush", phase_clock)
         return inserted
 
     def _write_partitioned_parquet(self, rows: list[dict[str, Any]]) -> list[Path]:

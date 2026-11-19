@@ -464,6 +464,21 @@ class RuntimeStatusTests(unittest.TestCase):
             self.assertEqual(idle["strategy_rest_poll_health"], "NOT_DUE_OUTSIDE_ENTRY_WINDOW")
 
 
+class WriterPhaseTimingTests(unittest.TestCase):
+    def test_phases_are_recorded_and_exposed_in_status(self):
+        with TemporaryDirectory() as tmp:
+            store = Storage(Settings(home=Path(tmp), min_free_bytes=0))
+            store.open()
+            store.append_batch([_trade(i) for i in range(2100)])  # crosses the 2000-row flush threshold
+            phases = store.connection_status()["writer_phase_ms_ema"]
+            for name in ("append_prepare", "append_insert", "append_commit", "append_tail",
+                         "append_parquet_buffer_and_flush", "flush_write_files", "flush_manifest",
+                         "flush_wal_barrier", "flush_checkpoint_file"):
+                self.assertIn(name, phases)
+                self.assertGreaterEqual(phases[name], 0.0)
+            store.close()
+
+
 class LedgerVolumeTests(unittest.TestCase):
     def test_ledger_path_override_and_default(self):
         with TemporaryDirectory() as tmp:
