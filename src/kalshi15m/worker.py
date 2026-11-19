@@ -3132,7 +3132,23 @@ class Collector:
             status_url=f"http://{self.cfg.status_host}:{self.cfg.status_port}/api/v1/status",
         )
         recovery_started = time.monotonic()
-        await loop.run_in_executor(self.writer_pool, self.storage.open)
+        recovery_future = loop.run_in_executor(self.writer_pool, self.storage.open)
+        # The normal heartbeat_loop starts only after storage recovery. Keep the
+        # RECOVERING status timestamp current while the bounded single writer
+        # is replaying archival data, without launching a competing worker.
+        while not recovery_future.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(recovery_future), timeout=5.0)
+            except asyncio.TimeoutError:
+                self.status.update(
+                    startup_phase="STORAGE_OPEN_AND_RECOVERY",
+                    storage_recovery_elapsed_seconds=round(
+                        time.monotonic() - recovery_started, 3
+                    ),
+                )
+        # Propagate recovery errors; a live heartbeat is NOT proof of progress
+        # or a reason to bypass the source-integrity and readiness gates.
+        await recovery_future
         storage_status = await loop.run_in_executor(
             self.writer_pool, self.storage.connection_status
         )
