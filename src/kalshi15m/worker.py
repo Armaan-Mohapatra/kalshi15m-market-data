@@ -437,6 +437,7 @@ class Collector:
 
     def __init__(self, cfg: Settings = settings) -> None:
         self.cfg = cfg
+        self.writer_timing_ema = {}
         self.api = PublicKalshiAPI()
         self.status = RuntimeStatus(cfg)
         self.storage = Storage(cfg)
@@ -840,6 +841,7 @@ class Collector:
                 except asyncio.QueueEmpty:
                     break
             retry_count = 0
+            cycle_started = time.monotonic()  # queue wait excluded
             while True:
                 try:
                     await loop.run_in_executor(
@@ -870,6 +872,7 @@ class Collector:
                             exc_info=True,
                         )
                     await asyncio.sleep(delay)
+            append_seconds = time.monotonic() - cycle_started
             for _ in batch:
                 self.queue.task_done()
             try:
@@ -885,11 +888,24 @@ class Collector:
             storage_status = await loop.run_in_executor(
                 self.writer_pool, self.storage.connection_status
             )
+            # Where does a writer cycle go? EMA (alpha 0.2) of append_batch vs the
+            # status/flush overhead around it, to name the bottleneck from evidence.
+            cycle_seconds = time.monotonic() - cycle_started
+            ema = self.__dict__.setdefault("writer_timing_ema", {})  # per instance, even via __new__
+            for key, value in (
+                ("append_ms", append_seconds * 1000),
+                ("overhead_ms", (cycle_seconds - append_seconds) * 1000),
+                ("batch_events", float(len(batch))),
+            ):
+                ema[key] = value if key not in ema else 0.8 * ema[key] + 0.2 * value
             self.status.update(
                 queue_depth=self.queue.qsize(),
                 events_inserted=self.storage.events_inserted,
                 events_duplicate=self.storage.events_duplicate,
                 raw_capture_state="ENABLED" if self.storage.raw_capture_enabled else "THROTTLED_BUDGET",
+                writer_append_ms_ema=round(ema["append_ms"], 1),
+                writer_overhead_ms_ema=round(ema["overhead_ms"], 1),
+                writer_batch_events_ema=round(ema["batch_events"], 1),
                 **storage_status,
             )
 

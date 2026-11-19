@@ -2525,6 +2525,11 @@ class WriterLoopTests(unittest.IsolatedAsyncioTestCase):
                 # One drain, one fsync: not three 500-event commits.
                 self.assertEqual(sizes, [1200])
                 self.assertEqual(store.events_inserted, 1200)
+                await asyncio.sleep(1.0)  # let the cycle finish its status update
+                data = collector.status.data
+                self.assertEqual(data["writer_batch_events_ema"], 1200.0)
+                self.assertGreaterEqual(data["writer_append_ms_ema"], 0.0)
+                self.assertGreaterEqual(data["writer_overhead_ms_ema"], 0.0)
             finally:
                 collector.stopping.set()
                 await asyncio.wait_for(writer, timeout=4)
