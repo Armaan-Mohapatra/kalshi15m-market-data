@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def _isolated(script: str, *args: str) -> subprocess.CompletedProcess:
     env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH",)}
+    env["PHOENIX_NO_TOAST"] = "1"  # these runs raise real CRITICAL alerts (no worker on the port): no desktop toasts
     return subprocess.run([sys.executable, "-I", str(ROOT / "scripts" / script), *args],
                           capture_output=True, text=True, timeout=120, env=env, cwd=os.environ.get("TEMP"))
 

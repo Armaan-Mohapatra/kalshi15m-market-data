@@ -100,5 +100,45 @@ class AlertTests(unittest.TestCase):
         self.assertFalse(any("500s" in a for a in pr.alerts(r)))
 
 
+class NotifyTests(unittest.TestCase):
+    class _Run:
+        def __init__(self, code=0, boom=False):
+            self.calls, self.code, self.boom = [], code, boom
+
+        def __call__(self, args, **kw):
+            if self.boom:
+                raise OSError("no powershell")
+            self.calls.append((args, kw))
+            return type("R", (), {"returncode": self.code})()
+
+    def test_only_new_critical_alerts_raise_a_toast_and_text_travels_in_the_environment(self):
+        run = self._Run()
+        self.assertTrue(pr.notify(["WARNING writer queue at 12000", "CRITICAL archive integrity UNKNOWN"], run=run))
+        self.assertEqual(len(run.calls), 1)
+        args, kw = run.calls[0]
+        self.assertIn("archive integrity UNKNOWN", kw["env"]["PHOENIX_TOAST_TEXT"])
+        self.assertNotIn("WARNING", kw["env"]["PHOENIX_TOAST_TEXT"])
+        self.assertNotIn("archive integrity", " ".join(args))  # never interpolated into the script
+        warning_only = self._Run()
+        self.assertFalse(pr.notify(["WARNING writer queue at 12000"], run=warning_only))
+        self.assertEqual(warning_only.calls, [])
+        self.assertFalse(pr.notify([], run=warning_only))
+
+    def test_toast_app_id_keeps_its_backslashes(self):
+        # a normal (non-raw) literal turned  into a vertical tab and broke the toast identity
+        self.assertIn(chr(92).join(["}", "WindowsPowerShell", "v1.0", "powershell.exe"]), pr.TOAST_SCRIPT)
+
+    def test_opt_out_and_failures_never_break_the_report(self):
+        import os
+        from unittest.mock import patch
+
+        with patch.dict(os.environ, {"PHOENIX_NO_TOAST": "1"}):
+            quiet = self._Run()
+            self.assertFalse(pr.notify(["CRITICAL x"], run=quiet))
+            self.assertEqual(quiet.calls, [])
+        self.assertFalse(pr.notify(["CRITICAL x"], run=self._Run(boom=True)))  # swallowed
+        self.assertFalse(pr.notify(["CRITICAL x"], run=self._Run(code=1)))
+
+
 if __name__ == "__main__":
     unittest.main()

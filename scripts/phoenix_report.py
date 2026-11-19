@@ -10,7 +10,9 @@ import argparse
 import csv
 import html
 import json
+import os
 import sqlite3
+import subprocess
 import sys
 import time
 import urllib.request
@@ -202,6 +204,39 @@ def render(report: dict) -> str:
             + "".join(parts))
 
 
+TOAST_SCRIPT = (
+    "[void][Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime];"
+    "$t=[Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent('ToastText02');"
+    "$n=$t.GetElementsByTagName('text');"
+    "$n.Item(0).AppendChild($t.CreateTextNode('Phoenix paper alert'))|Out-Null;"
+    "$n.Item(1).AppendChild($t.CreateTextNode($env:PHOENIX_TOAST_TEXT))|Out-Null;"
+    r"$id='{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe';"
+    "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($id).Show("
+    "[Windows.UI.Notifications.ToastNotification,Windows.UI.Notifications,ContentType=WindowsRuntime]::new($t))"
+)
+
+
+def notify(new_alerts: list[str], run=subprocess.run) -> bool:
+    """Out-of-band signal: one Windows toast for the NEW CRITICAL alerts of this run.
+
+    Best effort and never raises (a failed toast must not break the report). Only
+    CRITICAL alerts notify, so a flapping WARNING (queue near cap) cannot spam. The text
+    travels in an environment variable, not in the script. PHOENIX_NO_TOAST=1 disables it.
+    """
+    critical = [a for a in new_alerts if a.startswith("CRITICAL")]
+    if not critical or os.environ.get("PHOENIX_NO_TOAST") == "1" or sys.platform != "win32":
+        return False
+    try:
+        done = run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", TOAST_SCRIPT],
+            env={**os.environ, "PHOENIX_TOAST_TEXT": "; ".join(critical)[:220]},
+            timeout=20, capture_output=True,
+        )
+        return done.returncode == 0
+    except Exception:
+        return False
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--home", default=r"E:\PhoenixLab\runtime\k15m-native")
@@ -221,6 +256,7 @@ def main() -> int:
             log.write(f"{report['generated_utc']} NEW {a_}\n")
         for a_ in sorted(before - now):
             log.write(f"{report['generated_utc']} CLEARED {a_}\n")
+    notify(sorted(now - before))
     for name, text in (("report.json", json.dumps(report, indent=1)), ("dashboard.html", render(report))):
         tmp = out / (name + ".tmp")
         tmp.write_text(text, encoding="utf-8")
