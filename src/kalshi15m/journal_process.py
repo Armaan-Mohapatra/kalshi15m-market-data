@@ -198,6 +198,8 @@ class ProcessJournalStorage(Storage):
         self._cache_status: dict[str, Any] = {}
         self._timing_ema: dict[str, float] = {}
         self._last_ack_monotonic: float | None = None
+        self._inflight: tuple[Future, list[dict[str, Any]]] | None = None
+        self._failed: list[list[dict[str, Any]]] = []
         self._buffered_rows = 0
         self._raw_flag = True
         self._ready: Future = Future()
@@ -318,17 +320,53 @@ class ProcessJournalStorage(Storage):
         self.parquet_recovery_state = recovery_state
 
     def append_batch(self, events: list[dict[str, Any]]) -> int:
+        """Pipelined: send this batch, then collect the PREVIOUS batch's ack.
+
+        The child works on batch N-1 while the parent gathers and sends batch N, so it is
+        not idle during the parent's per-cycle work (measured ~1.3 s of a ~3 s cycle).
+        A batch whose ack failed is kept in _failed and re-sent, in order, before anything
+        new is sent; durability points (_settle: flush/close/metrics) wait for all of it.
+        """
         started = time.perf_counter()
+        self._resend_failed()
+        if not self.child_alive:  # fail fast: the worker holds this batch and retries
+            raise RuntimeError("journal process is not running")
         if self._last_ack_monotonic is not None:  # parent-side time between two batches
             self._note("gap", (time.monotonic() - self._last_ack_monotonic) * 1000)
         future = self._request("append", events)
         self._note("send", (time.perf_counter() - started) * 1000)  # pickle + pipe write
-        result = int(future.result(timeout=CALL_TIMEOUT_SECONDS))
+        previous, self._inflight = self._inflight, (future, events)
+        if previous is not None:
+            self._collect(previous)
         self._note("rpc", (time.perf_counter() - started) * 1000)
         self._last_ack_monotonic = time.monotonic()
-        return result
+        return len(events)
+
+    def _collect(self, inflight: tuple[Future, list[dict[str, Any]]]) -> None:
+        future, events = inflight
+        try:
+            future.result(timeout=CALL_TIMEOUT_SECONDS)
+        except Exception:
+            LOG.exception("journal batch failed; it will be re-sent before new batches")
+            self._failed.append(events)
+
+    def _resend_failed(self) -> None:
+        """Re-send failed batches one by one; raises (keeping them queued) if one fails again."""
+        while self._failed:
+            events = self._failed[0]
+            self._request("append", events).result(timeout=CALL_TIMEOUT_SECONDS)
+            self._failed.pop(0)
+
+    def _settle(self) -> None:
+        """Everything handed to the child is acknowledged (or raises)."""
+        inflight, self._inflight = self._inflight, None
+        if inflight is not None:
+            self._collect(inflight)
+        self._resend_failed()
 
     def _call(self, method: str, *args: Any, **kwargs: Any) -> Any:
+        if method != "close" or self.child_alive:
+            self._settle()
         return self._request("call", method, args, kwargs).result(timeout=CALL_TIMEOUT_SECONDS)
 
     def flush_parquet(self, *, reason: str = "MANUAL") -> int:

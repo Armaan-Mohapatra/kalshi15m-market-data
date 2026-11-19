@@ -3791,7 +3791,7 @@ class ProcessJournalStorageTests(unittest.TestCase):
             store.open()
             try:
                 self.assertEqual(store.append_batch([_trade(i) for i in range(5)]), 5)
-                self.assertEqual(store.append_batch([_trade(i) for i in range(3, 8)]), 3)  # 2 duplicates
+                self.assertEqual(store.append_batch([_trade(i) for i in range(3, 8)]), 5)  # 2 duplicates; pipelined: returns the batch size
                 self.assertTrue(store.append_paper_record("p1", "PROFILE", "DECISION", {"eligible": False}))
                 self.assertEqual(store.flush_parquet(reason="TEST"), 8)
                 self.assertEqual(sorted(_archived_keys(cfg)), _expected(8))
@@ -3936,6 +3936,58 @@ class JournalPipeTimingTests(unittest.TestCase):
                 store.append_batch([_trade(i) for i in range(20, 40)])
                 timing = store.connection_status()["journal_pipe_ms_ema"]
                 self.assertTrue({"rpc", "send", "gap", "child_wall", "child_cpu"} <= set(timing))
-                self.assertGreaterEqual(timing["rpc"], timing["child_wall"])  # transit is never negative
             finally:
                 store.close()
+
+
+class PipelinedAppendTests(unittest.TestCase):
+    """The proxy sends batch N before collecting N-1's ack; failed batches are re-sent in order."""
+
+    def _stub(self, outcomes):
+        from concurrent.futures import Future
+        from kalshi15m.journal_process import ProcessJournalStorage
+
+        class Stub(ProcessJournalStorage):
+            def _request(self, kind, *payload):
+                self.sent.append((kind, payload[0] if payload else None))
+                future = Future()
+                if self.outcomes.pop(0) == "ok":
+                    future.set_result(1)
+                else:
+                    future.set_exception(RuntimeError("child failed"))
+                return future
+
+        with TemporaryDirectory() as tmp:
+            stub = Stub(Settings(home=Path(tmp), min_free_bytes=0))
+        stub.sent, stub.outcomes = [], list(outcomes)
+        stub.child_alive = True
+        return stub
+
+    def test_send_precedes_the_previous_ack_and_settle_collects_the_last(self):
+        stub = self._stub(["ok", "ok"])
+        stub.append_batch(["b1"])
+        self.assertEqual(stub._inflight[1], ["b1"])  # returned without collecting its own ack
+        stub.append_batch(["b2"])
+        self.assertEqual([p for _, p in stub.sent], [["b1"], ["b2"]])
+        stub._settle()
+        self.assertIsNone(stub._inflight)
+        self.assertEqual(stub._failed, [])
+
+    def test_a_failed_batch_is_resent_before_any_new_batch_in_order(self):
+        stub = self._stub(["fail", "ok", "ok", "ok"])
+        stub.append_batch(["b1"])
+        stub.append_batch(["b2"])  # collects b1's failure
+        self.assertEqual(stub._failed, [["b1"]])
+        stub.append_batch(["b3"])  # re-sends b1 first
+        self.assertEqual([p for _, p in stub.sent], [["b1"], ["b2"], ["b1"], ["b3"]])
+        self.assertEqual(stub._failed, [])
+
+    def test_a_batch_that_keeps_failing_raises_and_stays_queued_and_blocks_new_sends(self):
+        stub = self._stub(["fail", "ok", "fail"])
+        stub.append_batch(["b1"])
+        stub.append_batch(["b2"])
+        with self.assertRaises(RuntimeError):
+            stub.append_batch(["b3"])  # re-send of b1 fails
+        self.assertEqual(stub._failed, [["b1"]])  # kept for the next attempt, nothing dropped
+        self.assertEqual([p for _, p in stub.sent], [["b1"], ["b2"], ["b1"]])  # b3 never sent
+
