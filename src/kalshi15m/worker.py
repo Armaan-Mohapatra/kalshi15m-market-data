@@ -108,6 +108,10 @@ def start_stack_sampling(runtime_dir: Path, log_dir: Path) -> bool:
     if config is None:
         return False
     interval, duration = config
+    try:  # consume the request so a running process starts exactly one window per file
+        os.replace(runtime_dir / "stack_sample.txt", runtime_dir / "stack_sample.started.txt")
+    except OSError:
+        return False
     handle = (log_dir / "stack_samples.log").open("a", buffering=1, encoding="utf-8")
     faulthandler.dump_traceback_later(interval, repeat=True, file=handle)
     timer = threading.Timer(duration, faulthandler.cancel_dump_traceback_later)
@@ -963,6 +967,7 @@ class Collector:
 
     async def heartbeat_loop(self) -> None:
         while not self.stopping.is_set():
+            start_stack_sampling(self.cfg.runtime_dir, self.cfg.log_dir)  # on demand, one stat per tick
             over_budget = bool(
                 self.cfg.journal_budget_bytes
                 and self.storage.sqlite_bytes >= self.cfg.journal_budget_bytes

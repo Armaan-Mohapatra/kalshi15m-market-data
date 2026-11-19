@@ -487,6 +487,9 @@ class StackSamplingTests(unittest.TestCase):
             (runtime / "stack_sample.txt").write_text("0.2 1", encoding="utf-8")
             try:
                 self.assertTrue(start_stack_sampling(runtime, logs))
+                self.assertFalse((runtime / "stack_sample.txt").exists())  # request consumed
+                self.assertTrue((runtime / "stack_sample.started.txt").exists())
+                self.assertFalse(start_stack_sampling(runtime, logs))  # a running tick does not restart it
                 time.sleep(0.7)
             finally:
                 faulthandler.cancel_dump_traceback_later()
