@@ -72,6 +72,11 @@ class Settings:
     # Archive recovery keeps its fingerprint index in a file under home (so it
     # lives on the research volume, never %TEMP%) and refuses to grow past this.
     recovery_index_max_bytes: int = 4 * 1024**3
+    # Durability of market-event batch commits (owner-approved 2026-11-19: the USB
+    # volume needs ~1.3 s per fsync). NORMAL keeps the database consistent but a
+    # power loss can drop the last few seconds of events. Paper-ledger commits are
+    # always FULL, and the archive checkpoint waits for a WAL checkpoint (see storage).
+    event_synchronous: str = os.environ.get("KALSHI15M_EVENT_SYNCHRONOUS", "NORMAL").upper()
     # Journal page cache. dedupe_key is a random SHA-256, so the primary-key index
     # is a random-access B-tree: 64 MiB measured ~5.6 ms/event cold, 256 MiB ~1.3.
     # 160 MiB trades speed against the host's scarce free RAM.

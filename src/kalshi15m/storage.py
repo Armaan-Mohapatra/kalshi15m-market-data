@@ -152,9 +152,12 @@ class Storage:
         self.persistence_audit_cache: dict[str, Any] = {}
 
     def open(self) -> None:
+        if self.cfg.event_synchronous not in ("NORMAL", "FULL"):  # before a handle exists
+            raise ValueError(f"unsupported synchronous mode {self.cfg.event_synchronous!r}")
         self.connection = sqlite3.connect(self.cfg.ledger_path, timeout=15)
         self.connection.execute("PRAGMA journal_mode=WAL")
-        self.connection.execute("PRAGMA synchronous=FULL")
+        self.synchronous_mode = ""
+        self._set_synchronous(self.cfg.event_synchronous)
         self.connection.execute("PRAGMA busy_timeout=15000")
         # Default 2 MiB cache re-reads B-tree interior pages from disk on every
         # dedupe lookup once the journal reaches GBs (slow on the USB data volume).
@@ -233,6 +236,25 @@ class Storage:
                 LOG.exception("Parquet archive recovery failed; SQLite journal remains available")
         else:
             self.parquet_recovery_state = "SKIPPED_PREVIOUS_RUN_STOPPED"
+
+    def _set_synchronous(self, mode: str) -> None:
+        """Switch the journal's fsync policy between transactions (WAL: per connection)."""
+        if mode not in ("NORMAL", "FULL"):
+            raise ValueError(f"unsupported synchronous mode {mode!r}")
+        if mode != self.synchronous_mode:
+            assert self.connection is not None
+            self.connection.execute(f"PRAGMA synchronous={mode}")
+            self.synchronous_mode = mode
+
+    def _make_journal_durable(self) -> bool:
+        """fsync everything committed so far; the archive checkpoint must not outrun it."""
+        assert self.connection is not None
+        try:
+            self.connection.execute("PRAGMA wal_checkpoint(FULL)").fetchall()
+            return True
+        except sqlite3.Error:
+            LOG.warning("journal durability barrier failed; checkpoint not advanced", exc_info=True)
+            return False
 
     def _checkpoint_current(self) -> bool:
         """True only if a manifest-verified checkpoint already covers the journal head.
@@ -952,8 +974,13 @@ class Storage:
         # and only then can the checkpoint move. A failed listing freezes the
         # checkpoint (archive_gap_pending); the next recovery adopts the files.
         listed = self._record_published_files(published)
+        # With synchronous=NORMAL for events, the checkpoint may only name journal
+        # rows that are already on disk: force the WAL out first.
         if through is not None and listed and not self.archive_gap_pending:
-            self._write_archive_checkpoint(through)
+            if self._make_journal_durable():
+                self._write_archive_checkpoint(through)
+            else:
+                self.archive_checkpoint_write_failures += 1
         self.parquet_buffer = []
         self.parquet_buffer_bytes_estimate = 0
         self.parquet_buffer_started_monotonic = None
@@ -1003,6 +1030,10 @@ class Storage:
         if self.connection is None:
             raise RuntimeError("Storage is not open")
         now = datetime.now(timezone.utc).isoformat()
+        # Paper records are never allowed the weaker policy; a FULL commit also syncs
+        # every earlier NORMAL event commit in the same WAL. SQLite refuses to change
+        # the level inside a transaction, so it is set before BEGIN.
+        self._set_synchronous("FULL")
         try:
             self.connection.execute("BEGIN IMMEDIATE")
             cursor = self.connection.execute(
@@ -1022,6 +1053,8 @@ class Storage:
             except Exception:
                 pass
             raise
+        finally:
+            self._set_synchronous(self.cfg.event_synchronous)
         self.sqlite_bytes = self._sqlite_size()
         inserted = cursor.rowcount == 1
         if inserted:

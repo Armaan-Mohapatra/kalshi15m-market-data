@@ -464,6 +464,45 @@ class RuntimeStatusTests(unittest.TestCase):
             self.assertEqual(idle["strategy_rest_poll_health"], "NOT_DUE_OUTSIDE_ENTRY_WINDOW")
 
 
+class JournalDurabilityPolicyTests(unittest.TestCase):
+    def test_events_use_configured_mode_but_paper_records_commit_full(self):
+        with TemporaryDirectory() as temporary:
+            store = Storage(Settings(home=Path(temporary), min_free_bytes=0, event_synchronous="NORMAL"))
+            store.open()
+            self.assertEqual(store.connection.execute("PRAGMA synchronous").fetchone()[0], 1)  # NORMAL
+            modes = []
+            real = store._set_synchronous
+            store._set_synchronous = lambda mode: (modes.append(mode), real(mode))[1]
+            store.append_batch([_trade(1)])
+            self.assertEqual(modes, [])  # event batches never raise the policy
+            store.append_paper_record("k1", "p", "DECISION", {"x": 1})
+            self.assertEqual(modes, ["FULL", "NORMAL"])
+            self.assertEqual(store.connection.execute("PRAGMA synchronous").fetchone()[0], 1)
+            store.close()
+
+    def test_checkpoint_waits_for_the_journal_durability_barrier(self):
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary), min_free_bytes=0)
+            store = Storage(cfg)
+            store.open()
+            store.append_batch([_trade(1)])
+            with patch.object(store, "_make_journal_durable", return_value=False):
+                store.flush_parquet(reason="TEST")
+            self.assertFalse(store.archive_checkpoint_path.exists())
+            self.assertEqual(store.archive_checkpoint_write_failures, 1)
+            store.append_batch([_trade(2)])
+            store.flush_parquet(reason="TEST")
+            self.assertEqual(
+                json.loads(store.archive_checkpoint_path.read_text(encoding="utf-8"))["through_rowid"], 2
+            )
+            store.close()
+
+    def test_unsupported_mode_is_rejected(self):
+        with TemporaryDirectory() as temporary:
+            with self.assertRaises(ValueError):
+                Storage(Settings(home=Path(temporary), event_synchronous="OFF")).open()
+
+
 class SourceFingerprintTests(unittest.TestCase):
     def test_status_reports_git_head_or_explicit_unknown(self):
         from kalshi15m.worker import source_fingerprint
