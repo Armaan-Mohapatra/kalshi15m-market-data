@@ -2008,6 +2008,23 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(len(store.parquet_buffer), 1)
             store.close()
 
+    def test_duplicates_are_ignored_after_restart_without_recent_key_window(self):
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary), min_free_bytes=0)
+            first = Storage(cfg)
+            first.open()
+            self.assertEqual(first.append_batch([_trade(1), _trade(2)]), 2)
+            first.close()
+            second = Storage(cfg)  # empty recent-key window, like a restarted worker
+            second.open()
+            self.assertEqual(second.append_batch([_trade(2), _trade(3), _trade(3)]), 1)
+            self.assertEqual(second.events_duplicate, 2)
+            self.assertEqual(
+                second.connection.execute("SELECT count(*) FROM market_events").fetchone()[0], 3
+            )
+            self.assertEqual([r["dedupe_key"] for r in second.parquet_buffer], ["trade-3"])
+            second.close()
+
     def test_unclean_start_recovers_missing_parquet_rows_from_sqlite(self):
         with TemporaryDirectory() as temporary:
             cfg = Settings(home=Path(temporary))

@@ -134,6 +134,7 @@ class Storage:
         self.latest_event: tuple[int, str] | None = None
         self.parquet_buffer_through: tuple[int, str] | None = None
         self.archive_gap_pending = False
+        self._recent_keys: dict[str, None] = {}
         self.parquet_recovery_reason: str | None = None
         self.parquet_recovery_files_scanned = 0
         self.parquet_recovery_rows_scanned = 0
@@ -379,6 +380,7 @@ class Storage:
     # it only vouches for files that are listed, present and unchanged. Startup
     # stats every listed file but hashes just the newest MANIFEST_TAIL_HASH_FILES.
     # Older same-size corruption needs verify_archive(full=True).
+    RECENT_KEYS_MAX = 100_000
     MANIFEST_GENESIS = "0" * 64
     MANIFEST_TAIL_HASH_FILES = 32
 
@@ -1061,23 +1063,15 @@ class Storage:
                 dedupe, digest, raw = self._normalized(event)
                 prepared.append((event, dedupe, digest, raw))
 
-        keys = list(dict.fromkeys(item[1] for item in prepared))
-        existing: set[str] = set()
+        # No separate dedupe SELECT: dedupe_key is a random SHA-256, so every probe
+        # is a cold random B-tree read. INSERT OR IGNORE ... RETURNING does the
+        # global uniqueness check and reports which rows were really new in one pass.
         seen: set[str] = set()
-        for start in range(0, len(keys), 500):
-            batch_keys = keys[start : start + 500]
-            placeholders = ",".join("?" for _ in batch_keys)
-            existing.update(
-                row[0]
-                for row in self.connection.execute(
-                    f"SELECT dedupe_key FROM market_events WHERE dedupe_key IN ({placeholders})",
-                    batch_keys,
-                )
-            )
-
         new_parquet_rows: list[dict[str, Any]] = []
         for event, dedupe, digest, raw in prepared:
-            if dedupe in existing or dedupe in seen:
+            # Recently committed keys (reconnect replays) skip normalization; anything
+            # older or after a restart is settled by INSERT OR IGNORE below.
+            if dedupe in seen or dedupe in self._recent_keys:
                 continue
             seen.add(dedupe)
             if digest is None or raw is None:
@@ -1108,14 +1102,19 @@ class Storage:
                 }
             )
 
-        cursor = None
+        inserted_keys: set[str] = set()
         try:
             if rows:
                 self.connection.execute("BEGIN IMMEDIATE")
-                cursor = self.connection.executemany(
-                    "INSERT OR IGNORE INTO market_events VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    rows,
-                )
+                for start in range(0, len(rows), 100):  # 800 bound variables per statement
+                    chunk = rows[start : start + 100]
+                    returned = self.connection.execute(
+                        "INSERT OR IGNORE INTO market_events VALUES "
+                        + ",".join(["(?,?,?,?,?,?,?,?)"] * len(chunk))
+                        + " RETURNING dedupe_key",
+                        [value for row in chunk for value in row],
+                    )
+                    inserted_keys.update(item[0] for item in returned.fetchall())
                 self.connection.commit()
         except Exception:
             try:
@@ -1123,9 +1122,13 @@ class Storage:
             except Exception:
                 pass
             raise
-        inserted = int(
-            cursor.rowcount if cursor is not None and cursor.rowcount >= 0 else len(rows)
-        )
+        inserted = len(inserted_keys)
+        new_parquet_rows = [row for row in new_parquet_rows if row["dedupe_key"] in inserted_keys]
+        # shortcut: bounded window of committed keys, not a full index; upgrade only
+        # if duplicate normalization CPU ever shows up in a profile.
+        self._recent_keys.update(dict.fromkeys(row[0] for row in rows))
+        while len(self._recent_keys) > self.RECENT_KEYS_MAX:
+            del self._recent_keys[next(iter(self._recent_keys))]
         self.events_inserted += inserted
         self.events_duplicate += max(0, len(events) - inserted)
         self.sqlite_bytes = self._sqlite_size()
