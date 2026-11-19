@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import json
 import logging
 import logging.handlers
@@ -82,6 +83,32 @@ def tune_gil_switch_interval() -> None:
     append_prepare was 3-4 s per cycle against ~120 ms of real work.
     """
     sys.setswitchinterval(GIL_SWITCH_INTERVAL_SECONDS)
+
+
+class LoopLagMonitor:
+    """How late does the event loop run a 50 ms timer? A blocked loop leaves the WebSocket unread
+    (keepalive timeouts, server-side slow-consumer drops), so each disconnect records this."""
+
+    TICK_SECONDS = 0.05
+
+    def __init__(self) -> None:
+        self.samples: collections.deque[tuple[float, float]] = collections.deque()
+
+    def record(self, lag_seconds: float, now: float | None = None) -> None:
+        now = time.monotonic() if now is None else now
+        self.samples.append((now, lag_seconds))
+        while self.samples and now - self.samples[0][0] > 120:
+            self.samples.popleft()
+
+    def max_ms(self, window_seconds: float = 30.0, now: float | None = None) -> float:
+        now = time.monotonic() if now is None else now
+        return round(1000 * max((lag for t, lag in self.samples if now - t <= window_seconds), default=0.0), 1)
+
+    async def run(self) -> None:
+        while True:
+            started = time.monotonic()
+            await asyncio.sleep(self.TICK_SECONDS)
+            self.record(max(0.0, time.monotonic() - started - self.TICK_SECONDS))
 
 
 def parse_stack_sample_config(text: str) -> tuple[float, float] | None:
@@ -489,6 +516,7 @@ def status_server(status: RuntimeStatus, cfg: Settings) -> ThreadingHTTPServer:
 
 
 class Collector:
+    loop_lag = LoopLagMonitor()  # replaced per instance in __init__
     # Group commit: one fsync per drain of up to this many queued events. Measured
     # ~1.3 s per commit on the USB research volume, so 500/commit capped throughput
     # near 400 events/s. Never waits for more events; durability is unchanged.
@@ -503,6 +531,7 @@ class Collector:
         self.api = PublicKalshiAPI()
         self.status = RuntimeStatus(cfg)
         self.storage = make_storage(cfg)
+        self.loop_lag = LoopLagMonitor()
         self.queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=cfg.max_queue_events)
         self.writer_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="journal-writer")
         self.stopping = asyncio.Event()
@@ -986,6 +1015,7 @@ class Collector:
                 journal_delta_budget_skipped=getattr(self, "journal_delta_budget_skipped", 0),
                 journal_optional_capture_state="STOPPED_JOURNAL_BUDGET" if over_budget else "ENABLED",
                 websocket_connection_id=self.ws_connection_id,
+                event_loop_lag_ms_max_30s=self.loop_lag.max_ms(30.0),
             )
             self.status.refresh_ages()
             try:
@@ -2742,7 +2772,10 @@ class Collector:
                     last_websocket_disconnect_detail=str(exc)[:300],
                 )
                 # The type alone hid why the server ended the session (clean close vs reset).
-                LOG.warning("WebSocket disconnected: %s: %s", type(exc).__name__, str(exc)[:300])
+                LOG.warning(
+                    "WebSocket disconnected: %s: %s [queue=%d loop_lag_max_30s_ms=%s]",
+                    type(exc).__name__, str(exc)[:300], self.queue.qsize(), self.loop_lag.max_ms(30.0),
+                )
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(30.0, reconnect_delay * 2)
         self.status.update(websocket_state="STOPPED")
@@ -3309,6 +3342,7 @@ class Collector:
         self.stop_file.unlink(missing_ok=True)
         writer = asyncio.create_task(self.writer_loop(), name="sqlite-parquet-writer")
         heartbeat = asyncio.create_task(self.heartbeat_loop(), name="runtime-heartbeat")
+        lag_task = asyncio.create_task(self.loop_lag.run(), name="loop-lag-monitor")
         await self.refresh_inventory()
         ws_task = asyncio.create_task(self.websocket_loop(), name="kalshi-websocket")
         await self.emit(
@@ -3509,6 +3543,7 @@ class Collector:
         finally:
             self.stopping.set()
             heartbeat.cancel()
+            lag_task.cancel()
             try:
                 await heartbeat
             except asyncio.CancelledError:

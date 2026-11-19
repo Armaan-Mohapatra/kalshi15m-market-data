@@ -4027,3 +4027,31 @@ class WebSocketCloseDetailTests(unittest.TestCase):
         self.assertIn("going away", detail)
         self.assertRegex(detail, r"session_s=1[12]\.\d")
         self.assertIn("close_code=None", Collector._close_detail(object(), time.monotonic()))  # no attribute: still safe
+
+
+class LoopLagMonitorTests(unittest.TestCase):
+    def test_a_blocked_event_loop_shows_up_as_lag_and_old_samples_expire(self):
+        import asyncio
+        from kalshi15m.worker import LoopLagMonitor
+
+        async def scenario():
+            monitor = LoopLagMonitor()
+            task = asyncio.create_task(monitor.run())
+            await asyncio.sleep(0.2)
+            time.sleep(0.4)  # block the loop the way a long synchronous call would
+            await asyncio.sleep(0.2)
+            task.cancel()
+            return monitor
+
+        monitor = asyncio.run(scenario())
+        self.assertGreaterEqual(monitor.max_ms(30.0), 300)
+        self.assertEqual(monitor.max_ms(30.0, now=time.monotonic() + 1000), 0.0)  # window passed: nothing
+
+    def test_samples_older_than_two_minutes_are_dropped(self):
+        from kalshi15m.worker import LoopLagMonitor
+
+        monitor = LoopLagMonitor()
+        monitor.record(5.0, now=0.0)
+        monitor.record(0.01, now=200.0)
+        self.assertEqual(len(monitor.samples), 1)
+        self.assertEqual(monitor.max_ms(30.0, now=200.0), 10.0)
