@@ -19,6 +19,11 @@ class Settings:
     min_free_bytes: int = 20 * 1024**3
     max_response_bytes: int = 64 * 1024**2
     max_queue_events: int = 12000
+    # Opt-in: persist WebSocket orderbook_delta rows only for these series prefixes.
+    # Unset (default) journals every delta. Books and sequence checks are unaffected.
+    journal_delta_series_prefixes: tuple[str, ...] = tuple(
+        p.strip() for p in os.environ.get("KALSHI15M_JOURNAL_DELTA_SERIES", "").split(",") if p.strip()
+    )
     # Leave headroom below one REST request per second; forward polling at
     # 1.0 s observed recoverable 429 responses on /markets discovery.
     rest_min_interval_seconds: float = 2.0
@@ -52,7 +57,10 @@ class Settings:
     # runs when the set of confirmed-frequency candidates changes.
     series_catalog_refresh_seconds: int = 900
     discovery_refresh_seconds: int = 21600
-    raw_data_budget_bytes: int = 1500 * 1024**2
+    raw_data_budget_bytes: int = int(os.environ.get("KALSHI15M_RAW_DATA_BUDGET_BYTES", 1500 * 1024**2))
+    # Optional (orderbook_delta) journaling stops once SQLite+WAL reaches this
+    # size; snapshots, trades, lifecycle and paper records keep persisting. 0 = no cap.
+    journal_budget_bytes: int = int(os.environ.get("KALSHI15M_JOURNAL_BUDGET_BYTES", "0"))
     log_budget_bytes: int = 40 * 1024**2
     log_file_max_bytes: int = 8 * 1024**2
     log_backup_count: int = 5

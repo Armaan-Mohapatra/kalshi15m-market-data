@@ -127,6 +127,15 @@ class Storage:
         self.parquet_dropped_rows = self.previous_parquet_dropped_rows
         self.parquet_recovery_state = "NOT_RUN"
         self.parquet_recovery_rows = 0
+        self.parquet_recovery_mode = "NOT_RUN"
+        # Highest SQLite rowid committed so far, and highest rowid sitting in
+        # parquet_buffer. A flush publishes the checkpoint only when no rows were
+        # dropped since the last verified checkpoint (archive_gap_pending).
+        self.latest_event: tuple[int, str] | None = None
+        self.parquet_buffer_through: tuple[int, str] | None = None
+        self.archive_gap_pending = False
+        self.parquet_size_reconcile_interval_seconds = 300.0
+        self.parquet_size_reconcile_last_monotonic = 0.0
         self.persistence_audit_interval_seconds = 15.0
         self.persistence_audit_last_monotonic = 0.0
         self.persistence_audit_cache: dict[str, Any] = {}
@@ -136,6 +145,9 @@ class Storage:
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA synchronous=FULL")
         self.connection.execute("PRAGMA busy_timeout=15000")
+        # Default 2 MiB cache re-reads B-tree interior pages from disk on every
+        # dedupe lookup once the journal reaches GBs (slow on the USB data volume).
+        self.connection.execute("PRAGMA cache_size=-65536")
         self.connection.execute(
             """CREATE TABLE IF NOT EXISTS market_events (
                 dedupe_key TEXT PRIMARY KEY,
@@ -182,10 +194,12 @@ class Storage:
         ).fetchone()
         self.latest_paper_record_utc = str(latest_paper[0]) if latest_paper else None
         latest_event = self.connection.execute(
-            "SELECT received_utc FROM market_events ORDER BY rowid DESC LIMIT 1"
+            "SELECT received_utc, rowid, dedupe_key FROM market_events ORDER BY rowid DESC LIMIT 1"
         ).fetchone()
         self.latest_market_event_received_utc = str(latest_event[0]) if latest_event else None
+        self.latest_event = (int(latest_event[1]), str(latest_event[2])) if latest_event else None
         self.parquet_bytes = self._parquet_directory_size()
+        self.parquet_size_reconcile_last_monotonic = time.monotonic()
         self.sqlite_bytes = self._sqlite_size()
         previous_capture_incomplete = (
             self.previous_parquet_dropped_rows > 0
@@ -280,7 +294,11 @@ class Storage:
             disk_paper_rowid = int(latest_paper[0]) if latest_paper else None
             disk_event = str(latest_event[1]) if latest_event else None
             disk_paper = str(latest_paper[1]) if latest_paper else None
-            self.parquet_bytes = self._parquet_directory_size()
+            now = time.monotonic()
+            if now - self.parquet_size_reconcile_last_monotonic >= self.parquet_size_reconcile_interval_seconds:
+                # Full directory walk is O(files); flushes track bytes incrementally.
+                self.parquet_bytes = self._parquet_directory_size()
+                self.parquet_size_reconcile_last_monotonic = now
             self.persistence_audit_cache = {
                 "storage_latest_disk_market_event_rowid": disk_event_rowid,
                 "storage_latest_disk_paper_record_rowid": disk_paper_rowid,
@@ -308,10 +326,74 @@ class Storage:
             if probe is not None:
                 probe.close()
 
+    @property
+    def archive_checkpoint_path(self) -> Path:
+        return self.cfg.parquet_dir / "_archive_checkpoint.json"
+
+    def _write_archive_checkpoint(self, through: tuple[int, str]) -> None:
+        """Durably record that every market_events row <= through[0] is archived.
+
+        Failure only leaves the older (still valid) checkpoint in place.
+        """
+        try:
+            self._write_archive_checkpoint_file(through)
+        except OSError:
+            LOG.warning("archive checkpoint write failed; older checkpoint kept", exc_info=True)
+
+    def _write_archive_checkpoint_file(self, through: tuple[int, str]) -> None:
+        record = {
+            "version": 1,
+            "through_rowid": int(through[0]),
+            "through_dedupe_key": str(through[1]),
+            "written_epoch": time.time(),
+            "written_utc": datetime.now(timezone.utc).isoformat(),
+            "archive_bytes": int(self.parquet_bytes),
+        }
+        path = self.archive_checkpoint_path
+        temporary = path.with_suffix(".json.partial")
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(record, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+
+    def _read_archive_checkpoint(self) -> dict[str, Any] | None:
+        """Return the checkpoint only if it still names the same journal row."""
+        assert self.connection is not None
+        try:
+            record = json.loads(self.archive_checkpoint_path.read_text(encoding="utf-8"))
+            rowid = int(record["through_rowid"])
+            key = str(record["through_dedupe_key"])
+            float(record["written_epoch"])
+            archive_bytes = int(record["archive_bytes"])
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+        if self._parquet_directory_size() < archive_bytes:
+            # Archive files were removed or truncated after the checkpoint.
+            return None
+        row = self.connection.execute(
+            "SELECT dedupe_key FROM market_events WHERE rowid = ?", (rowid,)
+        ).fetchone()
+        if row is None or str(row[0]) != key:
+            return None
+        return record
+
+    # Files written after a checkpoint may hold rows past it. Allow for clock
+    # adjustment; a too-wide window only costs time, a too-narrow one could
+    # re-archive an already-published row (a duplicate, never a loss).
+    CHECKPOINT_MTIME_MARGIN_SECONDS = 900.0
+
     def recover_parquet_archive(self) -> int:
-        """Rebuild missing Parquet event variants from the durable SQLite journal."""
+        """Rebuild missing Parquet event variants from the durable SQLite journal.
+
+        With a valid checkpoint only journal rows after it, and Parquet files
+        written after it, are compared. Otherwise the full history is scanned.
+        """
         if self.connection is None:
             raise RuntimeError("Storage is not open")
+        # Until this run completes, the archive may be missing journal rows, so
+        # flushes must not advance the checkpoint (cleared only on success).
+        self.archive_gap_pending = True
         if self.parquet_bytes >= self.cfg.raw_data_budget_bytes:
             self.raw_capture_enabled = False
             self.parquet_recovery_state = "SKIPPED_RAW_BUDGET"
@@ -325,6 +407,22 @@ class Storage:
             self.parquet_recovery_state = "SKIPPED_LOW_DISK"
             return 0
 
+        has_versions = self.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='market_event_versions'"
+        ).fetchone()
+        # The legacy merge tool writes market_event_versions out of band, so a
+        # checkpoint cannot vouch for it; such journals always take the full scan.
+        checkpoint = None if has_versions else self._read_archive_checkpoint()
+        since_rowid = int(checkpoint["through_rowid"]) if checkpoint else 0
+        min_mtime = (
+            float(checkpoint["written_epoch"]) - self.CHECKPOINT_MTIME_MARGIN_SECONDS
+            if checkpoint
+            else None
+        )
+        self.parquet_recovery_mode = (
+            f"INCREMENTAL_FROM_ROWID_{since_rowid}" if checkpoint else "FULL_SCAN"
+        )
+        max_scanned: tuple[int, str] | None = None
         # Recovery may scan a long-running journal. Keep the archive index on
         # disk instead of retaining every fingerprint in a Python set (which
         # can consume several times the archive size in RAM).
@@ -340,6 +438,12 @@ class Storage:
             )
             insert_fingerprint = "INSERT OR IGNORE INTO archived_fingerprints VALUES (?)"
             for path in self.cfg.parquet_dir.rglob("*.parquet"):
+                if min_mtime is not None:
+                    try:
+                        if path.stat().st_mtime < min_mtime:
+                            continue
+                    except OSError:
+                        continue
                 parquet_file = pq.ParquetFile(path)
                 names = set(parquet_file.schema_arrow.names)
                 columns = [
@@ -373,10 +477,7 @@ class Storage:
 
             assert self.connection is not None
             tables = ["market_events"]
-            version_table = self.connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='market_event_versions'"
-            ).fetchone()
-            if version_table:
+            if has_versions:
                 tables.append("market_event_versions")
             columns = (
                 "dedupe_key, received_utc, exchange_ts, channel, kind, "
@@ -386,9 +487,16 @@ class Storage:
             archive_rows: list[dict[str, Any]] = []
             stop_recovery = False
             for table in tables:
-                cursor = self.connection.execute(
-                    f"SELECT {columns} FROM {table} ORDER BY received_utc, dedupe_key"
-                )
+                if table == "market_events":
+                    cursor = self.connection.execute(
+                        f"SELECT {columns}, rowid FROM {table} WHERE rowid > ? ORDER BY rowid",
+                        (since_rowid,),
+                    )
+                else:
+                    # WITHOUT ROWID legacy table.
+                    cursor = self.connection.execute(
+                        f"SELECT {columns} FROM {table} ORDER BY received_utc, dedupe_key"
+                    )
                 while True:
                     rows = cursor.fetchmany(1000)
                     if not rows:
@@ -409,6 +517,9 @@ class Storage:
                             "raw_json": decode_journal_payload(row[6]),
                             "payload_sha256": row[7],
                         }
+                        if table == "market_events":
+                            # ORDER BY rowid: the last row seen is the maximum.
+                            max_scanned = (int(row[8]), str(row[0]))
                         fingerprint = event_archive_fingerprint(event)
                         was_new = fingerprint_db.execute(
                             insert_fingerprint, (fingerprint,)
@@ -425,11 +536,14 @@ class Storage:
             if archive_rows:
                 self._write_partitioned_parquet(archive_rows)
                 recovered += len(archive_rows)
+            if not stop_recovery:
+                if max_scanned is not None:
+                    self._write_archive_checkpoint(max_scanned)
+                self.archive_gap_pending = False
         finally:
             fingerprint_db.close()
-        self.parquet_bytes = sum(
-            path.stat().st_size for path in self.cfg.parquet_dir.rglob("*.parquet")
-        )
+        self.parquet_bytes = self._parquet_directory_size()
+        self.parquet_size_reconcile_last_monotonic = time.monotonic()
         if self.parquet_recovery_state == "NOT_RUN":
             self.parquet_recovery_state = "RECOVERED_MISSING_ROWS" if recovered else "VERIFIED_NO_GAP"
         return recovered
@@ -505,6 +619,8 @@ class Storage:
         if not self.raw_capture_enabled:
             count = len(self.parquet_buffer)
             self.parquet_dropped_rows += count
+            self.archive_gap_pending = True
+            self.parquet_buffer_through = None
             self.parquet_buffer.clear()
             self.parquet_buffer_bytes_estimate = 0
             self.parquet_buffer_started_monotonic = None
@@ -514,10 +630,15 @@ class Storage:
             LOG.warning("raw Parquet budget reached; SQLite critical journal remains enabled")
             return self.flush_parquet(reason="RAW_CAPTURE_DISABLED")
         rows = self.parquet_buffer
+        # _write_partitioned_parquet adds each published file's size to
+        # parquet_bytes; the periodic audit reconciles with a directory walk.
         self._write_partitioned_parquet(rows)
-        # Reconcile after every flush so budget checks/status include any
-        # archive files created while this worker was running.
-        self.parquet_bytes = self._parquet_directory_size()
+        through = self.parquet_buffer_through
+        self.parquet_buffer_through = None
+        if through is not None and not self.archive_gap_pending:
+            # Every file of this flush is published (os.replace) before the
+            # checkpoint moves, so a crash mid-flush leaves the older checkpoint.
+            self._write_archive_checkpoint(through)
         self.parquet_buffer = []
         self.parquet_buffer_bytes_estimate = 0
         self.parquet_buffer_started_monotonic = None
@@ -696,9 +817,10 @@ class Storage:
         self.events_duplicate += max(0, len(events) - inserted)
         self.sqlite_bytes = self._sqlite_size()
         latest_event = self.connection.execute(
-            "SELECT received_utc FROM market_events ORDER BY rowid DESC LIMIT 1"
+            "SELECT received_utc, rowid, dedupe_key FROM market_events ORDER BY rowid DESC LIMIT 1"
         ).fetchone()
         self.latest_market_event_received_utc = str(latest_event[0]) if latest_event else None
+        self.latest_event = (int(latest_event[1]), str(latest_event[2])) if latest_event else None
 
         if self.raw_capture_enabled and new_parquet_rows:
             incoming_estimate = sum(
@@ -709,16 +831,19 @@ class Storage:
             if self.parquet_bytes + incoming_estimate > self.cfg.raw_data_budget_bytes:
                 self.raw_capture_enabled = False
                 self.parquet_dropped_rows += len(new_parquet_rows)
+                self.archive_gap_pending = True
                 LOG.warning("raw Parquet budget reached; SQLite critical journal remains enabled")
             else:
                 if not self.parquet_buffer:
                     self.parquet_buffer_started_monotonic = time.monotonic()
                 self.parquet_buffer.extend(new_parquet_rows)
+                self.parquet_buffer_through = self.latest_event
                 self.parquet_buffer_bytes_estimate += incoming_estimate
                 if len(self.parquet_buffer) >= self.parquet_flush_rows:
                     self.flush_parquet(reason="ROW_THRESHOLD")
         elif new_parquet_rows:
             self.parquet_dropped_rows += len(new_parquet_rows)
+            self.archive_gap_pending = True
         return inserted
 
     def _write_partitioned_parquet(self, rows: list[dict[str, Any]]) -> None:
@@ -763,18 +888,23 @@ class Storage:
         result = self.connection.execute("PRAGMA integrity_check").fetchone()
         return str(result[0]) if result else "UNKNOWN"
 
-    def database_metrics(self) -> dict[str, Any]:
+    def database_metrics(self, *, full_integrity_check: bool = False) -> dict[str, Any]:
+        """Cheap shutdown metrics; the full-page integrity scan is opt-in.
+
+        market_events rows are never deleted and INSERT OR IGNORE consumes no
+        rowid when it ignores, so max(rowid) equals the row count without a scan.
+        """
         if self.connection is None:
             self.open()
         assert self.connection is not None
-        event_count = self.connection.execute("SELECT count(*) FROM market_events").fetchone()[0]
+        event_count = self.connection.execute("SELECT max(rowid) FROM market_events").fetchone()[0] or 0
         ledger_count = self.connection.execute("SELECT count(*) FROM paper_ledger").fetchone()[0]
         return {
             "event_count": event_count,
             "paper_ledger_count": ledger_count,
             "sqlite_bytes_including_wal": self._sqlite_size(),
             "parquet_bytes": self.parquet_bytes,
-            "integrity_check": self.integrity_check(),
+            "integrity_check": self.integrity_check() if full_integrity_check else "SKIPPED_FULL_SCAN",
             **self.connection_status(),
         }
 

@@ -8,6 +8,7 @@ import os
 import shutil
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -502,6 +503,9 @@ class Collector:
         self.crossmarket_performance_dirty = True
         self.queue_dropped = 0
         self.status_http: ThreadingHTTPServer | None = None
+        # Kalshi restarts sid/seq numbering on every socket; scope WS dedupe keys
+        # to the connection so a reconnect never collides with earlier sessions.
+        self.ws_connection_id = uuid.uuid4().hex[:12]
         self.stop_file = cfg.runtime_dir / "stop.request"
         try:
             self.strategy_config, self.strategy_config_hash = load_frozen_strategy(
@@ -737,6 +741,19 @@ class Collector:
         exchange_ts: Any = None,
         dedupe_key: str | None = None,
     ) -> None:
+        if kind == "orderbook_delta":
+            # Deltas are applied to the in-memory book upstream; only persistence
+            # is skipped. Paper fills embed their own arrival book snapshot.
+            cfg = getattr(self, "cfg", None)
+            prefixes = cfg.journal_delta_series_prefixes if cfg is not None else ()
+            budget = cfg.journal_budget_bytes if cfg is not None else 0
+            storage = getattr(self, "storage", None)
+            if prefixes and not str(market_ticker or "").startswith(prefixes):
+                self.journal_delta_skipped = getattr(self, "journal_delta_skipped", 0) + 1
+                return
+            if budget and storage is not None and storage.sqlite_bytes >= budget:
+                self.journal_delta_budget_skipped = getattr(self, "journal_delta_budget_skipped", 0) + 1
+                return
         event = {
             "channel": channel,
             "kind": kind,
@@ -852,6 +869,18 @@ class Collector:
 
     async def heartbeat_loop(self) -> None:
         while not self.stopping.is_set():
+            over_budget = bool(
+                self.cfg.journal_budget_bytes
+                and self.storage.sqlite_bytes >= self.cfg.journal_budget_bytes
+            )
+            self.status.update(
+                journal_delta_series_prefixes=list(self.cfg.journal_delta_series_prefixes),
+                journal_delta_skipped=getattr(self, "journal_delta_skipped", 0),
+                journal_budget_bytes=self.cfg.journal_budget_bytes,
+                journal_delta_budget_skipped=getattr(self, "journal_delta_budget_skipped", 0),
+                journal_optional_capture_state="STOPPED_JOURNAL_BUDGET" if over_budget else "ENABLED",
+                websocket_connection_id=self.ws_connection_id,
+            )
             self.status.refresh_ages()
             try:
                 await asyncio.wait_for(self.stopping.wait(), timeout=5)
@@ -2532,8 +2561,10 @@ class Collector:
                     ping_timeout=20,
                     max_size=2**20,
                 ) as ws:
+                    self.ws_connection_id = uuid.uuid4().hex[:12]
                     self.status.update(
                         websocket_state="READY",
+                        websocket_connection_id=self.ws_connection_id,
                         reconnect_count=self.status.data.get("reconnect_count", 0) + 1,
                     )
                     reconnect_delay = 1.0
@@ -2941,7 +2972,7 @@ class Collector:
                         {"sid": sid, "prior_seq": prior, "current_seq": seq, "market_ticker": ticker},
                         str(ticker),
                         exchange_ts,
-                        f"snapshot-gap|{sid}|{prior}|{seq}",
+                        f"snapshot-gap|{self.ws_connection_id}|{sid}|{prior}|{seq}",
                     )
                     await ws.close(code=1011, reason="snapshot missing sequence metadata")
                     return
@@ -2958,7 +2989,7 @@ class Collector:
                         {"raw": outer, "synchronized": book.synchronized, "executable_quotes": book.quotes()},
                         str(ticker),
                         exchange_ts,
-                        f"ws|{sid}|{seq}",
+                        f"ws|{self.ws_connection_id}|{sid}|{seq:>012}",
                     )
             elif kind == "orderbook_delta" and ticker:
                 prior = self.last_seq.get(sid) if isinstance(sid, int) else None
@@ -2985,7 +3016,7 @@ class Collector:
                         {"sid": sid, "prior_seq": prior, "current_seq": seq, "market_ticker": ticker},
                         str(ticker),
                         exchange_ts,
-                        f"gap|{sid}|{prior}|{seq}",
+                        f"gap|{self.ws_connection_id}|{sid}|{prior}|{seq}",
                     )
                     await ws.close(code=1011, reason="sequence invalid; reconnect for fresh snapshots")
                     return
@@ -3031,7 +3062,7 @@ class Collector:
                     },
                     str(ticker),
                     exchange_ts,
-                    f"ws|{sid}|{seq}" if sid is not None and seq is not None else None,
+                    f"ws|{self.ws_connection_id}|{sid}|{seq:>012}" if sid is not None and seq is not None else None,
                 )
             else:
                 await self.emit(
@@ -3040,7 +3071,7 @@ class Collector:
                     outer,
                     str(ticker) if ticker else None,
                     exchange_ts,
-                    f"ws|{sid}|{seq}" if sid is not None and seq is not None else None,
+                    f"ws|{self.ws_connection_id}|{sid}|{seq:>012}" if sid is not None and seq is not None else None,
                 )
             self.status.mark_channel(channel, exchange_ts)
             if kind == "trade":
@@ -3092,6 +3123,15 @@ class Collector:
         self.cfg.ensure_dirs()
         configure_logging(self.cfg)
         loop = asyncio.get_running_loop()
+        # Serve status during storage recovery so a supervisor sees RECOVERING
+        # instead of an absent listener and never launches a second worker.
+        self.status_http = status_server(self.status, self.cfg)
+        self.status.update(
+            service_state="RECOVERING",
+            startup_phase="STORAGE_OPEN_AND_RECOVERY",
+            status_url=f"http://{self.cfg.status_host}:{self.cfg.status_port}/api/v1/status",
+        )
+        recovery_started = time.monotonic()
         await loop.run_in_executor(self.writer_pool, self.storage.open)
         storage_status = await loop.run_in_executor(
             self.writer_pool, self.storage.connection_status
@@ -3100,6 +3140,9 @@ class Collector:
             **storage_status,
             parquet_archive_recovery_state=self.storage.parquet_recovery_state,
             parquet_archive_recovery_rows=self.storage.parquet_recovery_rows,
+            parquet_archive_recovery_mode=self.storage.parquet_recovery_mode,
+            storage_recovery_seconds=round(time.monotonic() - recovery_started, 3),
+            startup_phase="PAPER_STATE_RESTORE",
         )
         if self.strategy_profile_id:
             try:
@@ -3121,8 +3164,7 @@ class Collector:
                     last_error=f"cross-market paper ledger recovery failed: {type(exc).__name__}",
                 )
                 LOG.exception("cross-market paper ledger recovery failed")
-        self.status_http = status_server(self.status, self.cfg)
-        self.status.update(status_url=f"http://{self.cfg.status_host}:{self.cfg.status_port}/api/v1/status")
+        self.status.update(startup_phase="INGEST")
         self.stop_file.unlink(missing_ok=True)
         writer = asyncio.create_task(self.writer_loop(), name="sqlite-parquet-writer")
         heartbeat = asyncio.create_task(self.heartbeat_loop(), name="runtime-heartbeat")
@@ -3344,7 +3386,8 @@ class Collector:
                     self.writer_pool,
                     lambda: self.storage.flush_parquet(reason="SHUTDOWN"),
                 )
-                await loop.run_in_executor(self.writer_pool, self.storage.integrity_check)
+                # No PRAGMA integrity_check here: on a multi-GB journal on the USB
+                # data volume two full scans held shutdown for well over an hour.
                 metrics = await loop.run_in_executor(self.writer_pool, self.storage.database_metrics)
             except Exception as exc:
                 storage_error = f"{type(exc).__name__}: {exc}"

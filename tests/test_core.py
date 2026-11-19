@@ -1830,8 +1830,10 @@ class StorageTests(unittest.TestCase):
             actual_bytes = sum(
                 path.stat().st_size for path in cfg.parquet_dir.rglob("*.parquet")
             )
-            self.assertEqual(store.parquet_bytes, actual_bytes)
+            store.parquet_size_reconcile_interval_seconds = 0
             status = store.connection_status()
+            self.assertEqual(store.parquet_bytes, actual_bytes)
+            self.assertEqual(status["parquet_bytes"], actual_bytes)
             self.assertEqual(status["parquet_flush_count"], 1)
             self.assertEqual(status["parquet_last_flush_rows"], 1)
             self.assertEqual(status["parquet_last_flush_reason"], "ROW_THRESHOLD")
@@ -1968,7 +1970,10 @@ class StorageTests(unittest.TestCase):
                 self.assertEqual(writer.submit(store.integrity_check).result(), "ok")
                 with patch("kalshi15m.storage.os.fsync", wraps=os.fsync) as fsync:
                     writer.submit(store.close).result()
-                    self.assertEqual(fsync.call_count, 1)
+                    self.assertEqual(fsync.call_count, 2)
+            checkpoint = json.loads(store.archive_checkpoint_path.read_text(encoding="utf-8"))
+            self.assertEqual(checkpoint["through_rowid"], 1)
+            self.assertEqual(checkpoint["through_dedupe_key"], "trade-1")
             parquet_files = list(cfg.parquet_dir.rglob("*.parquet"))
             self.assertEqual(len(parquet_files), 1)
             self.assertEqual(list(cfg.parquet_dir.rglob("*.partial")), [])
@@ -2546,7 +2551,7 @@ class WriterLoopTests(unittest.IsolatedAsyncioTestCase):
             writer = asyncio.create_task(collector.writer_loop())
             try:
                 deadline = asyncio.get_running_loop().time() + 3
-                while store.parquet_buffer and asyncio.get_running_loop().time() < deadline:
+                while (store.parquet_buffer or collector.status.data.get("parquet_last_flush_reason") is None) and asyncio.get_running_loop().time() < deadline:
                     await asyncio.sleep(0.05)
 
                 self.assertEqual(store.parquet_buffer, [])
@@ -2881,3 +2886,244 @@ if __name__ == "__main__":
     unittest.main()
 
 
+
+
+class JournalDeltaAllowlistTests(unittest.IsolatedAsyncioTestCase):
+    async def _emit(self, prefixes, ticker, kind="orderbook_delta"):
+        collector = Collector.__new__(Collector)
+        collector.cfg = Settings(home=Path("unused"), journal_delta_series_prefixes=prefixes)
+        collector.queue = asyncio.Queue()
+        await collector.emit("websocket_orderbook", kind, {"x": 1}, market_ticker=ticker)
+        return collector
+
+    async def test_default_journals_every_delta(self):
+        c = await self._emit((), "KXGOLD15M-26NOV181500-00")
+        self.assertEqual(c.queue.qsize(), 1)
+
+    async def test_out_of_scope_delta_skipped_and_counted(self):
+        c = await self._emit(("KXBTC15M", "KXETH15M"), "KXGOLD15M-26NOV181500-00")
+        self.assertEqual(c.queue.qsize(), 0)
+        self.assertEqual(c.journal_delta_skipped, 1)
+
+    async def test_in_scope_delta_and_other_kinds_kept(self):
+        c = await self._emit(("KXBTC15M",), "KXBTC15M-26NOV181500-00")
+        self.assertEqual(c.queue.qsize(), 1)
+        c = await self._emit(("KXBTC15M",), "KXGOLD15M-26NOV181500-00", kind="trade")
+        self.assertEqual(c.queue.qsize(), 1)
+
+
+def _trade(index):
+    return {
+        "dedupe_key": f"trade-{index}",
+        "received_utc": "2026-10-15T06:00:00+00:00",
+        "channel": "test",
+        "kind": "public_trade",
+        "market_ticker": "sample",
+        "payload": {"trade_id": f"trade-{index}"},
+    }
+
+
+def _archived_keys(cfg):
+    import pyarrow.parquet as pq
+
+    keys = []
+    for path in cfg.parquet_dir.rglob("*.parquet"):
+        keys.extend(pq.read_table(path, columns=["dedupe_key"]).column(0).to_pylist())
+    return keys
+
+
+def _mark_unclean(cfg):
+    cfg.runtime_dir.mkdir(parents=True, exist_ok=True)
+    (cfg.runtime_dir / "status.json").write_text(
+        json.dumps({"service_state": "RUNNING"}), encoding="utf-8"
+    )
+
+
+class ArchiveCheckpointRecoveryTests(unittest.TestCase):
+    def test_crash_recovers_only_rows_after_checkpoint_without_duplicates(self):
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary))
+            store = Storage(cfg)
+            store.open()
+            store.append_batch([_trade(i) for i in range(5)])
+            store.flush_parquet(reason="TEST")
+            # Committed to SQLite, still only in the memory buffer at the "crash".
+            store.append_batch([_trade(i) for i in range(5, 8)])
+            store.connection.close()
+            store.connection = None
+            _mark_unclean(cfg)
+
+            recovered = Storage(cfg)
+            recovered.open()
+
+            self.assertEqual(recovered.parquet_recovery_mode, "INCREMENTAL_FROM_ROWID_5")
+            self.assertEqual(recovered.parquet_recovery_rows, 3)
+            keys = _archived_keys(cfg)
+            self.assertEqual(sorted(keys), sorted(f"trade-{i}" for i in range(8)))
+            checkpoint = json.loads(recovered.archive_checkpoint_path.read_text(encoding="utf-8"))
+            self.assertEqual(checkpoint["through_rowid"], 8)
+            recovered.close()
+
+    def test_crash_after_publish_before_checkpoint_does_not_duplicate(self):
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary))
+            store = Storage(cfg)
+            store.open()
+            store.append_batch([_trade(i) for i in range(3)])
+            store.flush_parquet(reason="TEST")
+            store.append_batch([_trade(i) for i in range(3, 6)])
+            # Files publish, then the process dies before the checkpoint moves.
+            with patch.object(store, "_write_archive_checkpoint"):
+                store.flush_parquet(reason="TEST")
+            store.connection.close()
+            store.connection = None
+            _mark_unclean(cfg)
+
+            recovered = Storage(cfg)
+            recovered.open()
+
+            self.assertEqual(recovered.parquet_recovery_mode, "INCREMENTAL_FROM_ROWID_3")
+            self.assertEqual(recovered.parquet_recovery_rows, 0)
+            self.assertEqual(sorted(_archived_keys(cfg)), sorted(f"trade-{i}" for i in range(6)))
+            recovered.close()
+
+    def test_mismatched_or_shrunken_checkpoint_falls_back_to_full_scan(self):
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary))
+            store = Storage(cfg)
+            store.open()
+            store.append_batch([_trade(i) for i in range(4)])
+            store.close()
+            path = store.archive_checkpoint_path
+            record = json.loads(path.read_text(encoding="utf-8"))
+            record["through_dedupe_key"] = "not-this-row"
+            path.write_text(json.dumps(record), encoding="utf-8")
+            _mark_unclean(cfg)
+
+            recovered = Storage(cfg)
+            recovered.open()
+            self.assertEqual(recovered.parquet_recovery_mode, "FULL_SCAN")
+            self.assertEqual(recovered.parquet_recovery_rows, 0)
+            recovered.close()
+
+            for parquet in cfg.parquet_dir.rglob("*.parquet"):
+                parquet.unlink()
+            _mark_unclean(cfg)
+            rebuilt = Storage(cfg)
+            rebuilt.open()
+            self.assertEqual(rebuilt.parquet_recovery_mode, "FULL_SCAN")
+            self.assertEqual(rebuilt.parquet_recovery_rows, 4)
+            rebuilt.close()
+
+    def test_checkpoint_does_not_advance_past_dropped_rows(self):
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary))
+            store = Storage(cfg)
+            store.open()
+            store.append_batch([_trade(0)])
+            store.flush_parquet(reason="TEST")
+            store.raw_capture_enabled = False
+            store.append_batch([_trade(1)])
+            store.raw_capture_enabled = True
+            store.append_batch([_trade(2)])
+            store.flush_parquet(reason="TEST")
+            record = json.loads(store.archive_checkpoint_path.read_text(encoding="utf-8"))
+            self.assertEqual(record["through_rowid"], 1)
+            store.connection.close()
+            store.connection = None
+            _mark_unclean(cfg)
+
+            recovered = Storage(cfg)
+            recovered.open()
+            self.assertEqual(sorted(_archived_keys(cfg)), ["trade-0", "trade-1", "trade-2"])
+            recovered.close()
+
+
+class WebSocketReconnectDedupeTests(unittest.TestCase):
+    def test_reconnect_reusing_sid_and_seq_journals_new_events(self):
+        class FakeWebSocket:
+            def __init__(self, messages):
+                self.messages = messages
+
+            def __aiter__(self):
+                async def iterate():
+                    for message in self.messages:
+                        yield json.dumps(message)
+                return iterate()
+
+        messages = [
+            {
+                "type": "orderbook_snapshot", "sid": 2, "seq": 1,
+                "msg": {
+                    "market_ticker": "SAMPLE",
+                    "yes_dollars_fp": [["0.40", "2.00"]],
+                    "no_dollars_fp": [["0.50", "3.00"]],
+                },
+            },
+            {
+                "type": "orderbook_delta", "sid": 2, "seq": 2,
+                "msg": {"market_ticker": "SAMPLE", "side": "yes", "price_dollars": "0.40", "delta_fp": "1.00"},
+            },
+        ]
+        with TemporaryDirectory() as root:
+            collector = Collector(Settings(home=Path(root)))
+            collector.open_tickers.add("SAMPLE")
+            keys = []
+            for connection in ("first", "second"):
+                collector.ws_connection_id = connection
+                collector.last_seq.clear()
+                collector.subscription_channel_by_sid[2] = "orderbook_delta"
+                collector.subscription_membership[2] = {"SAMPLE"}
+                asyncio.run(collector._receive_ws(FakeWebSocket(messages)))
+                while not collector.queue.empty():
+                    keys.append(collector.queue.get_nowait()["dedupe_key"])
+            self.assertEqual(len(keys), 4)
+            self.assertEqual(len(set(keys)), 4)
+
+
+class JournalBudgetTests(unittest.IsolatedAsyncioTestCase):
+    async def test_deltas_stop_at_budget_but_other_kinds_persist(self):
+        collector = Collector.__new__(Collector)
+        collector.cfg = Settings(home=Path("unused"), journal_budget_bytes=100)
+        collector.queue = asyncio.Queue()
+
+        class FakeStorage:
+            sqlite_bytes = 100
+
+        collector.storage = FakeStorage()
+        await collector.emit("websocket_orderbook", "orderbook_delta", {"x": 1}, market_ticker="KXBTC15M-X")
+        await collector.emit("websocket_orderbook", "orderbook_snapshot", {"x": 1}, market_ticker="KXBTC15M-X")
+        self.assertEqual(collector.queue.qsize(), 1)
+        self.assertEqual(collector.journal_delta_budget_skipped, 1)
+        collector.storage.sqlite_bytes = 99
+        await collector.emit("websocket_orderbook", "orderbook_delta", {"x": 1}, market_ticker="KXBTC15M-X")
+        self.assertEqual(collector.queue.qsize(), 2)
+
+
+class DiskFullFixtureTests(unittest.TestCase):
+    def test_enospc_on_parquet_keeps_journal_buffer_and_checkpoint(self):
+        import errno
+
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary))
+            store = Storage(cfg)
+            store.open()
+            store.append_batch([_trade(0)])
+            store.flush_parquet(reason="TEST")
+            store.append_batch([_trade(1), _trade(2)])
+            with patch(
+                "kalshi15m.storage.pq.write_table",
+                side_effect=OSError(errno.ENOSPC, "No space left on device"),
+            ):
+                with self.assertRaises(OSError):
+                    store.flush_parquet(reason="TEST")
+            self.assertEqual(len(store.parquet_buffer), 2)
+            self.assertEqual(list(cfg.parquet_dir.rglob("*.partial")), [])
+            record = json.loads(store.archive_checkpoint_path.read_text(encoding="utf-8"))
+            self.assertEqual(record["through_rowid"], 1)
+            self.assertEqual(store.integrity_check(), "ok")
+            self.assertEqual(store.flush_parquet(reason="TEST"), 2)
+            record = json.loads(store.archive_checkpoint_path.read_text(encoding="utf-8"))
+            self.assertEqual(record["through_rowid"], 3)
+            self.assertEqual(sorted(_archived_keys(cfg)), ["trade-0", "trade-1", "trade-2"])
+            store.close()
