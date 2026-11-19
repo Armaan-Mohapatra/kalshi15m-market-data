@@ -45,7 +45,24 @@ def recompute(p: dict) -> dict:
     return {"payout": payout, "gross": gross, "net": net}
 
 
-def reconcile(ledger: Path, sleep: float) -> dict:
+FINAL_STATUSES = ("finalized", "settled")
+
+
+def load_official_cache(path: Path | None) -> dict[str, dict]:
+    try:
+        data = json.loads(path.read_text("utf-8")) if path else {}
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def reconcile(ledger: Path, sleep: float, cache_path: Path | None = None) -> dict:
+    """cache_path: official outcomes of finalized/settled markets never change, so once
+    fetched they are kept there and not re-requested every run (less load on public REST).
+    Only final outcomes are cached; anything else is fetched again next time."""
+    official = load_official_cache(cache_path)
+    known = len(official)
+    fetched_new = 0
     db = sqlite3.connect("file:" + ledger.as_posix() + "?mode=ro", uri=True, timeout=30)
     rows = db.execute(
         "select profile_id, idempotency_key, payload_json from paper_ledger "
@@ -57,8 +74,16 @@ def reconcile(ledger: Path, sleep: float) -> dict:
         p = json.loads(raw)
         ticker = p["market_ticker"]
         if ticker not in cache:
-            cache[ticker] = fetch_market(ticker)
-            time.sleep(sleep)
+            if ticker in official:
+                cache[ticker] = {"status": official[ticker]["status"], "result": official[ticker]["result"]}
+            else:
+                cache[ticker] = fetch_market(ticker)
+                fetched_new += 1
+                time.sleep(sleep)
+                market = cache[ticker]
+                if market and market.get("status") in FINAL_STATUSES and market.get("result") in ("yes", "no"):
+                    official[ticker] = {"status": market["status"], "result": market["result"],
+                                        "fetched_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
         market = cache[ticker]
         calc = recompute(p)
         issues = []
@@ -77,6 +102,11 @@ def reconcile(ledger: Path, sleep: float) -> dict:
             status = "DISCREPANCY" if market is not None else status
         out.append({"profile": profile, "ticker": ticker, "side": p["side"], "status": status,
                     "issues": issues, "net_pnl_recorded": p["net_pnl_dollars"], "key": key})
+    if cache_path is not None and len(official) > known:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(official, indent=1, sort_keys=True), encoding="utf-8")
+        tmp.replace(cache_path)
     counts: dict[str, int] = {}
     for item in out:
         counts[item["status"]] = counts.get(item["status"], 0) + 1
@@ -85,6 +115,7 @@ def reconcile(ledger: Path, sleep: float) -> dict:
         by_profile[item["profile"]] = str(D(by_profile.get(item["profile"], "0")) + D(item["net_pnl_recorded"]))
     return {"checked_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "settlements": len(out),
             "counts": counts, "net_pnl_recorded_by_profile": by_profile,
+            "official_outcomes_fetched_this_run": fetched_new,
             "unmatched": [i for i in out if i["status"] != "MATCH"]}
 
 
@@ -99,7 +130,7 @@ def main() -> int:
     cfg = Settings(home=Path(args.home))
     ledger = Path(args.ledger) if args.ledger else cfg.ledger_path
     out_path = args.out or str(cfg.home / "reports" / "settlement_reconciliation.json")
-    report = reconcile(ledger, args.sleep)
+    report = reconcile(ledger, args.sleep, cfg.home / "reports" / "official_outcomes_cache.json")
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     Path(out_path).write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(json.dumps({k: report[k] for k in ("checked_utc", "settlements", "counts", "net_pnl_recorded_by_profile")}))
