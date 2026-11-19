@@ -3145,6 +3145,10 @@ class Collector:
                     storage_recovery_elapsed_seconds=round(
                         time.monotonic() - recovery_started, 3
                     ),
+                    # Plain int reads: progress evidence, not a completion claim.
+                    archive_recovery_files_scanned=self.storage.parquet_recovery_files_scanned,
+                    archive_recovery_rows_scanned=self.storage.parquet_recovery_rows_scanned,
+                    archive_recovery_reason=self.storage.parquet_recovery_reason,
                 )
         # Propagate recovery errors; a live heartbeat is NOT proof of progress
         # or a reason to bypass the source-integrity and readiness gates.

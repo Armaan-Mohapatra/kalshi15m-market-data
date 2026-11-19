@@ -3,7 +3,7 @@ param(
     [switch]$KeepSupervisorPausedOnTimeout
 )
 $ErrorActionPreference = 'Stop'
-$root = 'C:\Users\dakin\Projects\kalshi-15m-native'
+$root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path  # the checkout this script lives in
 $homePath = if ($env:KALSHI15M_HOME) { $env:KALSHI15M_HOME } else { Join-Path $env:LOCALAPPDATA 'Kalshi15mNative' }
 $statusPort = if ($env:KALSHI15M_STATUS_PORT) { [int]$env:KALSHI15M_STATUS_PORT } else { 8768 }
 $pidPath = Join-Path $homePath 'runtime\worker.pid.json'
