@@ -464,6 +464,49 @@ class RuntimeStatusTests(unittest.TestCase):
             self.assertEqual(idle["strategy_rest_poll_health"], "NOT_DUE_OUTSIDE_ENTRY_WINDOW")
 
 
+class ManifestHeadCacheTests(unittest.TestCase):
+    def test_appends_and_checkpoints_do_not_reread_the_manifest(self):
+        with TemporaryDirectory() as tmp:
+            cfg = Settings(home=Path(tmp), min_free_bytes=0)
+            store, _ = _flushed_store(cfg, [2])  # first flush loads the cache once
+            real = store._manifest_read
+            reads = []
+            store._manifest_read = lambda: (reads.append(1), real())[1]
+            for start in (2, 3, 4):
+                store.append_batch([_trade(start)])
+                store.flush_parquet(reason="TEST")
+            self.assertEqual(reads, [])  # no full re-read per flush
+            self.assertTrue(store.verify_archive(full=True)["ok"])  # on-disk chain is intact
+            record = json.loads(store.archive_checkpoint_path.read_text(encoding="utf-8"))
+            self.assertEqual(record["manifest_seq"], len(real()[0]))
+            self.assertEqual(record["manifest_head"], real()[0][-1]["hash"])
+            store.close()
+
+    def test_failed_append_drops_the_cache_and_the_chain_stays_valid(self):
+        with TemporaryDirectory() as tmp:
+            cfg = Settings(home=Path(tmp), min_free_bytes=0)
+            store, _ = _flushed_store(cfg, [2])
+            store.append_batch([_trade(2)])
+            real_fsync, calls = os.fsync, []
+
+            def second_fsync_fails(fd):  # 1st = the Parquet file, 2nd = the manifest line
+                calls.append(1)
+                if len(calls) == 2:
+                    raise OSError(5, "I/O error")
+                return real_fsync(fd)
+
+            with patch("kalshi15m.storage.os.fsync", side_effect=second_fsync_fails):
+                store.flush_parquet(reason="TEST")
+            self.assertEqual(store.archive_manifest_failures, 1)
+            self.assertIsNone(store._manifest_cache)  # unknown state: next use re-reads the file
+            store.append_batch([_trade(3)])
+            store.flush_parquet(reason="TEST")  # re-reads, appends; checkpoint stays frozen
+            self.assertIsNotNone(store._manifest_cache)
+            self.assertTrue(store.verify_archive(full=True)["ok"])
+            self.assertEqual(sorted(_archived_keys(cfg)), _expected(4))
+            store.close()
+
+
 class AdaptiveFlushThresholdTests(unittest.TestCase):
     def test_slow_flushes_double_the_threshold_to_a_cap_and_fast_ones_decay_to_base(self):
         with TemporaryDirectory() as tmp:

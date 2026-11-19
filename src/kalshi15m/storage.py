@@ -136,6 +136,7 @@ class Storage:
         self.archive_gap_pending = False
         self._recent_keys: dict[str, None] = {}
         self.phase_ms_ema: dict[str, float] = {}
+        self._manifest_cache: tuple[int, str, int] | None = None
         self.parquet_recovery_reason: str | None = None
         self.parquet_recovery_files_scanned = 0
         self.parquet_recovery_rows_scanned = 0
@@ -463,11 +464,22 @@ class Storage:
             good += len(line)
         return entries, good, good < len(data)
 
+    def _manifest_state(self) -> tuple[int, str, int]:
+        """(entries, head hash, valid byte length) of the manifest, cached after one full read.
+
+        Re-parsing and re-hashing the whole growing file on every flush (twice) was pure
+        overhead on the writer thread. Only the worker appends; any append error or
+        rebuild drops the cache, and startup verification still reads the full file.
+        """
+        if self._manifest_cache is None:
+            entries, good, _ = self._manifest_read()
+            head = entries[-1]["hash"] if entries else self.MANIFEST_GENESIS
+            self._manifest_cache = (len(entries), head, good)
+        return self._manifest_cache
+
     def _manifest_append(self, bodies: list[dict[str, Any]]) -> tuple[int, str]:
         """Append and fsync chained entries; returns the new (seq, head)."""
-        entries, good, _ = self._manifest_read()
-        prev = entries[-1]["hash"] if entries else self.MANIFEST_GENESIS
-        seq = len(entries)
+        seq, prev, good = self._manifest_state()
         lines = []
         for body in bodies:
             seq += 1
@@ -475,12 +487,18 @@ class Storage:
             prev = self._manifest_hash(prev, record)
             lines.append(json.dumps({**record, "hash": prev}, sort_keys=True).encode("utf-8") + b"\n")
         path = self.archive_manifest_path
-        with path.open("r+b" if path.exists() else "wb") as handle:
-            handle.truncate(good)  # drop any torn tail before extending the chain
-            handle.seek(good)
-            handle.write(b"".join(lines))
-            handle.flush()
-            os.fsync(handle.fileno())
+        payload = b"".join(lines)
+        try:
+            with path.open("r+b" if path.exists() else "wb") as handle:
+                handle.truncate(good)  # drop any torn tail before extending the chain
+                handle.seek(good)
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except BaseException:
+            self._manifest_cache = None  # unknown on-disk state: re-read next time
+            raise
+        self._manifest_cache = (seq, prev, good + len(payload))
         return seq, prev
 
     def _manifest_file_body(self, path: Path, *, adopted: bool = False) -> dict[str, Any]:
@@ -573,16 +591,15 @@ class Storage:
             LOG.warning("archive checkpoint write failed; older checkpoint kept", exc_info=True)
 
     def _write_archive_checkpoint_file(self, through: tuple[int, str]) -> None:
-        entries, _, _ = self._manifest_read()
+        manifest_seq, manifest_head, _ = self._manifest_state()
         record = {
             "version": 2,
             "through_rowid": int(through[0]),
             "through_dedupe_key": str(through[1]),
             "written_epoch": time.time(),
             "written_utc": datetime.now(timezone.utc).isoformat(),
-            "archive_bytes": int(self.parquet_bytes),
-            "manifest_seq": len(entries),
-            "manifest_head": entries[-1]["hash"] if entries else self.MANIFEST_GENESIS,
+            "manifest_seq": manifest_seq,
+            "manifest_head": manifest_head,
         }
         path = self.archive_checkpoint_path
         temporary = path.with_suffix(".json.partial")
@@ -652,6 +669,7 @@ class Storage:
             path = self.archive_manifest_path
             if rebuild and path.exists():
                 os.replace(path, path.with_name(f"{path.name}.superseded-{int(time.time())}"))
+                self._manifest_cache = None  # a new chain starts
             entries, _, _ = self._manifest_read()
             listed = {e["path"] for e in entries if e.get("t") == "file"}
             orphans = sorted(
