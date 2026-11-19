@@ -761,6 +761,12 @@ class Collector:
         exchange_ts: Any = None,
         dedupe_key: str | None = None,
     ) -> None:
+        if kind == "ticker":
+            cfg = getattr(self, "cfg", None)
+            prefixes = cfg.journal_ticker_series_prefixes if cfg is not None else ()
+            if prefixes and not str(market_ticker or "").startswith(prefixes):
+                self.journal_ticker_skipped = getattr(self, "journal_ticker_skipped", 0) + 1
+                return
         if kind == "orderbook_delta":
             # Deltas are applied to the in-memory book upstream; only persistence
             # is skipped. Paper fills embed their own arrival book snapshot.
@@ -896,6 +902,7 @@ class Collector:
             self.status.update(
                 journal_delta_series_prefixes=list(self.cfg.journal_delta_series_prefixes),
                 journal_delta_skipped=getattr(self, "journal_delta_skipped", 0),
+                journal_ticker_skipped=getattr(self, "journal_ticker_skipped", 0),
                 journal_budget_bytes=self.cfg.journal_budget_bytes,
                 journal_delta_budget_skipped=getattr(self, "journal_delta_budget_skipped", 0),
                 journal_optional_capture_state="STOPPED_JOURNAL_BUDGET" if over_budget else "ENABLED",

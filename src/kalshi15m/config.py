@@ -24,6 +24,11 @@ class Settings:
     journal_delta_series_prefixes: tuple[str, ...] = tuple(
         p.strip() for p in os.environ.get("KALSHI15M_JOURNAL_DELTA_SERIES", "").split(",") if p.strip()
     )
+    # Opt-in, same contract for WebSocket `ticker` rows (archival only; no decision
+    # reads them). Unset (default) journals every ticker row, i.e. unchanged evidence.
+    journal_ticker_series_prefixes: tuple[str, ...] = tuple(
+        p.strip() for p in os.environ.get("KALSHI15M_JOURNAL_TICKER_SERIES", "").split(",") if p.strip()
+    )
     # Leave headroom below one REST request per second; forward polling at
     # 1.0 s observed recoverable 429 responses on /markets discovery.
     rest_min_interval_seconds: float = 2.0

@@ -2980,6 +2980,28 @@ class JournalDeltaAllowlistTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(c.queue.qsize(), 1)
 
 
+class JournalTickerAllowlistTests(unittest.IsolatedAsyncioTestCase):
+    async def _emit(self, prefixes, ticker, kind="ticker"):
+        collector = Collector.__new__(Collector)
+        collector.cfg = Settings(home=Path("unused"), journal_ticker_series_prefixes=prefixes)
+        collector.queue = asyncio.Queue()
+        await collector.emit("websocket_ticker", kind, {"x": 1}, market_ticker=ticker)
+        return collector
+
+    async def test_default_journals_every_ticker_row(self):
+        self.assertEqual((await self._emit((), "KXGOLD15M-26NOV181500-00")).queue.qsize(), 1)
+
+    async def test_out_of_scope_ticker_skipped_and_counted_in_scope_kept(self):
+        skipped = await self._emit(("KXBTC15M",), "KXGOLD15M-26NOV181500-00")
+        self.assertEqual((skipped.queue.qsize(), skipped.journal_ticker_skipped), (0, 1))
+        self.assertEqual((await self._emit(("KXBTC15M",), "KXBTC15M-26NOV181500-00")).queue.qsize(), 1)
+
+    async def test_ticker_allowlist_never_filters_trades_or_deltas(self):
+        for kind in ("public_trade", "orderbook_delta"):
+            kept = await self._emit(("KXBTC15M",), "KXGOLD15M-26NOV181500-00", kind=kind)
+            self.assertEqual(kept.queue.qsize(), 1)
+
+
 def _trade(index):
     return {
         "dedupe_key": f"trade-{index}",
