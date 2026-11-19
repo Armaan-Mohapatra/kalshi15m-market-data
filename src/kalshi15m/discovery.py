@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import csv
 import json
 import logging
@@ -22,6 +23,10 @@ SERIES_DURATION_PATTERNS = (
     re.compile(r"\b900\s+seconds?\b", re.IGNORECASE),
     re.compile(r"\bfifteen[-\s]+minutes?\b", re.IGNORECASE),
 )
+
+
+# One alternation = one pass over each metadata string instead of three.
+SERIES_DURATION_PATTERN = re.compile("|".join(p.pattern for p in SERIES_DURATION_PATTERNS), re.IGNORECASE)
 
 
 def utc_now() -> str:
@@ -49,11 +54,10 @@ def series_catalog_candidate(series: dict[str, Any]) -> bool:
     if candidate_series(series):
         return True
     return any(
-        pattern.search(text)
+        SERIES_DURATION_PATTERN.search(text)
         for key, value in series.items()
         if key not in {"ticker", "series_ticker"}
         for text in _series_metadata_strings(value)
-        for pattern in SERIES_DURATION_PATTERNS
     )
 
 
@@ -74,15 +78,20 @@ def candidate_series_tickers(series_rows: Iterable[dict[str, Any]]) -> list[str]
 
 
 def series_catalog_changes(
-    snapshot: dict[str, Any], series_rows: Iterable[dict[str, Any]]
+    snapshot: dict[str, Any],
+    series_rows: Iterable[dict[str, Any]],
+    candidates: list[str] | None = None,
 ) -> tuple[list[str], list[str]]:
-    """Compare fresh candidate-series metadata with the cached inventory."""
+    """Compare fresh candidate-series metadata with the cached inventory.
+
+    candidates: the already-computed candidate_series_tickers(series_rows), so a caller that
+    needs it more than once scans the (large) catalog once."""
     prior = {
         str(row.get("series_ticker") or row.get("ticker"))
         for row in snapshot.get("series") or []
         if row.get("series_ticker") or row.get("ticker")
     }
-    current = set(candidate_series_tickers(series_rows))
+    current = set(candidates if candidates is not None else candidate_series_tickers(series_rows))
     return sorted(current - prior), sorted(prior - current)
 
 
@@ -564,7 +573,9 @@ async def discover(
         if series_rows_override is None
         else list(series_rows_override)
     )
-    selected = [s for s in series_all if series_catalog_candidate(s)]
+    # Regex-scanning the whole catalog is seconds of pure Python: keep it off the event loop
+    # (it starved the WebSocket reader and the server dropped us as a slow consumer).
+    selected = await asyncio.to_thread(lambda: [s for s in series_all if series_catalog_candidate(s)])
     events_by_series: dict[str, list[dict[str, Any]]] = defaultdict(list)
     market_by_ticker: dict[str, dict[str, Any]] = {}
     mve_truncated_series: list[str] = []
@@ -876,7 +887,7 @@ async def discover(
         "recent_closed_settled_min_close_ts": recent_close_min_ts,
         "series_api_rows": len(series_all),
         "fifteen_min_series": len(inventory),
-        "series_catalog_candidate_tickers": candidate_series_tickers(series_all),
+        "series_catalog_candidate_tickers": await asyncio.to_thread(candidate_series_tickers, series_all),
         "series_catalog_fingerprint_checked_utc": fetched_at,
         "event_api_rows": sum(len(value) for value in events_by_series.values()),
         "mve_latest_page_truncated_series": mve_truncated_series,

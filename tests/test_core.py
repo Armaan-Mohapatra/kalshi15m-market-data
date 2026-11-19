@@ -4055,3 +4055,52 @@ class LoopLagMonitorTests(unittest.TestCase):
         monitor.record(0.01, now=200.0)
         self.assertEqual(len(monitor.samples), 1)
         self.assertEqual(monitor.max_ms(30.0, now=200.0), 10.0)
+
+
+class StallWatchdogAndCatalogScanTests(unittest.TestCase):
+    def test_watchdog_names_the_call_that_blocks_the_event_loop_once_per_stall(self):
+        import asyncio
+        import logging
+        from kalshi15m.worker import LoopLagMonitor
+
+        def blocking_call_for_test():
+            time.sleep(1.4)
+
+        async def scenario(monitor):
+            task = asyncio.create_task(monitor.run())
+            await asyncio.sleep(0.2)
+            monitor.start_watchdog(__import__("threading").get_ident(), threshold_seconds=0.5,
+                                   log=logging.getLogger("stall-test"))
+            blocking_call_for_test()
+            await asyncio.sleep(0.4)
+            task.cancel()
+            monitor.watchdog_stop.set()
+
+        monitor = LoopLagMonitor()
+        with self.assertLogs("stall-test", level="WARNING") as captured:
+            asyncio.run(scenario(monitor))
+        text = "\n".join(captured.output)
+        self.assertIn("blocking_call_for_test", text)
+        self.assertEqual(len(captured.records), 1)  # one report per stall, not one per check
+
+    def test_combined_duration_pattern_matches_exactly_what_the_three_patterns_did(self):
+        from kalshi15m.discovery import SERIES_DURATION_PATTERN, SERIES_DURATION_PATTERNS, series_catalog_candidate
+
+        for text in ("every 15 minutes", "15-min contract", "settles each 900 seconds", "fifteen minutes",
+                     "Fifteen-Minute", "150 minutes", "no duration here", "1500 seconds", "15mins"):
+            self.assertEqual(bool(SERIES_DURATION_PATTERN.search(text)),
+                             any(p.search(text) for p in SERIES_DURATION_PATTERNS), text)
+        self.assertTrue(series_catalog_candidate({"ticker": "X", "title": "BTC price every 15 minutes"}))
+        self.assertFalse(series_catalog_candidate({"ticker": "X15M", "title": "daily close"}))  # ticker text ignored
+
+    def test_catalog_changes_with_precomputed_candidates_is_identical_and_scans_once(self):
+        from unittest.mock import patch
+        import kalshi15m.discovery as discovery
+
+        prior = {"series": [{"series_ticker": "KEEP"}, {"series_ticker": "REMOVE"}]}
+        fresh = [{"ticker": "KEEP", "title": "every 15 minutes"}, {"ticker": "ADD", "title": "every 15 minutes"}]
+        candidates = discovery.candidate_series_tickers(fresh)
+        with patch.object(discovery, "candidate_series_tickers") as scan:
+            self.assertEqual(discovery.series_catalog_changes(prior, fresh, candidates), (["ADD"], ["REMOVE"]))
+            scan.assert_not_called()  # the caller's scan is reused
+        self.assertEqual(discovery.series_catalog_changes(prior, fresh), (["ADD"], ["REMOVE"]))

@@ -93,6 +93,8 @@ class LoopLagMonitor:
 
     def __init__(self) -> None:
         self.samples: collections.deque[tuple[float, float]] = collections.deque()
+        self.last_tick = time.monotonic()
+        self.watchdog_stop = threading.Event()
 
     def record(self, lag_seconds: float, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now
@@ -108,7 +110,28 @@ class LoopLagMonitor:
         while True:
             started = time.monotonic()
             await asyncio.sleep(self.TICK_SECONDS)
-            self.record(max(0.0, time.monotonic() - started - self.TICK_SECONDS))
+            self.last_tick = time.monotonic()
+            self.record(max(0.0, self.last_tick - started - self.TICK_SECONDS))
+
+    def start_watchdog(self, loop_thread_id: int, threshold_seconds: float = 2.0, log: logging.Logger | None = None) -> None:
+        """A thread (it still runs while the loop is blocked) logs the loop thread's stack once
+        per stall of threshold_seconds or more, naming the call that is holding the loop."""
+        import traceback
+
+        logger = log or LOG
+
+        def watch() -> None:
+            reported_tick = None
+            while not self.watchdog_stop.wait(0.25):
+                tick = self.last_tick
+                stalled = time.monotonic() - tick
+                if stalled >= threshold_seconds and reported_tick != tick:
+                    reported_tick = tick
+                    frame = sys._current_frames().get(loop_thread_id)
+                    stack = "".join(traceback.format_stack(frame)[-12:]) if frame is not None else "(no frame)"
+                    logger.warning("event loop stalled %.1fs; it is executing:\n%s", stalled, stack)
+
+        threading.Thread(target=watch, name="loop-stall-watchdog", daemon=True).start()
 
 
 def parse_stack_sample_config(text: str) -> tuple[float, float] | None:
@@ -1061,15 +1084,14 @@ class Collector:
                 self.last_series_catalog_monotonic = time.monotonic()
                 try:
                     fresh_series = await self.api.pages("/series", "series", max_pages=1)
-                    added, removed = series_catalog_changes(snapshot, fresh_series)
+                    candidates = await asyncio.to_thread(candidate_series_tickers, fresh_series)
+                    added, removed = series_catalog_changes(snapshot, fresh_series, candidates)
                     checked_utc = utc_now()
                     catalog_status = {
                         "series_catalog_state": "CHANGED" if added or removed else "READY",
                         "series_catalog_last_checked_utc": checked_utc,
                         "series_catalog_api_rows": len(fresh_series),
-                        "series_catalog_candidate_count": len(
-                            candidate_series_tickers(fresh_series)
-                        ),
+                        "series_catalog_candidate_count": len(candidates),
                         "series_catalog_added_tickers": added,
                         "series_catalog_removed_tickers": removed,
                         "series_catalog_error": None,
@@ -1079,9 +1101,7 @@ class Collector:
                         series_rows_override = fresh_series
                     else:
                         snapshot["series_api_rows"] = len(fresh_series)
-                        snapshot["series_catalog_candidate_tickers"] = sorted(
-                            candidate_series_tickers(fresh_series)
-                        )
+                        snapshot["series_catalog_candidate_tickers"] = sorted(candidates)
                         snapshot["series_catalog_fingerprint_checked_utc"] = checked_utc
                 except PaginationLimitExceeded as exc:
                     catalog_status = {
@@ -3343,6 +3363,8 @@ class Collector:
         writer = asyncio.create_task(self.writer_loop(), name="sqlite-parquet-writer")
         heartbeat = asyncio.create_task(self.heartbeat_loop(), name="runtime-heartbeat")
         lag_task = asyncio.create_task(self.loop_lag.run(), name="loop-lag-monitor")
+        self.loop_lag.last_tick = time.monotonic()
+        self.loop_lag.start_watchdog(threading.get_ident())
         await self.refresh_inventory()
         ws_task = asyncio.create_task(self.websocket_loop(), name="kalshi-websocket")
         await self.emit(
@@ -3544,6 +3566,7 @@ class Collector:
             self.stopping.set()
             heartbeat.cancel()
             lag_task.cancel()
+            self.loop_lag.watchdog_stop.set()
             try:
                 await heartbeat
             except asyncio.CancelledError:
