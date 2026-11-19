@@ -67,6 +67,24 @@ class AlertTests(unittest.TestCase):
     def test_healthy_report_has_no_alerts(self):
         self.assertEqual(pr.alerts(self._report()), [])
 
+    def test_stale_or_never_run_hourly_jobs_alarm_even_if_task_result_would_be_zero(self):
+        fresh = {"settlement_reconcile": 600.0, "research_cycle": 1200.0}
+        self.assertEqual(pr.alerts(self._report(job_ages_s=fresh)), [])
+        stale = pr.alerts(self._report(job_ages_s={"settlement_reconcile": 600.0, "research_cycle": 20000.0}))
+        self.assertEqual(len(stale), 1)
+        self.assertIn("research_cycle", stale[0])
+        never = pr.alerts(self._report(job_ages_s={"settlement_reconcile": None, "research_cycle": 5.0}))
+        self.assertIn("ever", never[0])
+
+    def test_job_ages_reads_file_mtimes(self):
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "reports").mkdir()
+            (home / "reports" / "research_last_run.txt").write_text("x", encoding="utf-8")
+            ages = pr.job_ages(home)
+            self.assertLess(ages["research_cycle"], 60)
+            self.assertIsNone(ages["settlement_reconcile"])  # never ran
+
     def test_each_fault_raises_a_specific_alert(self):
         r = self._report()
         r["status"] = dict(r["status"], exchange_write_calls=1)

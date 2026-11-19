@@ -98,6 +98,22 @@ def ledger(home: Path) -> dict:
     return {"counts": {f"{p.split(':')[0]}/{t}": n for p, t, n in counts}, "recent": trades, "decisions": decisions}
 
 
+JOB_STALE_SECONDS = 9000  # 2.5 h for jobs scheduled hourly
+
+
+def job_ages(home: Path) -> dict:
+    """Seconds since each hourly job last proved it ran (file mtimes; None if never)."""
+    files = {"settlement_reconcile": home / "reports" / "settlement_reconciliation.json",
+             "research_cycle": home / "reports" / "research_last_run.txt"}
+    ages: dict = {}
+    for name, path in files.items():
+        try:
+            ages[name] = round(time.time() - path.stat().st_mtime, 1)
+        except OSError:
+            ages[name] = None
+    return ages
+
+
 def alerts(report: dict) -> list[str]:
     """Explicit fault alarms. Unknown or missing evidence is an alarm, never silence."""
     out: list[str] = []
@@ -120,6 +136,9 @@ def alerts(report: dict) -> list[str]:
     for profile, d in report.get("ledger", {}).get("decisions", {}).items():
         if d["missing_reason"]:
             out.append(f"CRITICAL {d['missing_reason']} no-trade decisions without a reason in {profile}")
+    for job, hours in report.get("job_ages_s", {}).items():
+        if hours is None or hours > JOB_STALE_SECONDS:
+            out.append(f"WARNING scheduled job '{job}' has not run in {'ever' if hours is None else f'{hours / 3600:.1f} h'} (hourly)")
     recon = report.get("settlement_reconciliation", {})
     if recon.get("state") == "NOT_RUN":
         out.append("WARNING settlement reconciliation has not run")
@@ -144,7 +163,7 @@ def build(home: Path, port: int) -> dict:
     report = {"generated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"), "status_source": source,
               "persisted_event_age_s": age(status.get("storage_latest_market_event_received_utc")),
               "heartbeat_age_s": age(status.get("heartbeat_utc")), "status": s, "growth": growth(home),
-              "settlement_reconciliation": recon, "ledger": led}
+              "settlement_reconciliation": recon, "ledger": led, "job_ages_s": job_ages(home)}
     report["alerts"] = alerts(report)
     return report
 

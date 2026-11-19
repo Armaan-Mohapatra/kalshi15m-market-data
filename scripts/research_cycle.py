@@ -88,7 +88,13 @@ def main() -> int:
     ap.add_argument("--home", default=r"E:\PhoenixLab\runtime\k15m-native")
     ap.add_argument("--seed", type=int, default=7)
     a = ap.parse_args()
-    print(json.dumps(cycle(Path(a.home), a.seed)))
+    result = cycle(Path(a.home), a.seed)
+    # Heartbeat even for a no-op: Task Scheduler's "result 0" reflects the wrapper, not this
+    # script, so the report alerts on this file's age instead.
+    stamp = Path(a.home) / "reports" / "research_last_run.txt"
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    stamp.write_text(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), encoding="utf-8")
+    print(json.dumps(result))
     return 0
 
 
