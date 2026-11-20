@@ -180,5 +180,27 @@ class ResourceLogTests(unittest.TestCase):
         pr.append_resource_log(Path("Z:/no/such/folder/for/this/test"), {"utc": "t"})  # swallowed
 
 
+class StatusWhitelistTests(unittest.TestCase):
+    def test_every_status_key_the_alerts_read_is_passed_through_to_the_report(self):
+        import inspect
+        import re
+
+        source = inspect.getsource(pr.alerts)
+        read = set(re.findall(r"""\bs\.get\(["'](\w+)["']""", source))
+        self.assertIn("ledger_volume_state", read)  # the case that was silently dropped
+        self.assertEqual(sorted(read - set(pr.STATUS_KEYS)), [])  # an alert on a dropped key can never fire
+
+    def test_build_carries_process_identity_and_the_volume_state_through(self):
+        from unittest.mock import patch
+
+        live = {"pid": 4242, "journal_process_pid": 4343, "ledger_volume_state": "CRITICAL", "mode": "PAPER_ONLY",
+                "exchange_write_calls": 0, "orders_submitted_to_exchange": 0, "queue_depth": 0,
+                "archive_integrity_state": "VERIFIED_COMPLETE"}
+        with TemporaryDirectory() as tmp, patch.object(pr, "get_status", return_value=(live, "status_api")):
+            report = pr.build(Path(tmp), 1)
+        self.assertEqual((report["status"]["pid"], report["status"]["journal_process_pid"]), (4242, 4343))
+        self.assertTrue(any("journal volume CRITICAL" in a for a in report["alerts"]))  # now actually fires
+
+
 if __name__ == "__main__":
     unittest.main()

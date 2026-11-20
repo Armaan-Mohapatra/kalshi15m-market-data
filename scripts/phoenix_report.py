@@ -31,6 +31,12 @@ STATUS_KEYS = (
     "crossmarket_paper_settlement_records", "crossmarket_paper_realized_net_pnl_dollars",
     "exchange_write_calls", "orders_submitted_to_exchange", "sqlite_bytes", "parquet_bytes",
     "disk_free_bytes", "active_market_rows",
+    # read by alerts(): without these the journal-volume alarm could never fire
+    "ledger_volume_state", "ledger_volume_free_bytes",
+    # identity, resources and pipeline health for the soak report
+    "pid", "started_utc", "source_commit", "source_dirty", "journal_process_pid", "journal_process_alive",
+    "journal_pruned_rows", "journal_prune_blocked", "parquet_dropped_rows", "error_count",
+    "event_loop_lag_ms_max_30s", "last_websocket_disconnect_detail",
 )
 
 
