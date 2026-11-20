@@ -11,7 +11,11 @@ from scripts import soak_report as sr
 def _facts(**over):
     base = {"mode": "PAPER_ONLY", "exchange_write_calls": 0, "orders_submitted_to_exchange": 0,
             "critical_alerts_in_window": [], "parquet_dropped_rows": 0, "archive_integrity_state": "VERIFIED_COMPLETE",
-            "restarts_in_window": 0, "commits_seen_in_window": 1, "uptime_seconds": 25 * 3600}
+            "restarts_in_window": 0, "commits_seen_in_window": 1, "uptime_seconds": 25 * 3600,
+            "service_state": "RUNNING", "journal_process_alive": True,
+            "source_commit": "abc1234def", "source_dirty": False, "heartbeat_age_s": 5,
+            "missing_evidence_files": [], "resource_samples": 144,
+            "first_resource_offset_s": 600, "last_resource_age_s": 120, "max_resource_gap_s": 600}
     base.update(over)
     return base
 
@@ -37,6 +41,47 @@ class JudgeTests(unittest.TestCase):
 
     def test_a_clean_stop_checkpoint_integrity_state_is_accepted(self):
         self.assertEqual(sr.judge(_facts(archive_integrity_state="VERIFIED_COMPLETE_CLEAN_STOP_CHECKPOINT"))[0], "SOAK_COMPLETE")
+
+    def test_missing_monitoring_evidence_cannot_pass_a_full_day(self):
+        for field, bad in (
+            ("missing_evidence_files", ["alerts.log"]),
+            ("resource_samples", 3),
+            ("first_resource_offset_s", 8000),
+            ("last_resource_age_s", 2000),
+            ("max_resource_gap_s", 1900),
+        ):
+            verdict, reasons = sr.judge(_facts(**{field: bad}))
+            self.assertEqual(verdict, "SOAK_FAILED", field)
+            self.assertTrue(reasons, field)
+
+    def test_hung_worker_or_child_never_passes_even_if_uptime_is_long(self):
+        for field, bad in (
+            ("service_state", "RUNNING_BUT_STALE"),
+            ("journal_process_alive", False),
+            ("source_dirty", True),
+            ("source_commit", None),
+            ("heartbeat_age_s", None),
+            ("heartbeat_age_s", 650),
+        ):
+            verdict, reasons = sr.judge(_facts(**{field: bad}))
+            self.assertEqual(verdict, "SOAK_FAILED", field)
+            self.assertTrue(reasons)
+
+    def test_partial_window_does_not_need_a_full_day_of_resource_samples(self):
+        verdict, _ = sr.judge(_facts(uptime_seconds=2 * 3600, resource_samples=10))
+        self.assertEqual(verdict, "SOAK_IN_PROGRESS")
+
+    def test_unavailable_status_produces_explicit_failed_verdict_not_crash(self):
+        import io
+        from contextlib import redirect_stdout
+
+        with patch.object(sr.sys, "argv", ["soak_report.py"]), \
+             patch.object(sr, "collect", side_effect=OSError("status unreachable")):
+            with redirect_stdout(io.StringIO()) as out:
+                code = sr.main()
+        self.assertEqual(code, 2)
+        self.assertIn("SOAK_FAILED", out.getvalue())
+        self.assertIn("OSError", out.getvalue())
 
 
 class CollectTests(unittest.TestCase):
