@@ -123,11 +123,34 @@ def job_ages(home: Path) -> dict:
 
 
 def alerts(report: dict) -> list[str]:
-    """Explicit fault alarms. Unknown or missing evidence is an alarm, never silence."""
+    """Fail closed when safety telemetry is absent, stale, or contradicts paper-only mode."""
     out: list[str] = []
     s = report["status"]
     if report["status_source"] != "status_api":
         out.append(f"CRITICAL worker status unavailable ({report['status_source']})")
+    else:
+        # A reachable HTTP endpoint is not proof that the collector or its
+        # journal process is making progress. Missing fields must never look OK.
+        required = (
+            "service_state", "mode", "exchange_write_calls",
+            "orders_submitted_to_exchange", "archive_integrity_state",
+            "ledger_volume_state", "parquet_dropped_rows",
+            "journal_process_alive",
+        )
+        absent = [key for key in required if s.get(key) is None]
+        if absent:
+            out.append("CRITICAL missing worker safety telemetry: " + ", ".join(absent))
+        heartbeat_age = report.get("heartbeat_age_s")
+        if heartbeat_age is None or heartbeat_age > 60:
+            out.append(f"CRITICAL worker heartbeat missing or stale ({heartbeat_age}s)")
+        if s.get("service_state") != "RUNNING":
+            out.append(f"CRITICAL worker state is {s.get('service_state')}, expected RUNNING")
+        if s.get("journal_process_alive") is not True:
+            out.append("CRITICAL journal process not confirmed alive")
+        if s.get("source_dirty") is True:
+            out.append("WARNING worker running from an uncommitted source revision")
+        if str(s.get("websocket_state") or "").startswith("BLOCKED"):
+            out.append(f"CRITICAL WebSocket blocked ({s.get('websocket_state')})")
     if s.get("exchange_write_calls") not in (0, None) or s.get("orders_submitted_to_exchange") not in (0, None):
         out.append("CRITICAL exchange write or order observed; paper-only invariant broken")
     if s and s.get("mode") != "PAPER_ONLY":
@@ -139,11 +162,15 @@ def alerts(report: dict) -> list[str]:
         out.append(f"WARNING writer queue at {s.get('queue_depth')} (cap 12000): persistence is behind")
     if s and s.get("ledger_volume_state") not in (None, "OK"):
         out.append(f"CRITICAL journal volume {s.get('ledger_volume_state')}")
-    if s and s.get("archive_integrity_state", "VERIFIED_COMPLETE").startswith(("INCOMPLETE", "UNKNOWN")):
+    if s and not str(s.get("archive_integrity_state") or "").startswith("VERIFIED_COMPLETE"):
         out.append(f"CRITICAL archive integrity {s.get('archive_integrity_state')}")
+    if s.get("parquet_dropped_rows") not in (0, None) or s.get("events_dropped") not in (0, None):
+        out.append("CRITICAL collector reported dropped market rows")
     for profile, d in report.get("ledger", {}).get("decisions", {}).items():
         if d["missing_reason"]:
             out.append(f"CRITICAL {d['missing_reason']} no-trade decisions without a reason in {profile}")
+    if report.get("ledger", {}).get("error"):
+        out.append(f"CRITICAL paper ledger audit unavailable: {report['ledger']['error']}")
     for job, hours in report.get("job_ages_s", {}).items():
         if hours is None or hours > JOB_STALE_SECONDS:
             out.append(f"WARNING scheduled job '{job}' has not run in {'ever' if hours is None else f'{hours / 3600:.1f} h'} (hourly)")
@@ -153,7 +180,6 @@ def alerts(report: dict) -> list[str]:
     elif recon.get("counts", {}).get("MATCH", 0) != recon.get("settlements", 0):
         out.append(f"CRITICAL settlement reconciliation mismatches: {recon.get('counts')}")
     return out
-
 
 def build(home: Path, port: int) -> dict:
     status, source = get_status(home, port)
