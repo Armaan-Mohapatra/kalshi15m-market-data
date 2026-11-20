@@ -201,8 +201,13 @@ class RuntimeStatus:
         self.async_file_writes = False
         self._file_lock = threading.Lock()
         self._write_wakeup = threading.Event()
-        self._pending_payload: str | None = None
+        self._pending_payload: tuple[int, str] | None = None
         self._file_writer: threading.Thread | None = None
+        # Every serialized payload gets a sequence number and a stale one is never written, so a
+        # queued background write can not land after (and undo) a later forced write such as the
+        # final service_state=STOPPED that tells the next start the stop was clean.
+        self._write_seq = 0
+        self._last_written_seq = 0
         self.last_status_file_write_monotonic: float | None = None
         self.started_utc = utc_now()
         self.data: dict[str, Any] = {
@@ -502,8 +507,10 @@ class RuntimeStatus:
             return
         self.last_status_file_write_monotonic = now
         payload = json.dumps(self.data, indent=2)
+        self._write_seq += 1
+        seq = self._write_seq
         if self.async_file_writes and not force:
-            self._pending_payload = payload  # latest wins
+            self._pending_payload = (seq, payload)  # latest wins
             if self._file_writer is None:
                 self._file_writer = threading.Thread(
                     target=self._file_writer_main, name="status-file-writer", daemon=True
@@ -511,21 +518,25 @@ class RuntimeStatus:
                 self._file_writer.start()
             self._write_wakeup.set()
             return
-        self._write_payload(payload)
+        self._pending_payload = None  # anything queued is older than this write
+        self._write_payload(seq, payload)
 
     def _file_writer_main(self) -> None:
         while True:
             self._write_wakeup.wait()
             self._write_wakeup.clear()
-            payload, self._pending_payload = self._pending_payload, None
-            if payload is not None:
+            pending, self._pending_payload = self._pending_payload, None
+            if pending is not None:
                 try:
-                    self._write_payload(payload)
+                    self._write_payload(*pending)
                 except Exception:
                     LOG.warning("status.json background write failed", exc_info=True)
 
-    def _write_payload(self, payload: str) -> None:
+    def _write_payload(self, seq: int, payload: str) -> None:
         with self._file_lock:
+            if seq < self._last_written_seq:
+                return  # a newer write already reached the disk
+            self._last_written_seq = seq
             self._write_payload_locked(payload)
 
     def _write_payload_locked(self, payload: str) -> None:

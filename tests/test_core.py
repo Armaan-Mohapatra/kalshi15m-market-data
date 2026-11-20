@@ -4261,3 +4261,43 @@ class RecentKeysWindowTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             store = Storage(Settings(home=Path(tmp), min_free_bytes=0))
             self.assertEqual(store.parquet_size_reconcile_interval_seconds, 3600.0)
+
+
+class StatusWriteOrderingTests(unittest.TestCase):
+    def test_a_forced_stopped_write_is_never_undone_by_an_older_background_write(self):
+        import threading
+
+        with TemporaryDirectory() as root:
+            status = RuntimeStatus(Settings(home=Path(root)))
+            status.async_file_writes = True
+            status.status_file_write_interval_seconds = 0.0
+            gate = threading.Event()
+            original = status._write_payload_locked
+            order = []
+
+            def gated(payload):
+                gate.wait(5)
+                order.append(json.loads(payload)["service_state"])
+                return original(payload)
+
+            status._write_payload_locked = gated
+            status.data["service_state"] = "RUNNING"
+            status.update(queue_depth=1)                    # background write of a RUNNING payload, stuck on the gate
+            time.sleep(0.2)
+            status.update(queue_depth=2)                    # a second RUNNING payload queued behind the stuck one
+            forced = threading.Thread(target=lambda: status.update(service_state="STOPPED"))
+            forced.start()                                   # forced write, waits for the file lock
+            time.sleep(0.2)
+            gate.set()
+            forced.join(10)
+            time.sleep(0.5)
+            saved = json.loads((Path(root) / "runtime" / "status.json").read_text())
+            self.assertEqual(saved["service_state"], "STOPPED")  # the old RUNNING payload did not overwrite it
+
+    def test_stale_sequence_numbers_are_dropped(self):
+        with TemporaryDirectory() as root:
+            status = RuntimeStatus(Settings(home=Path(root)))
+            status._write_payload(5, json.dumps({"service_state": "STOPPED"}))
+            status._write_payload(4, json.dumps({"service_state": "RUNNING"}))  # older: ignored
+            saved = json.loads((Path(root) / "runtime" / "status.json").read_text())
+            self.assertEqual(saved["service_state"], "STOPPED")
