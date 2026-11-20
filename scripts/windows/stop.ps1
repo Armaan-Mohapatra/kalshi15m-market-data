@@ -1,9 +1,11 @@
 param(
-    [ValidateRange(1,30)][int]$GracefulWaitSeconds = 30,
+    # A saturated queue takes 110-281 s to drain before the worker exits; a 30 s
+    # wait then deleted stop.request before the worker's loop ever read it.
+    [ValidateRange(1,900)][int]$GracefulWaitSeconds = 600,
     [switch]$KeepSupervisorPausedOnTimeout
 )
 $ErrorActionPreference = 'Stop'
-$root = 'C:\Users\dakin\Projects\kalshi-15m-native'
+$root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path  # the checkout this script lives in
 $homePath = if ($env:KALSHI15M_HOME) { $env:KALSHI15M_HOME } else { Join-Path $env:LOCALAPPDATA 'Kalshi15mNative' }
 $statusPort = if ($env:KALSHI15M_STATUS_PORT) { [int]$env:KALSHI15M_STATUS_PORT } else { 8768 }
 $pidPath = Join-Path $homePath 'runtime\worker.pid.json'

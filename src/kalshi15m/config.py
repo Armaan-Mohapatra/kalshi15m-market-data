@@ -19,6 +19,16 @@ class Settings:
     min_free_bytes: int = 20 * 1024**3
     max_response_bytes: int = 64 * 1024**2
     max_queue_events: int = 12000
+    # Opt-in: persist WebSocket orderbook_delta rows only for these series prefixes.
+    # Unset (default) journals every delta. Books and sequence checks are unaffected.
+    journal_delta_series_prefixes: tuple[str, ...] = tuple(
+        p.strip() for p in os.environ.get("KALSHI15M_JOURNAL_DELTA_SERIES", "").split(",") if p.strip()
+    )
+    # Opt-in, same contract for WebSocket `ticker` rows (archival only; no decision
+    # reads them). Unset (default) journals every ticker row, i.e. unchanged evidence.
+    journal_ticker_series_prefixes: tuple[str, ...] = tuple(
+        p.strip() for p in os.environ.get("KALSHI15M_JOURNAL_TICKER_SERIES", "").split(",") if p.strip()
+    )
     # Leave headroom below one REST request per second; forward polling at
     # 1.0 s observed recoverable 429 responses on /markets discovery.
     rest_min_interval_seconds: float = 2.0
@@ -52,10 +62,44 @@ class Settings:
     # runs when the set of confirmed-frequency candidates changes.
     series_catalog_refresh_seconds: int = 900
     discovery_refresh_seconds: int = 21600
-    raw_data_budget_bytes: int = 1500 * 1024**2
+    raw_data_budget_bytes: int = int(os.environ.get("KALSHI15M_RAW_DATA_BUDGET_BYTES", 1500 * 1024**2))
+    # Optional (orderbook_delta) journaling stops once SQLite+WAL reaches this
+    # size; snapshots, trades, lifecycle and paper records keep persisting. 0 = no cap.
+    journal_budget_bytes: int = int(os.environ.get("KALSHI15M_JOURNAL_BUDGET_BYTES", "0"))
     log_budget_bytes: int = 40 * 1024**2
     log_file_max_bytes: int = 8 * 1024**2
     log_backup_count: int = 5
+    # Archive recovery keeps its fingerprint index in a file under home (so it
+    # lives on the research volume, never %TEMP%) and refuses to grow past this.
+    recovery_index_max_bytes: int = 4 * 1024**3
+    # Optional absolute path of the SQLite journal (empty = <home>/data/paper_ledger.sqlite3).
+    ledger_override: str = os.environ.get("KALSHI15M_LEDGER_PATH", "")
+    # Free space guards on the journal's own volume (it may not be the research volume):
+    # below LOW optional capture is throttled; below CRITICAL the worker stops
+    # gracefully before a full disk can corrupt the journal.
+    # Rows older than this that the manifest-backed Parquet checkpoint already covers
+    # are deleted from the SQLite journal so it stops growing (owner-approved
+    # 2026-11-19 for P8). 0 = never prune (default).
+    journal_retention_seconds: int = int(float(os.environ.get("KALSHI15M_JOURNAL_RETENTION_HOURS", "0")) * 3600)
+    # WebSocket permessage-deflate: "deflate" (the library default) or "none". "none" was tried as a CPU saving
+    # (decode was ~4% of loop time) but order-book snapshot bursts get several times larger on the wire and
+    # reconnects doubled (62 -> 132/hour), so the default stays "deflate".
+    ws_compression: str = os.environ.get("KALSHI15M_WS_COMPRESSION", "deflate").strip().lower()
+    ledger_min_free_bytes: int = 5 * 1024**3
+    ledger_critical_free_bytes: int = 1 * 1024**3
+    # Durability of market-event batch commits (owner-approved 2026-11-19: the USB
+    # volume needs ~1.3 s per fsync). NORMAL keeps the database consistent but a
+    # power loss can drop the last few seconds of events. Paper-ledger commits are
+    # always FULL, and the archive checkpoint waits for a WAL checkpoint (see storage).
+    event_synchronous: str = os.environ.get("KALSHI15M_EVENT_SYNCHRONOUS", "NORMAL").upper()
+    # Journal page cache. dedupe_key is a random SHA-256, so the primary-key index
+    # is a random-access B-tree: 64 MiB measured ~5.6 ms/event cold, 256 MiB ~1.3.
+    # 160 MiB trades speed against the host's scarce free RAM.
+    sqlite_cache_kib: int = int(os.environ.get("KALSHI15M_SQLITE_CACHE_KIB", 160 * 1024))
+
+    @property
+    def recovery_workspace_dir(self) -> Path:
+        return self.home / "tmp"
 
     @property
     def data_dir(self) -> Path:
@@ -67,7 +111,18 @@ class Settings:
 
     @property
     def ledger_path(self) -> Path:
-        return self.data_dir / "paper_ledger.sqlite3"
+        # The SQLite journal can live on a faster volume than the Parquet archive
+        # (measured: random-key inserts 4,162 ev/s on NVMe vs 107 on the USB volume).
+        # Order: KALSHI15M_LEDGER_PATH, then <home>/runtime/ledger_path.txt (written by
+        # the migration so the worker and the report/reconcile/research tasks agree),
+        # then <home>/data/paper_ledger.sqlite3. See ledger_volume_state().
+        if self.ledger_override:
+            return Path(self.ledger_override)
+        try:
+            pointed = (self.runtime_dir / "ledger_path.txt").read_text(encoding="utf-8").strip()
+        except OSError:
+            pointed = ""
+        return Path(pointed) if pointed else self.data_dir / "paper_ledger.sqlite3"
 
     @property
     def runtime_dir(self) -> Path:
@@ -83,6 +138,13 @@ class Settings:
         self.parquet_dir.mkdir(parents=True, exist_ok=True)
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def ledger_volume_state(self, free_bytes: int) -> str:
+        """OK / LOW (throttle optional capture) / CRITICAL (stop before the disk fills)."""
+        if free_bytes < self.ledger_critical_free_bytes:
+            return "CRITICAL"
+        return "LOW" if free_bytes < self.ledger_min_free_bytes else "OK"
 
 
 settings = Settings()

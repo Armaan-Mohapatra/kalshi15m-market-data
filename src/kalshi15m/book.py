@@ -13,6 +13,10 @@ class OrderBook:
         self.no: dict[Decimal, Decimal] = {}
         self.synchronized = False
         self.sequence: int | None = None
+        # Best bid per side, kept incrementally: quotes() runs on every delta and a max() over
+        # hundreds of Decimal keys was ~15% of the event loop's busy time.
+        self._best_yes: Decimal | None = None
+        self._best_no: Decimal | None = None
 
     @staticmethod
     def _levels(values: list[Any]) -> dict[Decimal, Decimal]:
@@ -37,6 +41,8 @@ class OrderBook:
         self.no = self._levels(
             book.get("no_dollars_fp") or book.get("no_dollars") or book.get("no") or []
         )
+        self._best_yes = max(self.yes, default=None)
+        self._best_no = max(self.no, default=None)
         self.synchronized = True
 
     def invalidate(self) -> None:
@@ -56,15 +62,33 @@ class OrderBook:
         size = levels.get(price, Decimal(0)) + delta
         if size < 0:
             raise ValueError("negative orderbook quantity")
+        is_yes = levels is self.yes
+        best = self._best_yes if is_yes else self._best_no
         if size == 0:
             levels.pop(price, None)
+            if price == best:  # the best level went away: only now is a scan needed
+                best = max(levels, default=None)
         else:
             levels[price] = size
+            if best is None or price > best:
+                best = price
+        if is_yes:
+            self._best_yes = best
+        else:
+            self._best_no = best
         self.synchronized = True
 
+    def _best(self) -> tuple[Decimal | None, Decimal | None]:
+        """Cached best bids, re-derived if the level dicts were replaced behind our back."""
+        yes, no = self._best_yes, self._best_no
+        if (yes is None) == bool(self.yes) or (yes is not None and yes not in self.yes):
+            yes = self._best_yes = max(self.yes, default=None)
+        if (no is None) == bool(self.no) or (no is not None and no not in self.no):
+            no = self._best_no = max(self.no, default=None)
+        return yes, no
+
     def quotes(self) -> dict[str, str | None]:
-        best_yes = max(self.yes, default=None)
-        best_no = max(self.no, default=None)
+        best_yes, best_no = self._best()
         one = Decimal("1.0000")
         return {
             "yes_bid": str(best_yes) if best_yes is not None else None,

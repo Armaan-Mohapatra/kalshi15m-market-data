@@ -464,6 +464,233 @@ class RuntimeStatusTests(unittest.TestCase):
             self.assertEqual(idle["strategy_rest_poll_health"], "NOT_DUE_OUTSIDE_ENTRY_WINDOW")
 
 
+class StackSamplingTests(unittest.TestCase):
+    def test_config_parsing_is_strict(self):
+        from kalshi15m.worker import parse_stack_sample_config as parse
+
+        self.assertEqual(parse("1 240\n"), (1.0, 240.0))
+        self.assertEqual(parse("  0.5   60 "), (0.5, 60.0))
+        for bad in ("", "x y", "1", "0.01 60", "1 0", "100 60", "1 99999"):
+            self.assertIsNone(parse(bad), bad)
+
+    def test_disabled_without_the_file_and_bounded_when_enabled(self):
+        import faulthandler
+
+        from kalshi15m.worker import start_stack_sampling
+
+        with TemporaryDirectory() as tmp:
+            runtime, logs = Path(tmp) / "runtime", Path(tmp) / "logs"
+            runtime.mkdir()
+            logs.mkdir()
+            self.assertFalse(start_stack_sampling(runtime, logs))
+            self.assertFalse((logs / "stack_samples.log").exists())
+            (runtime / "stack_sample.txt").write_text("0.2 1", encoding="utf-8")
+            try:
+                self.assertTrue(start_stack_sampling(runtime, logs))
+                self.assertFalse((runtime / "stack_sample.txt").exists())  # request consumed
+                self.assertTrue((runtime / "stack_sample.started.txt").exists())
+                self.assertFalse(start_stack_sampling(runtime, logs))  # a running tick does not restart it
+                time.sleep(0.7)
+            finally:
+                faulthandler.cancel_dump_traceback_later()
+            self.assertIn("most recent call first", (logs / "stack_samples.log").read_text(encoding="utf-8"))
+
+
+class GilSwitchIntervalTests(unittest.TestCase):
+    def test_tuning_shortens_the_switch_interval_and_collector_applies_it(self):
+        from kalshi15m.worker import GIL_SWITCH_INTERVAL_SECONDS, tune_gil_switch_interval
+
+        before = sys.getswitchinterval()
+        try:
+            sys.setswitchinterval(0.005)
+            tune_gil_switch_interval()
+            self.assertAlmostEqual(sys.getswitchinterval(), GIL_SWITCH_INTERVAL_SECONDS, places=6)
+            self.assertLessEqual(GIL_SWITCH_INTERVAL_SECONDS, 0.0005)  # 1 ms was NOT enough when measured
+            sys.setswitchinterval(0.005)
+            with TemporaryDirectory() as tmp:
+                Collector(Settings(home=Path(tmp), min_free_bytes=0))
+            self.assertAlmostEqual(sys.getswitchinterval(), GIL_SWITCH_INTERVAL_SECONDS, places=6)
+        finally:
+            sys.setswitchinterval(before)
+
+
+class ManifestHeadCacheTests(unittest.TestCase):
+    def test_appends_and_checkpoints_do_not_reread_the_manifest(self):
+        with TemporaryDirectory() as tmp:
+            cfg = Settings(home=Path(tmp), min_free_bytes=0)
+            store, _ = _flushed_store(cfg, [2])  # first flush loads the cache once
+            real = store._manifest_read
+            reads = []
+            store._manifest_read = lambda: (reads.append(1), real())[1]
+            for start in (2, 3, 4):
+                store.append_batch([_trade(start)])
+                store.flush_parquet(reason="TEST")
+            self.assertEqual(reads, [])  # no full re-read per flush
+            self.assertTrue(store.verify_archive(full=True)["ok"])  # on-disk chain is intact
+            record = json.loads(store.archive_checkpoint_path.read_text(encoding="utf-8"))
+            self.assertEqual(record["manifest_seq"], len(real()[0]))
+            self.assertEqual(record["manifest_head"], real()[0][-1]["hash"])
+            store.close()
+
+    def test_failed_append_drops_the_cache_and_the_chain_stays_valid(self):
+        with TemporaryDirectory() as tmp:
+            cfg = Settings(home=Path(tmp), min_free_bytes=0)
+            store, _ = _flushed_store(cfg, [2])
+            store.append_batch([_trade(2)])
+            real_fsync, calls = os.fsync, []
+
+            def second_fsync_fails(fd):  # 1st = the Parquet file, 2nd = the manifest line
+                calls.append(1)
+                if len(calls) == 2:
+                    raise OSError(5, "I/O error")
+                return real_fsync(fd)
+
+            with patch("kalshi15m.storage.os.fsync", side_effect=second_fsync_fails):
+                store.flush_parquet(reason="TEST")
+            self.assertEqual(store.archive_manifest_failures, 1)
+            self.assertIsNone(store._manifest_cache)  # unknown state: next use re-reads the file
+            store.append_batch([_trade(3)])
+            store.flush_parquet(reason="TEST")  # re-reads, appends; checkpoint stays frozen
+            self.assertIsNotNone(store._manifest_cache)
+            self.assertTrue(store.verify_archive(full=True)["ok"])
+            self.assertEqual(sorted(_archived_keys(cfg)), _expected(4))
+            store.close()
+
+
+class AdaptiveFlushThresholdTests(unittest.TestCase):
+    def test_slow_flushes_double_the_threshold_to_a_cap_and_fast_ones_decay_to_base(self):
+        with TemporaryDirectory() as tmp:
+            store = Storage(Settings(home=Path(tmp), min_free_bytes=0))
+            self.assertEqual(store.parquet_flush_rows, 2000)
+            seen = []
+            for _ in range(5):
+                store._adapt_flush_rows(5.0)  # slow flush
+                seen.append(store.parquet_flush_rows)
+            self.assertEqual(seen, [4000, 8000, 16000, 16000, 16000])  # capped
+            for _ in range(5):
+                store._adapt_flush_rows(0.05)  # fast flush
+            self.assertEqual(store.parquet_flush_rows, 2000)  # back to base, not below
+            store._adapt_flush_rows(0.5)  # in between: unchanged
+            self.assertEqual(store.parquet_flush_rows, 2000)
+            store.parquet_flush_rows = 1  # an explicit smaller value is left alone by fast flushes
+            store._adapt_flush_rows(0.05)
+            self.assertEqual(store.parquet_flush_rows, 1)
+
+    def test_real_flush_reports_threshold_in_status(self):
+        with TemporaryDirectory() as tmp:
+            store = Storage(Settings(home=Path(tmp), min_free_bytes=0))
+            store.open()
+            store.append_batch([_trade(i) for i in range(2100)])
+            self.assertIn("parquet_flush_rows_threshold", store.connection_status())
+            store.close()
+
+
+class WriterPhaseTimingTests(unittest.TestCase):
+    def test_phases_are_recorded_and_exposed_in_status(self):
+        with TemporaryDirectory() as tmp:
+            store = Storage(Settings(home=Path(tmp), min_free_bytes=0))
+            store.open()
+            store.append_batch([_trade(i) for i in range(2100)])  # crosses the 2000-row flush threshold
+            phases = store.connection_status()["writer_phase_ms_ema"]
+            for name in ("append_prepare", "append_insert", "append_commit", "append_tail",
+                         "append_parquet_buffer_and_flush", "flush_write_files", "flush_manifest",
+                         "flush_wal_barrier", "flush_checkpoint_file"):
+                self.assertIn(name, phases)
+                self.assertGreaterEqual(phases[name], 0.0)
+            store.close()
+
+
+class LedgerVolumeTests(unittest.TestCase):
+    def test_ledger_path_override_and_default(self):
+        with TemporaryDirectory() as tmp:
+            self.assertEqual(Settings(home=Path(tmp)).ledger_path, Path(tmp) / "data" / "paper_ledger.sqlite3")
+            elsewhere = Path(tmp) / "fast" / "j.sqlite3"
+            cfg = Settings(home=Path(tmp) / "h", ledger_override=str(elsewhere))
+            cfg.ensure_dirs()
+            self.assertEqual(cfg.ledger_path, elsewhere)
+            self.assertTrue(elsewhere.parent.is_dir())
+            store = Storage(cfg)
+            store.open()
+            store.append_batch([_trade(1)])
+            self.assertTrue(elsewhere.exists())
+            self.assertEqual(store.sqlite_open_path, elsewhere.resolve())
+            store.close()
+
+    def test_pointer_file_relocates_the_ledger_and_env_wins(self):
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp) / "h"
+            cfg = Settings(home=home)
+            self.assertEqual(cfg.ledger_path, home / "data" / "paper_ledger.sqlite3")
+            (home / "runtime").mkdir(parents=True)
+            target = Path(tmp) / "fast" / "ledger.sqlite3"
+            (home / "runtime" / "ledger_path.txt").write_text(f"{target}\n", encoding="utf-8")
+            self.assertEqual(Settings(home=home).ledger_path, target)  # every consumer follows it
+            other = Path(tmp) / "env.sqlite3"
+            self.assertEqual(Settings(home=home, ledger_override=str(other)).ledger_path, other)
+            (home / "runtime" / "ledger_path.txt").write_text("  \n", encoding="utf-8")  # blank = unset
+            self.assertEqual(Settings(home=home).ledger_path, home / "data" / "paper_ledger.sqlite3")
+
+    def test_volume_state_thresholds(self):
+        cfg = Settings(ledger_min_free_bytes=5000, ledger_critical_free_bytes=1000)
+        self.assertEqual(
+            [cfg.ledger_volume_state(v) for v in (999, 1000, 4999, 5000)],
+            ["CRITICAL", "LOW", "LOW", "OK"],
+        )
+
+
+class JournalDurabilityPolicyTests(unittest.TestCase):
+    def test_events_use_configured_mode_but_paper_records_commit_full(self):
+        with TemporaryDirectory() as temporary:
+            store = Storage(Settings(home=Path(temporary), min_free_bytes=0, event_synchronous="NORMAL"))
+            store.open()
+            self.assertEqual(store.connection.execute("PRAGMA synchronous").fetchone()[0], 1)  # NORMAL
+            modes = []
+            real = store._set_synchronous
+            store._set_synchronous = lambda mode: (modes.append(mode), real(mode))[1]
+            store.append_batch([_trade(1)])
+            self.assertEqual(modes, [])  # event batches never raise the policy
+            store.append_paper_record("k1", "p", "DECISION", {"x": 1})
+            self.assertEqual(modes, ["FULL", "NORMAL"])
+            self.assertEqual(store.connection.execute("PRAGMA synchronous").fetchone()[0], 1)
+            store.close()
+
+    def test_checkpoint_waits_for_the_journal_durability_barrier(self):
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary), min_free_bytes=0)
+            store = Storage(cfg)
+            store.open()
+            store.append_batch([_trade(1)])
+            with patch.object(store, "_make_journal_durable", return_value=False):
+                store.flush_parquet(reason="TEST")
+            self.assertFalse(store.archive_checkpoint_path.exists())
+            self.assertEqual(store.archive_checkpoint_write_failures, 1)
+            store.append_batch([_trade(2)])
+            store.flush_parquet(reason="TEST")
+            self.assertEqual(
+                json.loads(store.archive_checkpoint_path.read_text(encoding="utf-8"))["through_rowid"], 2
+            )
+            store.close()
+
+    def test_unsupported_mode_is_rejected(self):
+        with TemporaryDirectory() as temporary:
+            with self.assertRaises(ValueError):
+                Storage(Settings(home=Path(temporary), event_synchronous="OFF")).open()
+
+
+class SourceFingerprintTests(unittest.TestCase):
+    def test_status_reports_git_head_or_explicit_unknown(self):
+        from kalshi15m.worker import source_fingerprint
+
+        fingerprint = source_fingerprint()
+        commit = fingerprint["source_commit"]
+        self.assertTrue(commit == "UNKNOWN" or (len(commit) == 40 and int(commit, 16) >= 0))
+        with patch("subprocess.run", side_effect=FileNotFoundError):
+            self.assertEqual(source_fingerprint(), {"source_commit": "UNKNOWN", "source_dirty": None})
+        with TemporaryDirectory() as temporary:
+            status = RuntimeStatus(Settings(home=Path(temporary)))
+            self.assertIn("source_commit", status.snapshot())
+
+
 class WebSocketAuthTests(unittest.TestCase):
     def test_generic_exchange_credentials_do_not_enable_market_data_socket(self):
         with patch.dict(
@@ -1830,8 +2057,10 @@ class StorageTests(unittest.TestCase):
             actual_bytes = sum(
                 path.stat().st_size for path in cfg.parquet_dir.rglob("*.parquet")
             )
-            self.assertEqual(store.parquet_bytes, actual_bytes)
+            store.parquet_size_reconcile_interval_seconds = 0
             status = store.connection_status()
+            self.assertEqual(store.parquet_bytes, actual_bytes)
+            self.assertEqual(status["parquet_bytes"], actual_bytes)
             self.assertEqual(status["parquet_flush_count"], 1)
             self.assertEqual(status["parquet_last_flush_rows"], 1)
             self.assertEqual(status["parquet_last_flush_reason"], "ROW_THRESHOLD")
@@ -1968,7 +2197,11 @@ class StorageTests(unittest.TestCase):
                 self.assertEqual(writer.submit(store.integrity_check).result(), "ok")
                 with patch("kalshi15m.storage.os.fsync", wraps=os.fsync) as fsync:
                     writer.submit(store.close).result()
-                    self.assertEqual(fsync.call_count, 1)
+                    # parquet file, manifest listing, checkpoint: each durable in order
+                    self.assertEqual(fsync.call_count, 3)
+            checkpoint = json.loads(store.archive_checkpoint_path.read_text(encoding="utf-8"))
+            self.assertEqual(checkpoint["through_rowid"], 1)
+            self.assertEqual(checkpoint["through_dedupe_key"], "trade-1")
             parquet_files = list(cfg.parquet_dir.rglob("*.parquet"))
             self.assertEqual(len(parquet_files), 1)
             self.assertEqual(list(cfg.parquet_dir.rglob("*.partial")), [])
@@ -2001,6 +2234,23 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(store.events_duplicate, 1)
             self.assertEqual(len(store.parquet_buffer), 1)
             store.close()
+
+    def test_duplicates_are_ignored_after_restart_without_recent_key_window(self):
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary), min_free_bytes=0)
+            first = Storage(cfg)
+            first.open()
+            self.assertEqual(first.append_batch([_trade(1), _trade(2)]), 2)
+            first.close()
+            second = Storage(cfg)  # empty recent-key window, like a restarted worker
+            second.open()
+            self.assertEqual(second.append_batch([_trade(2), _trade(3), _trade(3)]), 1)
+            self.assertEqual(second.events_duplicate, 2)
+            self.assertEqual(
+                second.connection.execute("SELECT count(*) FROM market_events").fetchone()[0], 3
+            )
+            self.assertEqual([r["dedupe_key"] for r in second.parquet_buffer], ["trade-3"])
+            second.close()
 
     def test_unclean_start_recovers_missing_parquet_rows_from_sqlite(self):
         with TemporaryDirectory() as temporary:
@@ -2420,6 +2670,46 @@ class WriterLoopTests(unittest.IsolatedAsyncioTestCase):
                 await loop.run_in_executor(pool, store.close)
                 pool.shutdown(wait=True)
 
+    async def test_writer_group_commits_a_full_queue_in_one_batch(self):
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary), min_free_bytes=0)
+            store = Storage(cfg)
+            pool = ThreadPoolExecutor(max_workers=1)
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(pool, store.open)
+            collector = Collector.__new__(Collector)
+            collector.stopping = asyncio.Event()
+            collector.queue = asyncio.Queue(maxsize=2000)
+            collector.storage = store
+            collector.writer_pool = pool
+            collector.status = RuntimeStatus(cfg)
+            for index in range(1200):
+                collector.queue.put_nowait(_trade(index))
+            sizes = []
+            real_append = store.append_batch
+
+            def recording_append(batch):
+                sizes.append(len(batch))
+                return real_append(batch)
+
+            store.append_batch = recording_append
+            writer = asyncio.create_task(collector.writer_loop())
+            try:
+                await asyncio.wait_for(collector.queue.join(), timeout=10)
+                # One drain, one fsync: not three 500-event commits.
+                self.assertEqual(sizes, [1200])
+                self.assertEqual(store.events_inserted, 1200)
+                await asyncio.sleep(1.0)  # let the cycle finish its status update
+                data = collector.status.data
+                self.assertEqual(data["writer_batch_events_ema"], 1200.0)
+                self.assertGreaterEqual(data["writer_append_ms_ema"], 0.0)
+                self.assertGreaterEqual(data["writer_overhead_ms_ema"], 0.0)
+            finally:
+                collector.stopping.set()
+                await asyncio.wait_for(writer, timeout=4)
+                await loop.run_in_executor(pool, store.close)
+                pool.shutdown(wait=True)
+
     async def test_writer_retains_batch_until_transient_sqlite_failure_recovers(self):
         with TemporaryDirectory() as temporary:
             cfg = Settings(home=Path(temporary))
@@ -2546,7 +2836,7 @@ class WriterLoopTests(unittest.IsolatedAsyncioTestCase):
             writer = asyncio.create_task(collector.writer_loop())
             try:
                 deadline = asyncio.get_running_loop().time() + 3
-                while store.parquet_buffer and asyncio.get_running_loop().time() < deadline:
+                while (store.parquet_buffer or collector.status.data.get("parquet_last_flush_reason") is None) and asyncio.get_running_loop().time() < deadline:
                     await asyncio.sleep(0.05)
 
                 self.assertEqual(store.parquet_buffer, [])
@@ -2601,6 +2891,7 @@ class WriterLoopTests(unittest.IsolatedAsyncioTestCase):
             collector.storage = store
             collector.writer_pool = ThreadPoolExecutor(max_workers=1)
             collector.status = RuntimeStatus(cfg)
+            collector.WRITER_BATCH_MAX = 500  # this test needs two batches (500 + 1)
             for index in range(501):
                 event_id = f"busy-flush-{index}"
                 collector.queue.put_nowait(
@@ -2881,3 +3172,1135 @@ if __name__ == "__main__":
     unittest.main()
 
 
+
+
+class JournalDeltaAllowlistTests(unittest.IsolatedAsyncioTestCase):
+    async def _emit(self, prefixes, ticker, kind="orderbook_delta"):
+        collector = Collector.__new__(Collector)
+        collector.cfg = Settings(home=Path("unused"), journal_delta_series_prefixes=prefixes)
+        collector.queue = asyncio.Queue()
+        await collector.emit("websocket_orderbook", kind, {"x": 1}, market_ticker=ticker)
+        return collector
+
+    async def test_default_journals_every_delta(self):
+        c = await self._emit((), "KXGOLD15M-26NOV181500-00")
+        self.assertEqual(c.queue.qsize(), 1)
+
+    async def test_out_of_scope_delta_skipped_and_counted(self):
+        c = await self._emit(("KXBTC15M", "KXETH15M"), "KXGOLD15M-26NOV181500-00")
+        self.assertEqual(c.queue.qsize(), 0)
+        self.assertEqual(c.journal_delta_skipped, 1)
+
+    async def test_in_scope_delta_and_other_kinds_kept(self):
+        c = await self._emit(("KXBTC15M",), "KXBTC15M-26NOV181500-00")
+        self.assertEqual(c.queue.qsize(), 1)
+        c = await self._emit(("KXBTC15M",), "KXGOLD15M-26NOV181500-00", kind="trade")
+        self.assertEqual(c.queue.qsize(), 1)
+
+
+class JournalTickerAllowlistTests(unittest.IsolatedAsyncioTestCase):
+    async def _emit(self, prefixes, ticker, kind="ticker"):
+        collector = Collector.__new__(Collector)
+        collector.cfg = Settings(home=Path("unused"), journal_ticker_series_prefixes=prefixes)
+        collector.queue = asyncio.Queue()
+        await collector.emit("websocket_ticker", kind, {"x": 1}, market_ticker=ticker)
+        return collector
+
+    async def test_default_journals_every_ticker_row(self):
+        self.assertEqual((await self._emit((), "KXGOLD15M-26NOV181500-00")).queue.qsize(), 1)
+
+    async def test_out_of_scope_ticker_skipped_and_counted_in_scope_kept(self):
+        skipped = await self._emit(("KXBTC15M",), "KXGOLD15M-26NOV181500-00")
+        self.assertEqual((skipped.queue.qsize(), skipped.journal_ticker_skipped), (0, 1))
+        self.assertEqual((await self._emit(("KXBTC15M",), "KXBTC15M-26NOV181500-00")).queue.qsize(), 1)
+
+    async def test_ticker_allowlist_never_filters_trades_or_deltas(self):
+        for kind in ("public_trade", "orderbook_delta"):
+            kept = await self._emit(("KXBTC15M",), "KXGOLD15M-26NOV181500-00", kind=kind)
+            self.assertEqual(kept.queue.qsize(), 1)
+
+
+def _trade(index):
+    return {
+        "dedupe_key": f"trade-{index}",
+        "received_utc": "2026-10-15T06:00:00+00:00",
+        "channel": "test",
+        "kind": "public_trade",
+        "market_ticker": "sample",
+        "payload": {"trade_id": f"trade-{index}"},
+    }
+
+
+def _archived_keys(cfg):
+    import pyarrow.parquet as pq
+
+    keys = []
+    for path in cfg.parquet_dir.rglob("*.parquet"):
+        keys.extend(pq.read_table(path, columns=["dedupe_key"]).column(0).to_pylist())
+    return keys
+
+
+def _mark_unclean(cfg):
+    cfg.runtime_dir.mkdir(parents=True, exist_ok=True)
+    (cfg.runtime_dir / "status.json").write_text(
+        json.dumps({"service_state": "RUNNING"}), encoding="utf-8"
+    )
+
+
+class ArchiveCheckpointRecoveryTests(unittest.TestCase):
+    def test_crash_recovers_only_rows_after_checkpoint_without_duplicates(self):
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary), min_free_bytes=0)
+            store = Storage(cfg)
+            store.open()
+            store.append_batch([_trade(i) for i in range(5)])
+            store.flush_parquet(reason="TEST")
+            # Committed to SQLite, still only in the memory buffer at the "crash".
+            store.append_batch([_trade(i) for i in range(5, 8)])
+            store.connection.close()
+            store.connection = None
+            _mark_unclean(cfg)
+
+            recovered = Storage(cfg)
+            recovered.open()
+
+            self.assertEqual(recovered.parquet_recovery_mode, "INCREMENTAL_FROM_ROWID_5")
+            self.assertEqual(recovered.parquet_recovery_rows, 3)
+            keys = _archived_keys(cfg)
+            self.assertEqual(sorted(keys), sorted(f"trade-{i}" for i in range(8)))
+            checkpoint = json.loads(recovered.archive_checkpoint_path.read_text(encoding="utf-8"))
+            self.assertEqual(checkpoint["through_rowid"], 8)
+            recovered.close()
+
+    def test_crash_after_publish_before_checkpoint_does_not_duplicate(self):
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary), min_free_bytes=0)
+            store = Storage(cfg)
+            store.open()
+            store.append_batch([_trade(i) for i in range(3)])
+            store.flush_parquet(reason="TEST")
+            store.append_batch([_trade(i) for i in range(3, 6)])
+            # Files publish, then the process dies before the checkpoint moves.
+            with patch.object(store, "_write_archive_checkpoint"):
+                store.flush_parquet(reason="TEST")
+            store.connection.close()
+            store.connection = None
+            _mark_unclean(cfg)
+
+            recovered = Storage(cfg)
+            recovered.open()
+
+            self.assertEqual(recovered.parquet_recovery_mode, "INCREMENTAL_FROM_ROWID_3")
+            self.assertEqual(recovered.parquet_recovery_rows, 0)
+            self.assertEqual(sorted(_archived_keys(cfg)), sorted(f"trade-{i}" for i in range(6)))
+            recovered.close()
+
+    def test_mismatched_or_shrunken_checkpoint_falls_back_to_full_scan(self):
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary), min_free_bytes=0)
+            store = Storage(cfg)
+            store.open()
+            store.append_batch([_trade(i) for i in range(4)])
+            store.close()
+            path = store.archive_checkpoint_path
+            record = json.loads(path.read_text(encoding="utf-8"))
+            record["through_dedupe_key"] = "not-this-row"
+            path.write_text(json.dumps(record), encoding="utf-8")
+            _mark_unclean(cfg)
+
+            recovered = Storage(cfg)
+            recovered.open()
+            self.assertEqual(recovered.parquet_recovery_mode, "FULL_SCAN")
+            self.assertEqual(recovered.parquet_recovery_rows, 0)
+            recovered.close()
+
+            for parquet in cfg.parquet_dir.rglob("*.parquet"):
+                parquet.unlink()
+            _mark_unclean(cfg)
+            rebuilt = Storage(cfg)
+            rebuilt.open()
+            self.assertEqual(rebuilt.parquet_recovery_mode, "FULL_SCAN")
+            self.assertEqual(rebuilt.parquet_recovery_rows, 4)
+            rebuilt.close()
+
+    def test_checkpoint_does_not_advance_past_dropped_rows(self):
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary), min_free_bytes=0)
+            store = Storage(cfg)
+            store.open()
+            store.append_batch([_trade(0)])
+            store.flush_parquet(reason="TEST")
+            store.raw_capture_enabled = False
+            store.append_batch([_trade(1)])
+            store.raw_capture_enabled = True
+            store.append_batch([_trade(2)])
+            store.flush_parquet(reason="TEST")
+            record = json.loads(store.archive_checkpoint_path.read_text(encoding="utf-8"))
+            self.assertEqual(record["through_rowid"], 1)
+            store.connection.close()
+            store.connection = None
+            _mark_unclean(cfg)
+
+            recovered = Storage(cfg)
+            recovered.open()
+            self.assertEqual(sorted(_archived_keys(cfg)), ["trade-0", "trade-1", "trade-2"])
+            recovered.close()
+
+
+    def test_recovery_low_disk_refuses_to_advance_checkpoint(self):
+        # The positive recovery tests above use tiny synthetic fixtures and
+        # independently exercise recovery. This test checks the real disk guard.
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary), min_free_bytes=1 << 62)
+            store = Storage(cfg)
+            store.open()
+            store.append_batch([_trade(0)])
+            store.connection.close()
+            store.connection = None
+            _mark_unclean(cfg)
+
+            recovered = Storage(cfg)
+            recovered.open()
+            self.assertEqual(recovered.parquet_recovery_state, "SKIPPED_LOW_DISK")
+            self.assertEqual(recovered.parquet_recovery_mode, "SKIPPED_LOW_DISK")
+            self.assertTrue(recovered.archive_gap_pending)
+            self.assertEqual(_archived_keys(cfg), [])
+            recovered.connection.close()
+            recovered.connection = None
+
+def _flushed_store(cfg, sizes):
+    """Journal and flush one Parquet file per size; leave the store open."""
+    store = Storage(cfg)
+    store.open()
+    start = 0
+    for size in sizes:
+        store.append_batch([_trade(i) for i in range(start, start + size)])
+        store.flush_parquet(reason="TEST")
+        start += size
+    return store, start
+
+
+def _crash(store, cfg):
+    store.connection.close()
+    store.connection = None
+    _mark_unclean(cfg)
+
+
+def _expected(count):
+    return sorted(f"trade-{i}" for i in range(count))
+
+
+class JournalRetentionTests(unittest.TestCase):
+    def _store(self, tmp, retention=3600):
+        cfg = Settings(home=Path(tmp), min_free_bytes=0, journal_retention_seconds=retention)
+        store = Storage(cfg)
+        store.open()
+        store.PRUNE_BATCH_ROWS = 3
+        store.PRUNE_MIN_INTERVAL_SECONDS = 0
+        return cfg, store
+
+    def test_only_archived_old_rows_are_pruned_and_a_restart_still_verifies(self):
+        with TemporaryDirectory() as tmp:
+            cfg, store = self._store(tmp)
+            store.append_batch([_trade(i) for i in range(10)])
+            store.flush_parquet(reason="TEST")  # checkpoint through row 10, prunes rows 1-3
+            while store.prune_journal():
+                pass
+            count = lambda: store.connection.execute("SELECT count(*) FROM market_events").fetchone()[0]
+            self.assertEqual(count(), 1)  # the checkpoint row itself is always kept
+            self.assertEqual(store.journal_pruned_rows, 9)
+            self.assertEqual(sorted(_archived_keys(cfg)), _expected(10))  # nothing lost
+            store.append_batch([_trade(10)])
+            self.assertEqual(store.latest_event[0], 11)  # rowids keep counting, none reused
+            store.flush_parquet(reason="TEST")
+            store.close()
+            again = Storage(cfg)
+            again.open()
+            self.assertEqual(again.archive_integrity_state, "VERIFIED_COMPLETE_CLEAN_STOP_CHECKPOINT")
+            self.assertTrue(again.verify_archive(full=True)["ok"])
+            again.close()
+
+    def test_nothing_is_pruned_while_a_gap_is_pending_or_retention_is_off(self):
+        with TemporaryDirectory() as tmp:
+            cfg, store = self._store(tmp)
+            store.append_batch([_trade(i) for i in range(10)])
+            store.archive_gap_pending = True  # e.g. rows dropped before reaching Parquet
+            store.flush_parquet(reason="TEST")
+            self.assertEqual(store.prune_journal(), 0)
+            self.assertEqual(store.journal_prune_blocked, "NO_CHECKPOINT_THIS_RUN")
+            store.checkpoint_rowid_this_run = 10  # even with a stale checkpoint in hand
+            self.assertEqual(store.prune_journal(), 0)
+            self.assertEqual(store.journal_prune_blocked, "ARCHIVE_GAP_OR_MANIFEST_FAILURE")
+            store.close()
+        with TemporaryDirectory() as tmp:
+            cfg, store = self._store(tmp, retention=0)
+            store.append_batch([_trade(i) for i in range(10)])
+            store.flush_parquet(reason="TEST")
+            self.assertEqual(store.prune_journal(), 0)
+            self.assertEqual(store.connection.execute("SELECT count(*) FROM market_events").fetchone()[0], 10)
+            store.close()
+
+    def test_rows_inside_the_retention_window_are_kept(self):
+        with TemporaryDirectory() as tmp:
+            cfg, store = self._store(tmp, retention=3600)
+            fresh = datetime.now(timezone.utc).isoformat()
+            store.append_batch([dict(_trade(i), received_utc=fresh) for i in range(10)])
+            store.flush_parquet(reason="TEST")
+            self.assertEqual(store.prune_journal(), 0)
+            self.assertEqual(store.connection.execute("SELECT count(*) FROM market_events").fetchone()[0], 10)
+            store.close()
+
+
+class ArchiveManifestIntegrityTests(unittest.TestCase):
+    def test_same_size_corruption_of_newest_file_forces_full_scan_without_loss_or_dupes(self):
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary), min_free_bytes=0)
+            store, count = _flushed_store(cfg, [3, 3, 3])
+            newest = cfg.parquet_dir / store._manifest_read()[0][-1]["path"]
+            _crash(store, cfg)
+            data = bytearray(newest.read_bytes())
+            data[len(data) // 2] ^= 0xFF  # flip a byte: size unchanged
+            newest.write_bytes(bytes(data))
+
+            recovered = Storage(cfg)
+            recovered.open()
+
+            self.assertEqual(recovered.parquet_recovery_mode, "FULL_SCAN")
+            self.assertTrue(recovered.parquet_recovery_reason.startswith("MANIFEST_FILE_HASH_MISMATCH"))
+            self.assertEqual(recovered.archive_quarantined_files, 1)
+            self.assertEqual(len(list(cfg.parquet_dir.rglob("*.parquet.corrupt-*"))), 1)
+            self.assertEqual(sorted(_archived_keys(cfg)), _expected(count))
+            self.assertEqual(recovered.archive_integrity_state, "VERIFIED_COMPLETE")
+            self.assertTrue(recovered.verify_archive(full=True)["ok"])
+            self.assertEqual(len(list(cfg.parquet_dir.glob("_archive_manifest.jsonl.superseded-*"))), 1)
+            recovered.close()
+
+    def test_file_replacement_is_detected(self):
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary), min_free_bytes=0)
+            store, count = _flushed_store(cfg, [2, 5])
+            entries = store._manifest_read()[0]
+            small = cfg.parquet_dir / entries[0]["path"]
+            large = cfg.parquet_dir / entries[1]["path"]
+            _crash(store, cfg)
+            small.write_bytes(large.read_bytes())  # a different, valid Parquet file
+
+            recovered = Storage(cfg)
+            recovered.open()
+
+            self.assertEqual(recovered.parquet_recovery_mode, "FULL_SCAN")
+            self.assertTrue(recovered.parquet_recovery_reason.startswith("MANIFEST_FILE_SIZE_MISMATCH"))
+            # The replacement's rows are duplicates of the other file; the original
+            # file's rows come back from the journal.
+            self.assertEqual(set(_archived_keys(cfg)), set(_expected(count)))
+            self.assertEqual(recovered.archive_integrity_state, "VERIFIED_COMPLETE")
+            recovered.close()
+
+    def test_missing_archive_part_is_rebuilt_from_journal(self):
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary), min_free_bytes=0)
+            store, count = _flushed_store(cfg, [2, 2, 2])
+            oldest = cfg.parquet_dir / store._manifest_read()[0][0]["path"]
+            _crash(store, cfg)
+            oldest.unlink()
+
+            recovered = Storage(cfg)
+            recovered.open()
+
+            self.assertEqual(recovered.parquet_recovery_mode, "FULL_SCAN")
+            self.assertTrue(recovered.parquet_recovery_reason.startswith("MANIFEST_FILE_MISSING"))
+            self.assertEqual(recovered.parquet_recovery_rows, 2)
+            self.assertEqual(sorted(_archived_keys(cfg)), _expected(count))
+            recovered.close()
+
+    def test_old_same_size_corruption_is_only_caught_by_full_verification(self):
+        # Documented limit: startup hashes the newest MANIFEST_TAIL_HASH_FILES only.
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary), min_free_bytes=0)
+            with patch.object(Storage, "MANIFEST_TAIL_HASH_FILES", 1):
+                store, count = _flushed_store(cfg, [2, 2, 2])
+                oldest = cfg.parquet_dir / store._manifest_read()[0][0]["path"]
+                _crash(store, cfg)
+                original = oldest.stat()
+                data = bytearray(oldest.read_bytes())
+                data[len(data) // 2] ^= 0xFF
+                oldest.write_bytes(bytes(data))
+                os.utime(oldest, ns=(original.st_atime_ns, original.st_mtime_ns))
+
+                recovered = Storage(cfg)
+                recovered.open()
+                self.assertTrue(recovered.parquet_recovery_mode.startswith("INCREMENTAL_FROM_ROWID_"))
+                self.assertTrue(recovered.verify_archive()["ok"])
+                audit = recovered.verify_archive(full=True)
+                self.assertFalse(audit["ok"])
+                self.assertTrue(audit["violations"][0].startswith("MANIFEST_FILE_HASH_MISMATCH"))
+                recovered.connection.close()
+                recovered.connection = None
+
+    def test_interrupted_checkpoint_write_is_counted_and_recovered_idempotently(self):
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary), min_free_bytes=0)
+            store, count = _flushed_store(cfg, [3])
+            store.append_batch([_trade(i) for i in range(3, 6)])
+            with patch.object(store, "_write_archive_checkpoint_file", side_effect=OSError("disk")):
+                store.flush_parquet(reason="TEST")
+            self.assertEqual(store.archive_checkpoint_write_failures, 1)
+            record = json.loads(store.archive_checkpoint_path.read_text(encoding="utf-8"))
+            self.assertEqual(record["through_rowid"], 3)  # older checkpoint kept
+            _crash(store, cfg)
+
+            recovered = Storage(cfg)
+            recovered.open()
+            self.assertEqual(recovered.parquet_recovery_mode, "INCREMENTAL_FROM_ROWID_3")
+            self.assertEqual(recovered.parquet_recovery_rows, 0)
+            self.assertEqual(sorted(_archived_keys(cfg)), _expected(6))
+            recovered.close()
+
+    def test_failed_parquet_fsync_publishes_nothing_and_keeps_buffer(self):
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary), min_free_bytes=0)
+            store, _ = _flushed_store(cfg, [2])
+            store.append_batch([_trade(2), _trade(3)])
+            with patch("kalshi15m.storage.os.fsync", side_effect=OSError(5, "I/O error")):
+                with self.assertRaises(OSError):
+                    store.flush_parquet(reason="TEST")
+            self.assertEqual(len(store.parquet_buffer), 2)
+            self.assertEqual(list(cfg.parquet_dir.rglob("*.partial")), [])
+            record = json.loads(store.archive_checkpoint_path.read_text(encoding="utf-8"))
+            self.assertEqual(record["through_rowid"], 2)
+            self.assertEqual(store.flush_parquet(reason="TEST"), 2)
+            self.assertEqual(sorted(_archived_keys(cfg)), _expected(4))
+            store.close()
+
+    def test_failed_manifest_fsync_freezes_checkpoint_and_next_start_adopts_files(self):
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary), min_free_bytes=0)
+            store, _ = _flushed_store(cfg, [2])
+            store.append_batch([_trade(2), _trade(3)])
+            with patch.object(store, "_manifest_append", side_effect=OSError(5, "I/O error")):
+                store.flush_parquet(reason="TEST")
+            self.assertEqual(store.archive_manifest_failures, 1)
+            self.assertTrue(store.archive_gap_pending)
+            self.assertEqual(store.archive_integrity_state, "INCOMPLETE")
+            store.append_batch([_trade(4)])
+            store.flush_parquet(reason="TEST")  # must not advance past the unlisted file
+            record = json.loads(store.archive_checkpoint_path.read_text(encoding="utf-8"))
+            self.assertEqual(record["through_rowid"], 2)
+            _crash(store, cfg)
+
+            recovered = Storage(cfg)
+            recovered.open()
+            self.assertEqual(recovered.parquet_recovery_mode, "INCREMENTAL_FROM_ROWID_2")
+            self.assertEqual(recovered.parquet_recovery_rows, 0)
+            self.assertEqual(sorted(_archived_keys(cfg)), _expected(5))
+            self.assertEqual(recovered.archive_integrity_state, "VERIFIED_COMPLETE")
+            self.assertTrue(recovered.verify_archive(full=True)["ok"])
+            recovered.close()
+
+    def test_torn_manifest_tail_is_ignored_then_truncated_by_next_append(self):
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary), min_free_bytes=0)
+            store, _ = _flushed_store(cfg, [2])
+            with store.archive_manifest_path.open("ab") as handle:
+                handle.write(b'{"seq":2,"prev":"abc"')  # crash mid-append
+            self.assertEqual(len(store._manifest_read()[0]), 1)
+            self.assertFalse(store.verify_archive()["ok"])
+            store.append_batch([_trade(2)])
+            store.flush_parquet(reason="TEST")
+            self.assertTrue(store.verify_archive(full=True)["ok"])
+            self.assertEqual(len(store._manifest_read()[0]), 2)
+            store.close()
+
+    def test_partial_recovery_by_index_cap_never_reports_complete_and_resumes_idempotently(self):
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary), min_free_bytes=0, recovery_index_max_bytes=8192)
+            # Below parquet_flush_rows (2000): 1500 archived rows, then 10 journal-only.
+            store, _ = _flushed_store(cfg, [1500])
+            store.append_batch([_trade(i) for i in range(1500, 1510)])
+            _crash(store, cfg)
+            # Only archive-side fingerprints grow the index (the journal pass just
+            # probes), so a full scan of 1500 archived rows exceeds the 8 KiB cap.
+            store.archive_checkpoint_path.unlink()
+
+            partial = Storage(cfg)
+            partial.open()
+            self.assertEqual(partial.parquet_recovery_state, "PARTIAL_RECOVERY_INDEX_BUDGET")
+            self.assertTrue(partial.archive_gap_pending)
+            self.assertEqual(partial.archive_integrity_state, "INCOMPLETE")
+            self.assertFalse(partial.archive_checkpoint_path.exists())
+            partial.connection.close()
+            partial.connection = None
+            _mark_unclean(cfg)
+
+            full = Storage(Settings(home=Path(temporary), min_free_bytes=0))
+            full.open()
+            self.assertEqual(full.archive_integrity_state, "VERIFIED_COMPLETE")
+            self.assertEqual(sorted(_archived_keys(cfg)), _expected(1510))  # no duplicates
+            full.close()
+
+    def test_restart_after_recovery_is_idempotent(self):
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary), min_free_bytes=0)
+            store, count = _flushed_store(cfg, [3])
+            store.append_batch([_trade(3), _trade(4)])
+            _crash(store, cfg)
+            for expected_rows in (2, 0, 0):
+                recovered = Storage(cfg)
+                recovered.open()
+                self.assertEqual(recovered.parquet_recovery_rows, expected_rows)
+                self.assertEqual(sorted(_archived_keys(cfg)), _expected(5))
+                recovered.connection.close()
+                recovered.connection = None
+                _mark_unclean(cfg)
+
+    def test_recovery_index_never_uses_temp_and_leaves_no_scratch(self):
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary), min_free_bytes=0)
+            store = Storage(cfg)
+            store.open()
+            store.append_batch([_trade(0)])
+            _crash(store, cfg)
+            with patch("kalshi15m.storage.sqlite3.connect", wraps=sqlite3.connect) as connect:
+                recovered = Storage(cfg)
+                recovered.open()
+            targets = [str(call.args[0]) for call in connect.call_args_list]
+            self.assertNotIn("", targets)
+            self.assertTrue(
+                any(str(cfg.recovery_workspace_dir) in target for target in targets), targets
+            )
+            self.assertEqual(list(cfg.recovery_workspace_dir.glob("archive-fingerprints-*")), [])
+            recovered.close()
+
+    def test_clean_stop_with_stale_checkpoint_runs_recovery_instead_of_assuming(self):
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary), min_free_bytes=0)
+            store, _ = _flushed_store(cfg, [2])
+            store.append_batch([_trade(2)])
+            with patch.object(store, "_write_archive_checkpoint_file", side_effect=OSError("disk")):
+                store.close()  # shutdown flush published the file; checkpoint write failed
+            (cfg.runtime_dir).mkdir(parents=True, exist_ok=True)
+            (cfg.runtime_dir / "status.json").write_text(
+                json.dumps({"service_state": "STOPPED", "raw_capture_state": "ENABLED"}),
+                encoding="utf-8",
+            )
+            recovered = Storage(cfg)
+            recovered.open()
+            self.assertNotEqual(recovered.parquet_recovery_state, "SKIPPED_PREVIOUS_RUN_STOPPED")
+            self.assertEqual(recovered.archive_integrity_state, "VERIFIED_COMPLETE")
+            self.assertEqual(sorted(_archived_keys(cfg)), _expected(3))
+            recovered.close()
+
+
+class WebSocketReconnectDedupeTests(unittest.TestCase):
+    def test_reconnect_reusing_sid_and_seq_journals_new_events(self):
+        class FakeWebSocket:
+            def __init__(self, messages):
+                self.messages = messages
+
+            def __aiter__(self):
+                async def iterate():
+                    for message in self.messages:
+                        yield json.dumps(message)
+                return iterate()
+
+        messages = [
+            {
+                "type": "orderbook_snapshot", "sid": 2, "seq": 1,
+                "msg": {
+                    "market_ticker": "SAMPLE",
+                    "yes_dollars_fp": [["0.40", "2.00"]],
+                    "no_dollars_fp": [["0.50", "3.00"]],
+                },
+            },
+            {
+                "type": "orderbook_delta", "sid": 2, "seq": 2,
+                "msg": {"market_ticker": "SAMPLE", "side": "yes", "price_dollars": "0.40", "delta_fp": "1.00"},
+            },
+        ]
+        with TemporaryDirectory() as root:
+            collector = Collector(Settings(home=Path(root)))
+            collector.open_tickers.add("SAMPLE")
+            keys = []
+            for connection in ("first", "second"):
+                collector.ws_connection_id = connection
+                collector.last_seq.clear()
+                collector.subscription_channel_by_sid[2] = "orderbook_delta"
+                collector.subscription_membership[2] = {"SAMPLE"}
+                asyncio.run(collector._receive_ws(FakeWebSocket(messages)))
+                while not collector.queue.empty():
+                    keys.append(collector.queue.get_nowait()["dedupe_key"])
+            self.assertEqual(len(keys), 4)
+            self.assertEqual(len(set(keys)), 4)
+
+
+class JournalBudgetTests(unittest.IsolatedAsyncioTestCase):
+    async def test_deltas_stop_at_budget_but_other_kinds_persist(self):
+        collector = Collector.__new__(Collector)
+        collector.cfg = Settings(home=Path("unused"), journal_budget_bytes=100)
+        collector.queue = asyncio.Queue()
+
+        class FakeStorage:
+            sqlite_bytes = 100
+
+        collector.storage = FakeStorage()
+        await collector.emit("websocket_orderbook", "orderbook_delta", {"x": 1}, market_ticker="KXBTC15M-X")
+        await collector.emit("websocket_orderbook", "orderbook_snapshot", {"x": 1}, market_ticker="KXBTC15M-X")
+        self.assertEqual(collector.queue.qsize(), 1)
+        self.assertEqual(collector.journal_delta_budget_skipped, 1)
+        collector.storage.sqlite_bytes = 99
+        await collector.emit("websocket_orderbook", "orderbook_delta", {"x": 1}, market_ticker="KXBTC15M-X")
+        self.assertEqual(collector.queue.qsize(), 2)
+
+
+class DiskFullFixtureTests(unittest.TestCase):
+    def test_enospc_on_parquet_keeps_journal_buffer_and_checkpoint(self):
+        import errno
+
+        with TemporaryDirectory() as temporary:
+            cfg = Settings(home=Path(temporary))
+            store = Storage(cfg)
+            store.open()
+            store.append_batch([_trade(0)])
+            store.flush_parquet(reason="TEST")
+            store.append_batch([_trade(1), _trade(2)])
+            with patch(
+                "kalshi15m.storage.pq.write_table",
+                side_effect=OSError(errno.ENOSPC, "No space left on device"),
+            ):
+                with self.assertRaises(OSError):
+                    store.flush_parquet(reason="TEST")
+            self.assertEqual(len(store.parquet_buffer), 2)
+            self.assertEqual(list(cfg.parquet_dir.rglob("*.partial")), [])
+            record = json.loads(store.archive_checkpoint_path.read_text(encoding="utf-8"))
+            self.assertEqual(record["through_rowid"], 1)
+            self.assertEqual(store.integrity_check(), "ok")
+            self.assertEqual(store.flush_parquet(reason="TEST"), 2)
+            record = json.loads(store.archive_checkpoint_path.read_text(encoding="utf-8"))
+            self.assertEqual(record["through_rowid"], 3)
+            self.assertEqual(sorted(_archived_keys(cfg)), ["trade-0", "trade-1", "trade-2"])
+            store.close()
+
+
+class ProcessJournalStorageTests(unittest.TestCase):
+    def test_child_process_owns_the_journal_and_archive_while_parent_keeps_paper_ledger(self):
+        from kalshi15m.journal_process import ProcessJournalStorage
+
+        with TemporaryDirectory() as tmp:
+            cfg = Settings(home=Path(tmp), min_free_bytes=0)
+            store = ProcessJournalStorage(cfg)
+            store.open()
+            try:
+                self.assertEqual(store.append_batch([_trade(i) for i in range(5)]), 5)
+                self.assertEqual(store.append_batch([_trade(i) for i in range(3, 8)]), 5)  # 2 duplicates; pipelined: returns the batch size
+                self.assertTrue(store.append_paper_record("p1", "PROFILE", "DECISION", {"eligible": False}))
+                self.assertEqual(store.flush_parquet(reason="TEST"), 8)
+                self.assertEqual(sorted(_archived_keys(cfg)), _expected(8))
+                time.sleep(1.5)  # one state interval
+                status = store.connection_status()
+                self.assertTrue(status["journal_process_alive"])
+                self.assertNotEqual(status["journal_process_pid"], os.getpid())
+                self.assertEqual(store.events_inserted, 8)
+                self.assertEqual(store.events_duplicate, 2)
+                self.assertEqual(status["storage_paper_ledger_record_count"], 1)
+                self.assertTrue(status["storage_paper_watermark_matches_disk"])
+                self.assertEqual(len(store.paper_records("PROFILE")), 1)
+                store.raw_capture_enabled = False
+                time.sleep(1.5)
+                self.assertFalse(store.raw_capture_enabled)
+            finally:
+                store.close()
+            self.assertFalse(store.child_alive)
+            again = Storage(cfg)
+            again.open()
+            self.assertEqual(again.archive_integrity_state, "VERIFIED_COMPLETE_CLEAN_STOP_CHECKPOINT")
+            self.assertEqual(again.connection.execute("SELECT count(*) FROM market_events").fetchone()[0], 8)
+            again.close()
+
+    def test_a_second_journal_process_cannot_share_the_journal(self):
+        from kalshi15m.journal_process import ProcessJournalStorage
+
+        with TemporaryDirectory() as tmp:
+            cfg = Settings(home=Path(tmp), min_free_bytes=0)
+            first = ProcessJournalStorage(cfg)
+            first.open()
+            try:
+                second = ProcessJournalStorage(cfg)
+                with self.assertRaises(RuntimeError) as caught:
+                    second.open()
+                self.assertIn("ALREADY_RUNNING", str(caught.exception))
+            finally:
+                first.close()
+
+    def test_losing_the_child_makes_appends_fail_instead_of_dropping_events(self):
+        from kalshi15m.journal_process import ProcessJournalStorage
+
+        with TemporaryDirectory() as tmp:
+            cfg = Settings(home=Path(tmp), min_free_bytes=0)
+            store = ProcessJournalStorage(cfg)
+            store.open()
+            store._process.kill()
+            store._process.join(10)
+            time.sleep(0.5)
+            with self.assertRaises(RuntimeError):
+                store.append_batch([_trade(1)])
+            self.assertFalse(store.connection_status()["journal_process_alive"])
+            store.close()
+
+
+class AsyncFlushTests(unittest.TestCase):
+    def _store(self, tmp, **kw):
+        cfg = Settings(home=Path(tmp), min_free_bytes=0, **kw)
+        store = Storage(cfg)
+        store.open()
+        store.async_flush = True
+        store.parquet_flush_rows = 5
+        return cfg, store
+
+    def test_appends_continue_while_a_flush_is_stuck_and_everything_lands(self):
+        import threading
+
+        with TemporaryDirectory() as tmp:
+            cfg, store = self._store(tmp)
+            gate, started = threading.Event(), threading.Event()
+            real = store._write_partitioned_parquet
+
+            def slow(rows):
+                started.set()
+                gate.wait(10)
+                return real(rows)
+
+            store._write_partitioned_parquet = slow
+            store.append_batch([_trade(i) for i in range(5)])  # reaches the threshold: flush starts
+            self.assertTrue(started.wait(5))
+            began = time.monotonic()
+            store.append_batch([_trade(i) for i in range(5, 9)])  # must not wait for the stuck flush
+            self.assertLess(time.monotonic() - began, 2.0)
+            self.assertTrue(store.connection_status()["parquet_flush_in_flight"])
+            gate.set()
+            store._write_partitioned_parquet = real
+            store.flush_parquet(reason="TEST")  # drains the background flush, then writes the rest
+            self.assertEqual(sorted(_archived_keys(cfg)), _expected(9))
+            record = json.loads(store.archive_checkpoint_path.read_text(encoding="utf-8"))
+            self.assertEqual(record["through_rowid"], 9)  # checkpoints stayed ordered
+            self.assertTrue(store.verify_archive(full=True)["ok"])
+            store.close()
+
+    def test_failed_background_flush_keeps_its_rows_and_they_are_archived_later(self):
+        with TemporaryDirectory() as tmp:
+            cfg, store = self._store(tmp)
+            real, calls = store._write_partitioned_parquet, []
+
+            def fail_once(rows):
+                calls.append(1)
+                if len(calls) == 1:
+                    raise OSError(5, "I/O error")
+                return real(rows)
+
+            store._write_partitioned_parquet = fail_once
+            store.append_batch([_trade(i) for i in range(5)])
+            store._flush_future.exception(timeout=10)  # wait for the failure without draining
+            store.append_batch([_trade(5)])
+            store.flush_parquet(reason="TEST")  # drains: requeues the failed rows, writes all
+            self.assertEqual(store.archive_async_flush_failures, 1)
+            self.assertEqual(sorted(_archived_keys(cfg)), _expected(6))
+            store.close()
+            again = Storage(cfg)
+            again.open()
+            self.assertEqual(again.archive_integrity_state, "VERIFIED_COMPLETE_CLEAN_STOP_CHECKPOINT")
+            again.close()
+
+    def test_background_flush_prunes_with_its_own_connection(self):
+        with TemporaryDirectory() as tmp:
+            cfg, store = self._store(tmp, journal_retention_seconds=3600)
+            store.PRUNE_BATCH_ROWS = 2
+            store.PRUNE_MIN_INTERVAL_SECONDS = 0
+            store.append_batch([_trade(i) for i in range(12)])
+            store.flush_parquet(reason="TEST")
+            store.flush_parquet(reason="TEST")
+            remaining = store.connection.execute("SELECT count(*) FROM market_events").fetchone()[0]
+            self.assertLessEqual(remaining, 2)  # less than one batch plus the checkpoint row is left
+            self.assertEqual(store.journal_pruned_rows, 12 - remaining)
+            self.assertEqual(sorted(_archived_keys(cfg)), _expected(12))
+            store.close()
+
+
+class JournalPipeTimingTests(unittest.TestCase):
+    def test_status_reports_where_a_batch_spends_its_time(self):
+        from kalshi15m.journal_process import ProcessJournalStorage
+
+        with TemporaryDirectory() as tmp:
+            store = ProcessJournalStorage(Settings(home=Path(tmp), min_free_bytes=0))
+            store.open()
+            try:
+                store.append_batch([_trade(i) for i in range(20)])
+                store.append_batch([_trade(i) for i in range(20, 40)])
+                timing = store.connection_status()["journal_pipe_ms_ema"]
+                self.assertTrue({"rpc", "send", "gap", "child_wall", "child_cpu"} <= set(timing))
+            finally:
+                store.close()
+
+
+class PipelinedAppendTests(unittest.TestCase):
+    """The proxy sends batch N before collecting N-1's ack; failed batches are re-sent in order."""
+
+    def _stub(self, outcomes):
+        from concurrent.futures import Future
+        from kalshi15m.journal_process import ProcessJournalStorage
+
+        class Stub(ProcessJournalStorage):
+            def _request(self, kind, *payload):
+                self.sent.append((kind, payload[0] if payload else None))
+                future = Future()
+                if self.outcomes.pop(0) == "ok":
+                    future.set_result(1)
+                else:
+                    future.set_exception(RuntimeError("child failed"))
+                return future
+
+        with TemporaryDirectory() as tmp:
+            stub = Stub(Settings(home=Path(tmp), min_free_bytes=0))
+        stub.sent, stub.outcomes = [], list(outcomes)
+        stub.child_alive = True
+        return stub
+
+    def test_send_precedes_the_previous_ack_and_settle_collects_the_last(self):
+        stub = self._stub(["ok", "ok"])
+        stub.append_batch(["b1"])
+        self.assertEqual(stub._inflight[1], ["b1"])  # returned without collecting its own ack
+        stub.append_batch(["b2"])
+        self.assertEqual([p for _, p in stub.sent], [["b1"], ["b2"]])
+        stub._settle()
+        self.assertIsNone(stub._inflight)
+        self.assertEqual(stub._failed, [])
+
+    def test_a_failed_batch_is_resent_before_any_new_batch_in_order(self):
+        stub = self._stub(["fail", "ok", "ok", "ok"])
+        stub.append_batch(["b1"])
+        stub.append_batch(["b2"])  # collects b1's failure
+        self.assertEqual(stub._failed, [["b1"]])
+        stub.append_batch(["b3"])  # re-sends b1 first
+        self.assertEqual([p for _, p in stub.sent], [["b1"], ["b2"], ["b1"], ["b3"]])
+        self.assertEqual(stub._failed, [])
+
+    def test_a_batch_that_keeps_failing_raises_and_stays_queued_and_blocks_new_sends(self):
+        stub = self._stub(["fail", "ok", "fail"])
+        stub.append_batch(["b1"])
+        stub.append_batch(["b2"])
+        with self.assertRaises(RuntimeError):
+            stub.append_batch(["b3"])  # re-send of b1 fails
+        self.assertEqual(stub._failed, [["b1"]])  # kept for the next attempt, nothing dropped
+        self.assertEqual([p for _, p in stub.sent], [["b1"], ["b2"], ["b1"]])  # b3 never sent
+
+
+
+class NamedStackSamplingTests(unittest.TestCase):
+    def test_a_named_request_is_consumed_and_logged_separately(self):
+        import faulthandler
+        from kalshi15m.worker import start_stack_sampling
+
+        with TemporaryDirectory() as tmp:
+            runtime, logs = Path(tmp) / "runtime", Path(tmp) / "logs"
+            runtime.mkdir()
+            logs.mkdir()
+            (runtime / "journal_stack_sample.txt").write_text("0.2 1", encoding="utf-8")
+            (runtime / "stack_sample.txt").write_text("0.2 1", encoding="utf-8")  # the worker's own request
+            try:
+                self.assertTrue(start_stack_sampling(runtime, logs, "journal_stack_sample", "journal_stack_samples.log"))
+                self.assertFalse((runtime / "journal_stack_sample.txt").exists())
+                self.assertTrue((runtime / "journal_stack_sample.started.txt").exists())
+                self.assertTrue((runtime / "stack_sample.txt").exists())  # the other process's request is untouched
+                self.assertTrue((logs / "journal_stack_samples.log").exists())
+            finally:
+                faulthandler.cancel_dump_traceback_later()
+
+
+class WebSocketCloseDetailTests(unittest.TestCase):
+    def test_close_detail_names_code_reason_and_session_length(self):
+        from kalshi15m.worker import Collector
+
+        class FakeSocket:
+            close_code = 1001
+            close_reason = "going away"
+
+        detail = Collector._close_detail(FakeSocket(), time.monotonic() - 12.0)
+        self.assertIn("close_code=1001", detail)
+        self.assertIn("going away", detail)
+        self.assertRegex(detail, r"session_s=1[12]\.\d")
+        self.assertIn("close_code=None", Collector._close_detail(object(), time.monotonic()))  # no attribute: still safe
+
+
+class LoopLagMonitorTests(unittest.TestCase):
+    def test_a_blocked_event_loop_shows_up_as_lag_and_old_samples_expire(self):
+        import asyncio
+        from kalshi15m.worker import LoopLagMonitor
+
+        async def scenario():
+            monitor = LoopLagMonitor()
+            task = asyncio.create_task(monitor.run())
+            await asyncio.sleep(0.2)
+            time.sleep(0.4)  # block the loop the way a long synchronous call would
+            await asyncio.sleep(0.2)
+            task.cancel()
+            return monitor
+
+        monitor = asyncio.run(scenario())
+        self.assertGreaterEqual(monitor.max_ms(30.0), 300)
+        self.assertEqual(monitor.max_ms(30.0, now=time.monotonic() + 1000), 0.0)  # window passed: nothing
+
+    def test_samples_older_than_two_minutes_are_dropped(self):
+        from kalshi15m.worker import LoopLagMonitor
+
+        monitor = LoopLagMonitor()
+        monitor.record(5.0, now=0.0)
+        monitor.record(0.01, now=200.0)
+        self.assertEqual(len(monitor.samples), 1)
+        self.assertEqual(monitor.max_ms(30.0, now=200.0), 10.0)
+
+
+class StallWatchdogAndCatalogScanTests(unittest.TestCase):
+    def test_watchdog_names_the_call_that_blocks_the_event_loop_once_per_stall(self):
+        import asyncio
+        import logging
+        from kalshi15m.worker import LoopLagMonitor
+
+        def blocking_call_for_test():
+            time.sleep(1.4)
+
+        async def scenario(monitor):
+            task = asyncio.create_task(monitor.run())
+            await asyncio.sleep(0.2)
+            monitor.start_watchdog(__import__("threading").get_ident(), threshold_seconds=0.5,
+                                   log=logging.getLogger("stall-test"))
+            blocking_call_for_test()
+            await asyncio.sleep(0.4)
+            task.cancel()
+            monitor.watchdog_stop.set()
+
+        monitor = LoopLagMonitor()
+        with self.assertLogs("stall-test", level="WARNING") as captured:
+            asyncio.run(scenario(monitor))
+        text = "\n".join(captured.output)
+        self.assertIn("blocking_call_for_test", text)
+        self.assertEqual(len(captured.records), 1)  # one report per stall, not one per check
+
+    def test_combined_duration_pattern_matches_exactly_what_the_three_patterns_did(self):
+        from kalshi15m.discovery import SERIES_DURATION_PATTERN, SERIES_DURATION_PATTERNS, series_catalog_candidate
+
+        for text in ("every 15 minutes", "15-min contract", "settles each 900 seconds", "fifteen minutes",
+                     "Fifteen-Minute", "150 minutes", "no duration here", "1500 seconds", "15mins"):
+            self.assertEqual(bool(SERIES_DURATION_PATTERN.search(text)),
+                             any(p.search(text) for p in SERIES_DURATION_PATTERNS), text)
+        self.assertTrue(series_catalog_candidate({"ticker": "X", "title": "BTC price every 15 minutes"}))
+        self.assertFalse(series_catalog_candidate({"ticker": "X15M", "title": "daily close"}))  # ticker text ignored
+
+    def test_catalog_changes_with_precomputed_candidates_is_identical_and_scans_once(self):
+        from unittest.mock import patch
+        import kalshi15m.discovery as discovery
+
+        prior = {"series": [{"series_ticker": "KEEP"}, {"series_ticker": "REMOVE"}]}
+        fresh = [{"ticker": "KEEP", "title": "every 15 minutes"}, {"ticker": "ADD", "title": "every 15 minutes"}]
+        candidates = discovery.candidate_series_tickers(fresh)
+        with patch.object(discovery, "candidate_series_tickers") as scan:
+            self.assertEqual(discovery.series_catalog_changes(prior, fresh, candidates), (["ADD"], ["REMOVE"]))
+            scan.assert_not_called()  # the caller's scan is reused
+        self.assertEqual(discovery.series_catalog_changes(prior, fresh), (["ADD"], ["REMOVE"]))
+
+
+class EventLoopCpuDietTests(unittest.TestCase):
+    def test_cached_best_prices_match_a_brute_force_scan_over_random_books(self):
+        import random
+
+        rng = random.Random(7)
+        book = OrderBook()
+        book.snapshot({"yes_dollars_fp": [["0.40", "5"], ["0.35", "2"]], "no_dollars_fp": [["0.55", "3"]]})
+        for step in range(3000):
+            side = rng.choice(["yes", "no"])
+            levels = book.yes if side == "yes" else book.no
+            price = Decimal(rng.randrange(1, 99)) / 100
+            have = levels.get(price, Decimal(0))
+            delta = -have if (have and rng.random() < 0.45) else Decimal(rng.randrange(1, 5))
+            book.delta({"side": side, "price_dollars": str(price), "delta_fp": str(delta)})
+            if step % 500 == 0:  # a fresh snapshot resets everything
+                book.snapshot({"yes_dollars_fp": [[str(price), "1"]], "no_dollars_fp": []})
+            quotes = book.quotes()
+            best_yes, best_no = max(book.yes, default=None), max(book.no, default=None)
+            self.assertEqual(quotes["yes_bid"], str(best_yes) if best_yes is not None else None)
+            self.assertEqual(quotes["no_bid"], str(best_no) if best_no is not None else None)
+            self.assertEqual(quotes["yes_ask"], str(Decimal("1.0000") - best_no) if best_no is not None else None)
+            self.assertEqual(quotes["no_ask_size"], str(book.yes[best_yes]) if best_yes is not None else None)
+
+    def test_book_recovers_if_the_level_dicts_are_replaced_behind_its_back(self):
+        book = OrderBook()
+        book.snapshot({"yes_dollars_fp": [["0.40", "5"]], "no_dollars_fp": [["0.55", "3"]]})
+        book.yes = {Decimal("0.60"): Decimal("1")}  # someone assigned a new dict
+        self.assertEqual(book.quotes()["yes_bid"], "0.60")
+        book.no = {}
+        self.assertIsNone(book.quotes()["no_bid"])
+
+    def test_background_status_writes_do_not_block_updates_and_the_latest_wins(self):
+        import threading
+
+        with TemporaryDirectory() as root:
+            status = RuntimeStatus(Settings(home=Path(root)))
+            status.async_file_writes = True
+            status.status_file_write_interval_seconds = 0.0
+            gate = threading.Event()
+            original = status._write_payload_locked
+
+            def slow(payload):
+                gate.wait(5)
+                return original(payload)
+
+            status._write_payload_locked = slow
+            began = time.monotonic()
+            for value in range(1, 6):
+                status.update(queue_depth=value)  # the write thread is stuck; none of these may wait
+            self.assertLess(time.monotonic() - began, 1.0)
+            gate.set()
+            deadline = time.monotonic() + 5
+            path = Path(root) / "runtime" / "status.json"
+            while time.monotonic() < deadline:
+                try:  # the writer may be mid-replace while we read (Windows): retry, do not error
+                    if path.exists() and json.loads(path.read_text())["queue_depth"] == 5:
+                        break
+                except (OSError, ValueError):
+                    pass
+                time.sleep(0.05)
+            self.assertEqual(json.loads(path.read_text())["queue_depth"], 5)
+
+    def test_forced_status_writes_stay_synchronous_even_when_background_writes_are_on(self):
+        with TemporaryDirectory() as root:
+            status = RuntimeStatus(Settings(home=Path(root)))
+            status.async_file_writes = True
+            status.update(service_state="STOPPED")  # service_state forces a write
+            saved = json.loads((Path(root) / "runtime" / "status.json").read_text())
+            self.assertEqual(saved["service_state"], "STOPPED")  # on disk before update() returned
+
+    def test_mark_quote_updates_the_three_maps_in_place_like_the_copying_version(self):
+        with TemporaryDirectory() as root:
+            status = RuntimeStatus(Settings(home=Path(root)))
+            status.update(
+                orderbook_quote_last_update_utc_by_ticker={"OLD": "t0"},
+                orderbook_quote_freshness_by_ticker={"OLD": "STALE"},
+                orderbook_quote_age_seconds_by_ticker={"OLD": 9.0},
+            )
+            ages = status.data["orderbook_quote_age_seconds_by_ticker"]
+            status.mark_quote("NEW", "FRESH", "t1")
+            snap = status.snapshot()
+            self.assertEqual(snap["orderbook_quote_last_update_utc_by_ticker"], {"OLD": "t0", "NEW": "t1"})
+            self.assertEqual(snap["orderbook_quote_freshness_by_ticker"], {"OLD": "STALE", "NEW": "FRESH"})
+            self.assertEqual(snap["orderbook_quote_age_seconds_by_ticker"], {"OLD": 9.0, "NEW": 0.0})
+            self.assertIs(status.data["orderbook_quote_age_seconds_by_ticker"], ages)  # no per-message copy
+            self.assertEqual(snap["heartbeat_utc"], "t1")
+
+    def test_sequence_state_publishes_on_transitions_but_not_on_every_delta(self):
+        with TemporaryDirectory() as root:
+            collector = Collector(Settings(home=Path(root)))
+            published = []
+            real = collector._publish_orderbook_sequence_state
+            collector._publish_orderbook_sequence_state = lambda **kw: (published.append(1), real(**kw))[1]
+            collector._record_orderbook_sequence(5, 1, snapshot=True)    # snapshot: publishes at once
+            collector._record_orderbook_sequence(5, 2, snapshot=False)   # first delta: state changes
+            before = len(published)
+            for seq in range(3, 203):
+                collector._record_orderbook_sequence(5, seq, snapshot=False)  # steady state
+            self.assertLessEqual(len(published) - before, 1)  # at most one time-based refresh in a fast loop
+            self.assertEqual(collector.orderbook_sequence_by_sid[5]["delta_count"], 201)  # counters are exact
+            published_before_snapshot = len(published)
+            collector._record_orderbook_sequence(5, 203, snapshot=True)
+            self.assertEqual(len(published), published_before_snapshot + 1)
+
+    def test_websocket_compression_defaults_to_deflate_and_can_be_disabled(self):
+        def connect_args(**settings):
+            seen = {}
+
+            class FakeConnection:
+                async def __aenter__(self):
+                    collector.stopping.set()
+                    raise ConnectionError("stop after capturing the connect arguments")
+
+                async def __aexit__(self, *exc):
+                    return False
+
+            with TemporaryDirectory() as root:
+                collector = Collector(Settings(home=Path(root), **settings))
+
+                def fake_connect(_url, **kwargs):
+                    seen.update(kwargs)
+                    return FakeConnection()
+
+                with (
+                    patch("kalshi15m.worker.ws_auth_headers", return_value={"k": "v"}),
+                    patch("kalshi15m.worker.websockets.connect", side_effect=fake_connect),
+                ):
+                    asyncio.run(collector.websocket_loop())
+            return seen
+
+        self.assertEqual(connect_args()["compression"], "deflate")  # measured: "none" doubled reconnects
+        self.assertIsNone(connect_args(ws_compression="none")["compression"])
+
+
+class RecentKeysWindowTests(unittest.TestCase):
+    def test_window_is_bounded_ordered_and_trims_in_constant_time(self):
+        from collections import OrderedDict
+
+        with TemporaryDirectory() as tmp:
+            store = Storage(Settings(home=Path(tmp), min_free_bytes=0))
+            store.open()
+            try:
+                store.RECENT_KEYS_MAX = 1000
+                self.assertIsInstance(store._recent_keys, OrderedDict)
+                for start in range(0, 6000, 500):
+                    store.append_batch([_trade(i) for i in range(start, start + 500)])
+                self.assertEqual(len(store._recent_keys), 1000)
+                kept = list(store._recent_keys)
+                self.assertEqual(kept[0], "trade-5000")   # oldest kept = 1000 newest
+                self.assertEqual(kept[-1], "trade-5999")
+                self.assertEqual(store.append_batch([_trade(5999), _trade(6000)]), 1)  # recent duplicate skipped
+            finally:
+                store.close()
+
+    def test_directory_size_reconcile_is_hourly_not_every_five_minutes(self):
+        with TemporaryDirectory() as tmp:
+            store = Storage(Settings(home=Path(tmp), min_free_bytes=0))
+            self.assertEqual(store.parquet_size_reconcile_interval_seconds, 3600.0)
+
+
+class StatusWriteOrderingTests(unittest.TestCase):
+    def test_a_forced_stopped_write_is_never_undone_by_an_older_background_write(self):
+        import threading
+
+        with TemporaryDirectory() as root:
+            status = RuntimeStatus(Settings(home=Path(root)))
+            status.async_file_writes = True
+            status.status_file_write_interval_seconds = 0.0
+            gate = threading.Event()
+            original = status._write_payload_locked
+            order = []
+
+            def gated(payload):
+                gate.wait(5)
+                order.append(json.loads(payload)["service_state"])
+                return original(payload)
+
+            status._write_payload_locked = gated
+            status.data["service_state"] = "RUNNING"
+            status.update(queue_depth=1)                    # background write of a RUNNING payload, stuck on the gate
+            time.sleep(0.2)
+            status.update(queue_depth=2)                    # a second RUNNING payload queued behind the stuck one
+            forced = threading.Thread(target=lambda: status.update(service_state="STOPPED"))
+            forced.start()                                   # forced write, waits for the file lock
+            time.sleep(0.2)
+            gate.set()
+            forced.join(10)
+            time.sleep(0.5)
+            saved = json.loads((Path(root) / "runtime" / "status.json").read_text())
+            self.assertEqual(saved["service_state"], "STOPPED")  # the old RUNNING payload did not overwrite it
+
+    def test_stale_sequence_numbers_are_dropped(self):
+        with TemporaryDirectory() as root:
+            status = RuntimeStatus(Settings(home=Path(root)))
+            status._write_payload(5, json.dumps({"service_state": "STOPPED"}))
+            status._write_payload(4, json.dumps({"service_state": "RUNNING"}))  # older: ignored
+            saved = json.loads((Path(root) / "runtime" / "status.json").read_text())
+            self.assertEqual(saved["service_state"], "STOPPED")

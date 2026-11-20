@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import json
 import logging
 import logging.handlers
 import os
 import shutil
+import sys
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -30,6 +33,7 @@ from .discovery import (
     series_catalog_changes,
     utc_now,
 )
+from .journal_process import make_storage
 from .storage import Storage
 from .paper import (
     crossmarket_performance_summary,
@@ -66,15 +70,149 @@ def configure_logging(cfg: Settings) -> None:
     root.addHandler(handler)
 
 
+GIL_SWITCH_INTERVAL_SECONDS = 0.0005
+
+
+def tune_gil_switch_interval() -> None:
+    """Stop the writer thread convoying behind the event loop for the GIL.
+
+    The writer calls the zstd compressor once per event; that call releases the GIL and
+    must re-acquire it from the busy event-loop thread, which at the default 5 ms switch
+    interval is handed over only every few ms. Measured on the same 4,000-event batch:
+    65 ms alone, 75,730 ms against a CPU-busy thread at 5 ms, 145 ms at 0.5 ms. Live
+    append_prepare was 3-4 s per cycle against ~120 ms of real work.
+    """
+    sys.setswitchinterval(GIL_SWITCH_INTERVAL_SECONDS)
+
+
+class LoopLagMonitor:
+    """How late does the event loop run a 50 ms timer? A blocked loop leaves the WebSocket unread
+    (keepalive timeouts, server-side slow-consumer drops), so each disconnect records this."""
+
+    TICK_SECONDS = 0.05
+
+    def __init__(self) -> None:
+        self.samples: collections.deque[tuple[float, float]] = collections.deque()
+        self.last_tick = time.monotonic()
+        self.watchdog_stop = threading.Event()
+
+    def record(self, lag_seconds: float, now: float | None = None) -> None:
+        now = time.monotonic() if now is None else now
+        self.samples.append((now, lag_seconds))
+        while self.samples and now - self.samples[0][0] > 120:
+            self.samples.popleft()
+
+    def max_ms(self, window_seconds: float = 30.0, now: float | None = None) -> float:
+        now = time.monotonic() if now is None else now
+        return round(1000 * max((lag for t, lag in self.samples if now - t <= window_seconds), default=0.0), 1)
+
+    async def run(self) -> None:
+        while True:
+            started = time.monotonic()
+            await asyncio.sleep(self.TICK_SECONDS)
+            self.last_tick = time.monotonic()
+            self.record(max(0.0, self.last_tick - started - self.TICK_SECONDS))
+
+    def start_watchdog(self, loop_thread_id: int, threshold_seconds: float = 2.0, log: logging.Logger | None = None) -> None:
+        """A thread (it still runs while the loop is blocked) logs the loop thread's stack once
+        per stall of threshold_seconds or more, naming the call that is holding the loop."""
+        import traceback
+
+        logger = log or LOG
+
+        def watch() -> None:
+            reported_tick = None
+            while not self.watchdog_stop.wait(0.25):
+                tick = self.last_tick
+                stalled = time.monotonic() - tick
+                if stalled >= threshold_seconds and reported_tick != tick:
+                    reported_tick = tick
+                    frame = sys._current_frames().get(loop_thread_id)
+                    stack = "".join(traceback.format_stack(frame)[-12:]) if frame is not None else "(no frame)"
+                    logger.warning("event loop stalled %.1fs; it is executing:\n%s", stalled, stack)
+
+        threading.Thread(target=watch, name="loop-stall-watchdog", daemon=True).start()
+
+
+def parse_stack_sample_config(text: str) -> tuple[float, float] | None:
+    """'<interval_s> <duration_s>' -> (interval, duration), or None if absent/invalid/out of range."""
+    parts = text.split()
+    try:
+        interval, duration = float(parts[0]), float(parts[1])
+    except (IndexError, ValueError):
+        return None
+    return (interval, duration) if 0.2 <= interval <= 60 and 1 <= duration <= 1800 else None
+
+
+def start_stack_sampling(
+    runtime_dir: Path,
+    log_dir: Path,
+    request: str = "stack_sample",
+    log_name: str = "stack_samples.log",
+) -> bool:
+    """Opt-in poor-man's profiler: dump every thread's stack every N seconds for a bounded time.
+
+    Enabled only if <runtime>/stack_sample.txt holds '<interval> <duration>'. Uses stdlib
+    faulthandler, writes <logs>/stack_samples.log, and cancels itself after the duration.
+    """
+    import faulthandler
+
+    try:
+        config = parse_stack_sample_config((runtime_dir / f"{request}.txt").read_text(encoding="utf-8"))
+    except OSError:
+        return False
+    if config is None:
+        return False
+    interval, duration = config
+    try:  # consume the request so a running process starts exactly one window per file
+        os.replace(runtime_dir / f"{request}.txt", runtime_dir / f"{request}.started.txt")
+    except OSError:
+        return False
+    handle = (log_dir / log_name).open("a", buffering=1, encoding="utf-8")
+    faulthandler.dump_traceback_later(interval, repeat=True, file=handle)
+    timer = threading.Timer(duration, faulthandler.cancel_dump_traceback_later)
+    timer.daemon = True
+    timer.start()
+    return True
+
+
+def source_fingerprint() -> dict[str, Any]:
+    """Git HEAD of the running checkout, so status proves which code is live."""
+    import subprocess
+
+    root = Path(__file__).resolve().parents[2]
+    try:
+        run = lambda *a: subprocess.run(  # noqa: E731
+            ["git", "-C", str(root), *a], capture_output=True, text=True, timeout=10, check=True
+        ).stdout.strip()
+        return {"source_commit": run("rev-parse", "HEAD"), "source_dirty": bool(run("status", "--porcelain"))}
+    except Exception:  # no git on PATH or not a checkout: say so, never guess
+        return {"source_commit": "UNKNOWN", "source_dirty": None}
+
+
 class RuntimeStatus:
     def __init__(self, cfg: Settings) -> None:
         self.cfg = cfg
         self.lock = threading.RLock()
         self.status_file_write_interval_seconds = 1.0
+        # The collector turns this on: the 700 KB status.json write + replace on the USB volume was
+        # ~15% of the event loop's busy time when done inline. Forced writes (state changes) stay
+        # synchronous so a transition is on disk before the caller continues.
+        self.async_file_writes = False
+        self._file_lock = threading.Lock()
+        self._write_wakeup = threading.Event()
+        self._pending_payload: tuple[int, str] | None = None
+        self._file_writer: threading.Thread | None = None
+        # Every serialized payload gets a sequence number and a stale one is never written, so a
+        # queued background write can not land after (and undo) a later forced write such as the
+        # final service_state=STOPPED that tells the next start the stop was clean.
+        self._write_seq = 0
+        self._last_written_seq = 0
         self.last_status_file_write_monotonic: float | None = None
         self.started_utc = utc_now()
         self.data: dict[str, Any] = {
             "service": "kalshi-15m-native",
+            **source_fingerprint(),
             "service_state": "STARTING",
             "mode": "PAPER_ONLY",
             "runtime_home": str(cfg.home.resolve()),
@@ -242,6 +380,17 @@ class RuntimeStatus:
             self.data["heartbeat_utc"] = received
             self._write_locked()
 
+    def mark_quote(self, ticker: str, state: str, utc: str) -> None:
+        """Per-quote freshness bookkeeping, in place: the previous version copied three
+        ~1,000-entry dicts on every order-book message (~9% of the loop's busy time)."""
+        with self.lock:
+            data = self.data
+            data.setdefault("orderbook_quote_last_update_utc_by_ticker", {})[ticker] = utc
+            data.setdefault("orderbook_quote_freshness_by_ticker", {})[ticker] = state
+            data.setdefault("orderbook_quote_age_seconds_by_ticker", {})[ticker] = 0.0
+            data["heartbeat_utc"] = utc
+            self._write_locked()
+
     def mark_rest_poll(
         self,
         channel: str,
@@ -357,12 +506,45 @@ class RuntimeStatus:
         ):
             return
         self.last_status_file_write_monotonic = now
+        payload = json.dumps(self.data, indent=2)
+        self._write_seq += 1
+        seq = self._write_seq
+        if self.async_file_writes and not force:
+            self._pending_payload = (seq, payload)  # latest wins
+            if self._file_writer is None:
+                self._file_writer = threading.Thread(
+                    target=self._file_writer_main, name="status-file-writer", daemon=True
+                )
+                self._file_writer.start()
+            self._write_wakeup.set()
+            return
+        self._pending_payload = None  # anything queued is older than this write
+        self._write_payload(seq, payload)
+
+    def _file_writer_main(self) -> None:
+        while True:
+            self._write_wakeup.wait()
+            self._write_wakeup.clear()
+            pending, self._pending_payload = self._pending_payload, None
+            if pending is not None:
+                try:
+                    self._write_payload(*pending)
+                except Exception:
+                    LOG.warning("status.json background write failed", exc_info=True)
+
+    def _write_payload(self, seq: int, payload: str) -> None:
+        with self._file_lock:
+            if seq < self._last_written_seq:
+                return  # a newer write already reached the disk
+            self._last_written_seq = seq
+            self._write_payload_locked(payload)
+
+    def _write_payload_locked(self, payload: str) -> None:
         self.cfg.runtime_dir.mkdir(parents=True, exist_ok=True)
         path = self.cfg.runtime_dir / "status.json"
         temporary = path.with_name(
             f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
         )
-        payload = json.dumps(self.data, indent=2)
         for attempt in range(STATUS_FILE_REPLACE_RETRIES):
             try:
                 temporary.write_text(payload, encoding="utf-8")
@@ -414,11 +596,22 @@ def status_server(status: RuntimeStatus, cfg: Settings) -> ThreadingHTTPServer:
 
 
 class Collector:
+    loop_lag = LoopLagMonitor()  # replaced per instance in __init__
+    # Group commit: one fsync per drain of up to this many queued events. Measured
+    # ~1.3 s per commit on the USB research volume, so 500/commit capped throughput
+    # near 400 events/s. Never waits for more events; durability is unchanged.
+    WRITER_BATCH_MAX = 4000
+
     def __init__(self, cfg: Settings = settings) -> None:
+        tune_gil_switch_interval()
         self.cfg = cfg
+        cfg.ensure_dirs()
+        start_stack_sampling(cfg.runtime_dir, cfg.log_dir)
+        self.writer_timing_ema = {}
         self.api = PublicKalshiAPI()
         self.status = RuntimeStatus(cfg)
-        self.storage = Storage(cfg)
+        self.storage = make_storage(cfg)
+        self.loop_lag = LoopLagMonitor()
         self.queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=cfg.max_queue_events)
         self.writer_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="journal-writer")
         self.stopping = asyncio.Event()
@@ -502,6 +695,9 @@ class Collector:
         self.crossmarket_performance_dirty = True
         self.queue_dropped = 0
         self.status_http: ThreadingHTTPServer | None = None
+        # Kalshi restarts sid/seq numbering on every socket; scope WS dedupe keys
+        # to the connection so a reconnect never collides with earlier sessions.
+        self.ws_connection_id = uuid.uuid4().hex[:12]
         self.stop_file = cfg.runtime_dir / "stop.request"
         try:
             self.strategy_config, self.strategy_config_hash = load_frozen_strategy(
@@ -737,6 +933,25 @@ class Collector:
         exchange_ts: Any = None,
         dedupe_key: str | None = None,
     ) -> None:
+        if kind == "ticker":
+            cfg = getattr(self, "cfg", None)
+            prefixes = cfg.journal_ticker_series_prefixes if cfg is not None else ()
+            if prefixes and not str(market_ticker or "").startswith(prefixes):
+                self.journal_ticker_skipped = getattr(self, "journal_ticker_skipped", 0) + 1
+                return
+        if kind == "orderbook_delta":
+            # Deltas are applied to the in-memory book upstream; only persistence
+            # is skipped. Paper fills embed their own arrival book snapshot.
+            cfg = getattr(self, "cfg", None)
+            prefixes = cfg.journal_delta_series_prefixes if cfg is not None else ()
+            budget = cfg.journal_budget_bytes if cfg is not None else 0
+            storage = getattr(self, "storage", None)
+            if prefixes and not str(market_ticker or "").startswith(prefixes):
+                self.journal_delta_skipped = getattr(self, "journal_delta_skipped", 0) + 1
+                return
+            if budget and storage is not None and storage.sqlite_bytes >= budget:
+                self.journal_delta_budget_skipped = getattr(self, "journal_delta_budget_skipped", 0) + 1
+                return
         event = {
             "channel": channel,
             "kind": kind,
@@ -791,12 +1006,13 @@ class Collector:
             except TimeoutError:
                 await flush_aged_buffer("IDLE_BUFFER_AGE")
                 continue
-            while len(batch) < 500:
+            while len(batch) < self.WRITER_BATCH_MAX:
                 try:
                     batch.append(self.queue.get_nowait())
                 except asyncio.QueueEmpty:
                     break
             retry_count = 0
+            cycle_started = time.monotonic()  # queue wait excluded
             while True:
                 try:
                     await loop.run_in_executor(
@@ -827,6 +1043,7 @@ class Collector:
                             exc_info=True,
                         )
                     await asyncio.sleep(delay)
+            append_seconds = time.monotonic() - cycle_started
             for _ in batch:
                 self.queue.task_done()
             try:
@@ -842,16 +1059,44 @@ class Collector:
             storage_status = await loop.run_in_executor(
                 self.writer_pool, self.storage.connection_status
             )
+            # Where does a writer cycle go? EMA (alpha 0.2) of append_batch vs the
+            # status/flush overhead around it, to name the bottleneck from evidence.
+            cycle_seconds = time.monotonic() - cycle_started
+            ema = self.__dict__.setdefault("writer_timing_ema", {})  # per instance, even via __new__
+            for key, value in (
+                ("append_ms", append_seconds * 1000),
+                ("overhead_ms", (cycle_seconds - append_seconds) * 1000),
+                ("batch_events", float(len(batch))),
+            ):
+                ema[key] = value if key not in ema else 0.8 * ema[key] + 0.2 * value
             self.status.update(
                 queue_depth=self.queue.qsize(),
                 events_inserted=self.storage.events_inserted,
                 events_duplicate=self.storage.events_duplicate,
                 raw_capture_state="ENABLED" if self.storage.raw_capture_enabled else "THROTTLED_BUDGET",
+                writer_append_ms_ema=round(ema["append_ms"], 1),
+                writer_overhead_ms_ema=round(ema["overhead_ms"], 1),
+                writer_batch_events_ema=round(ema["batch_events"], 1),
                 **storage_status,
             )
 
     async def heartbeat_loop(self) -> None:
         while not self.stopping.is_set():
+            start_stack_sampling(self.cfg.runtime_dir, self.cfg.log_dir)  # on demand, one stat per tick
+            over_budget = bool(
+                self.cfg.journal_budget_bytes
+                and self.storage.sqlite_bytes >= self.cfg.journal_budget_bytes
+            )
+            self.status.update(
+                journal_delta_series_prefixes=list(self.cfg.journal_delta_series_prefixes),
+                journal_delta_skipped=getattr(self, "journal_delta_skipped", 0),
+                journal_ticker_skipped=getattr(self, "journal_ticker_skipped", 0),
+                journal_budget_bytes=self.cfg.journal_budget_bytes,
+                journal_delta_budget_skipped=getattr(self, "journal_delta_budget_skipped", 0),
+                journal_optional_capture_state="STOPPED_JOURNAL_BUDGET" if over_budget else "ENABLED",
+                websocket_connection_id=self.ws_connection_id,
+                event_loop_lag_ms_max_30s=self.loop_lag.max_ms(30.0),
+            )
             self.status.refresh_ages()
             try:
                 await asyncio.wait_for(self.stopping.wait(), timeout=5)
@@ -896,15 +1141,14 @@ class Collector:
                 self.last_series_catalog_monotonic = time.monotonic()
                 try:
                     fresh_series = await self.api.pages("/series", "series", max_pages=1)
-                    added, removed = series_catalog_changes(snapshot, fresh_series)
+                    candidates = await asyncio.to_thread(candidate_series_tickers, fresh_series)
+                    added, removed = series_catalog_changes(snapshot, fresh_series, candidates)
                     checked_utc = utc_now()
                     catalog_status = {
                         "series_catalog_state": "CHANGED" if added or removed else "READY",
                         "series_catalog_last_checked_utc": checked_utc,
                         "series_catalog_api_rows": len(fresh_series),
-                        "series_catalog_candidate_count": len(
-                            candidate_series_tickers(fresh_series)
-                        ),
+                        "series_catalog_candidate_count": len(candidates),
                         "series_catalog_added_tickers": added,
                         "series_catalog_removed_tickers": removed,
                         "series_catalog_error": None,
@@ -914,9 +1158,7 @@ class Collector:
                         series_rows_override = fresh_series
                     else:
                         snapshot["series_api_rows"] = len(fresh_series)
-                        snapshot["series_catalog_candidate_tickers"] = sorted(
-                            candidate_series_tickers(fresh_series)
-                        )
+                        snapshot["series_catalog_candidate_tickers"] = sorted(candidates)
                         snapshot["series_catalog_fingerprint_checked_utc"] = checked_utc
                 except PaginationLimitExceeded as exc:
                     catalog_status = {
@@ -2531,9 +2773,15 @@ class Collector:
                     ping_interval=20,
                     ping_timeout=20,
                     max_size=2**20,
+                    # Disabling permessage-deflate saved ~4% loop CPU but doubled reconnects (bigger snapshot
+                    # bursts): keep it on unless KALSHI15M_WS_COMPRESSION=none.
+                    compression=None if self.cfg.ws_compression == "none" else "deflate",
                 ) as ws:
+                    self.ws_connection_id = uuid.uuid4().hex[:12]
+                    connected_at = time.monotonic()
                     self.status.update(
                         websocket_state="READY",
+                        websocket_connection_id=self.ws_connection_id,
                         reconnect_count=self.status.data.get("reconnect_count", 0) + 1,
                     )
                     reconnect_delay = 1.0
@@ -2565,7 +2813,10 @@ class Collector:
                         if receiver in done:
                             ready_wait.cancel()
                             await receiver
-                            raise ConnectionError("WebSocket ended before subscriptions were ready")
+                            raise ConnectionError(
+                                "WebSocket ended before subscriptions were ready"
+                                + self._close_detail(ws, connected_at)
+                            )
                         if ready_wait not in done:
                             ready_wait.cancel()
                             raise TimeoutError("market-data subscriptions were not acknowledged")
@@ -2587,7 +2838,9 @@ class Collector:
                                 task.cancel()
                         await asyncio.gather(*tasks, return_exceptions=True)
                     if not self.stopping.is_set():
-                        raise ConnectionError("WebSocket receive loop ended")
+                        raise ConnectionError(
+                            "WebSocket receive loop ended" + self._close_detail(ws, connected_at)
+                        )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -2596,11 +2849,23 @@ class Collector:
                     websocket_state="RECONNECTING",
                     error_count=self.status.data.get("error_count", 0) + 1,
                     last_error=f"WebSocket connection ended: {type(exc).__name__}",
+                    last_websocket_disconnect_detail=str(exc)[:300],
                 )
-                LOG.warning("WebSocket disconnected: %s", type(exc).__name__)
+                # The type alone hid why the server ended the session (clean close vs reset).
+                LOG.warning(
+                    "WebSocket disconnected: %s: %s [queue=%d loop_lag_max_30s_ms=%s]",
+                    type(exc).__name__, str(exc)[:300], self.queue.qsize(), self.loop_lag.max_ms(30.0),
+                )
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(30.0, reconnect_delay * 2)
         self.status.update(websocket_state="STOPPED")
+
+    @staticmethod
+    def _close_detail(ws: Any, connected_at: float) -> str:
+        """How the session ended: the peer's close code/reason and how long it lived."""
+        code = getattr(ws, "close_code", None)
+        reason = getattr(ws, "close_reason", None)
+        return f" (close_code={code}, close_reason={str(reason)[:120]!r}, session_s={time.monotonic() - connected_at:.1f})"
 
     def _invalidate_websocket_books(self) -> None:
         self._publish_orderbook_sequence_state(connected=False)
@@ -2660,6 +2925,7 @@ class Collector:
                 "last_message_utc": None,
             },
         )
+        previous_state = entry["state"]
         entry["last_seq"] = seq
         entry["last_message_utc"] = utc_now()
         if snapshot:
@@ -2669,7 +2935,17 @@ class Collector:
             entry["delta_count"] += 1
             entry["state"] = "VERIFIED_CONTIGUOUS"
             self.orderbook_sequence_last_verified_utc = entry["last_message_utc"]
-        self._publish_orderbook_sequence_state(connected=True)
+        # Rebuilding the aggregate and copying every subscription on every message was ~13% of the
+        # loop's busy time. Counters are exact in memory; the published copy may lag by 0.5 s,
+        # a state transition (snapshot, first delta, invalidation) publishes immediately.
+        now = time.monotonic()
+        if (
+            snapshot
+            or entry["state"] != previous_state
+            or now - getattr(self, "_sequence_published_monotonic", 0.0) >= 0.5
+        ):
+            self._sequence_published_monotonic = now
+            self._publish_orderbook_sequence_state(connected=True)
 
     def _record_orderbook_sequence_failure(self, sid: Any, reason: str) -> None:
         if isinstance(sid, int):
@@ -2690,15 +2966,7 @@ class Collector:
         self.status.update(orderbook_sequence_last_error=reason)
 
     def _mark_orderbook_quote(self, ticker: str, state: str = "FRESH") -> None:
-        updates = dict(self.status.data.get("orderbook_quote_last_update_utc_by_ticker", {}))
-        states = dict(self.status.data.get("orderbook_quote_freshness_by_ticker", {}))
-        updates[ticker] = utc_now()
-        states[ticker] = state
-        self.status.update(
-            orderbook_quote_last_update_utc_by_ticker=updates,
-            orderbook_quote_freshness_by_ticker=states,
-            orderbook_quote_age_seconds_by_ticker={**self.status.data.get("orderbook_quote_age_seconds_by_ticker", {}), ticker: 0.0},
-        )
+        self.status.mark_quote(ticker, state, utc_now())
 
     def _reset_websocket_subscriptions(self) -> None:
         self.subscription_sids.clear()
@@ -2941,7 +3209,7 @@ class Collector:
                         {"sid": sid, "prior_seq": prior, "current_seq": seq, "market_ticker": ticker},
                         str(ticker),
                         exchange_ts,
-                        f"snapshot-gap|{sid}|{prior}|{seq}",
+                        f"snapshot-gap|{self.ws_connection_id}|{sid}|{prior}|{seq}",
                     )
                     await ws.close(code=1011, reason="snapshot missing sequence metadata")
                     return
@@ -2958,7 +3226,7 @@ class Collector:
                         {"raw": outer, "synchronized": book.synchronized, "executable_quotes": book.quotes()},
                         str(ticker),
                         exchange_ts,
-                        f"ws|{sid}|{seq}",
+                        f"ws|{self.ws_connection_id}|{sid}|{seq:>012}",
                     )
             elif kind == "orderbook_delta" and ticker:
                 prior = self.last_seq.get(sid) if isinstance(sid, int) else None
@@ -2985,7 +3253,7 @@ class Collector:
                         {"sid": sid, "prior_seq": prior, "current_seq": seq, "market_ticker": ticker},
                         str(ticker),
                         exchange_ts,
-                        f"gap|{sid}|{prior}|{seq}",
+                        f"gap|{self.ws_connection_id}|{sid}|{prior}|{seq}",
                     )
                     await ws.close(code=1011, reason="sequence invalid; reconnect for fresh snapshots")
                     return
@@ -3031,7 +3299,7 @@ class Collector:
                     },
                     str(ticker),
                     exchange_ts,
-                    f"ws|{sid}|{seq}" if sid is not None and seq is not None else None,
+                    f"ws|{self.ws_connection_id}|{sid}|{seq:>012}" if sid is not None and seq is not None else None,
                 )
             else:
                 await self.emit(
@@ -3040,9 +3308,12 @@ class Collector:
                     outer,
                     str(ticker) if ticker else None,
                     exchange_ts,
-                    f"ws|{sid}|{seq}" if sid is not None and seq is not None else None,
+                    f"ws|{self.ws_connection_id}|{sid}|{seq:>012}" if sid is not None and seq is not None else None,
                 )
-            self.status.mark_channel(channel, exchange_ts)
+            marks = self.__dict__.setdefault("_channel_mark_monotonic", {})
+            if time.monotonic() - marks.get(channel, 0.0) >= 0.25:
+                marks[channel] = time.monotonic()
+                self.status.mark_channel(channel, exchange_ts)
             if kind == "trade":
                 self.status.update(trades_observed=self.status.data.get("trades_observed", 0) + 1)
             if kind in {"market_lifecycle_v2", "event_lifecycle", "market_lifecycle"}:
@@ -3092,7 +3363,37 @@ class Collector:
         self.cfg.ensure_dirs()
         configure_logging(self.cfg)
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(self.writer_pool, self.storage.open)
+        # Serve status during storage recovery so a supervisor sees RECOVERING
+        # instead of an absent listener and never launches a second worker.
+        self.status.async_file_writes = True  # real worker only (unit tests build Collectors without this)
+        self.status_http = status_server(self.status, self.cfg)
+        self.status.update(
+            service_state="RECOVERING",
+            startup_phase="STORAGE_OPEN_AND_RECOVERY",
+            status_url=f"http://{self.cfg.status_host}:{self.cfg.status_port}/api/v1/status",
+        )
+        recovery_started = time.monotonic()
+        recovery_future = loop.run_in_executor(self.writer_pool, self.storage.open)
+        # The normal heartbeat_loop starts only after storage recovery. Keep the
+        # RECOVERING status timestamp current while the bounded single writer
+        # is replaying archival data, without launching a competing worker.
+        while not recovery_future.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(recovery_future), timeout=5.0)
+            except asyncio.TimeoutError:
+                self.status.update(
+                    startup_phase="STORAGE_OPEN_AND_RECOVERY",
+                    storage_recovery_elapsed_seconds=round(
+                        time.monotonic() - recovery_started, 3
+                    ),
+                    # Plain int reads: progress evidence, not a completion claim.
+                    archive_recovery_files_scanned=self.storage.parquet_recovery_files_scanned,
+                    archive_recovery_rows_scanned=self.storage.parquet_recovery_rows_scanned,
+                    archive_recovery_reason=self.storage.parquet_recovery_reason,
+                )
+        # Propagate recovery errors; a live heartbeat is NOT proof of progress
+        # or a reason to bypass the source-integrity and readiness gates.
+        await recovery_future
         storage_status = await loop.run_in_executor(
             self.writer_pool, self.storage.connection_status
         )
@@ -3100,6 +3401,9 @@ class Collector:
             **storage_status,
             parquet_archive_recovery_state=self.storage.parquet_recovery_state,
             parquet_archive_recovery_rows=self.storage.parquet_recovery_rows,
+            parquet_archive_recovery_mode=self.storage.parquet_recovery_mode,
+            storage_recovery_seconds=round(time.monotonic() - recovery_started, 3),
+            startup_phase="PAPER_STATE_RESTORE",
         )
         if self.strategy_profile_id:
             try:
@@ -3121,11 +3425,13 @@ class Collector:
                     last_error=f"cross-market paper ledger recovery failed: {type(exc).__name__}",
                 )
                 LOG.exception("cross-market paper ledger recovery failed")
-        self.status_http = status_server(self.status, self.cfg)
-        self.status.update(status_url=f"http://{self.cfg.status_host}:{self.cfg.status_port}/api/v1/status")
+        self.status.update(startup_phase="INGEST")
         self.stop_file.unlink(missing_ok=True)
         writer = asyncio.create_task(self.writer_loop(), name="sqlite-parquet-writer")
         heartbeat = asyncio.create_task(self.heartbeat_loop(), name="runtime-heartbeat")
+        lag_task = asyncio.create_task(self.loop_lag.run(), name="loop-lag-monitor")
+        self.loop_lag.last_tick = time.monotonic()
+        self.loop_lag.start_watchdog(threading.get_ident())
         await self.refresh_inventory()
         ws_task = asyncio.create_task(self.websocket_loop(), name="kalshi-websocket")
         await self.emit(
@@ -3273,7 +3579,15 @@ class Collector:
                         )
                         next_trades = time.monotonic() + self.cfg.trades_poll_interval_seconds
                 disk_free = shutil.disk_usage(self.cfg.home).free
-                low_disk = disk_free < self.cfg.min_free_bytes
+                ledger_free = shutil.disk_usage(self.cfg.ledger_path.parent).free
+                ledger_state = self.cfg.ledger_volume_state(ledger_free)
+                self.status.update(ledger_volume_free_bytes=ledger_free, ledger_volume_state=ledger_state)
+                if ledger_state == "CRITICAL":
+                    # Fail closed: a clean stop now beats a journal corrupted by a full disk.
+                    LOG.error("ledger volume critically low (%d bytes free); stopping", ledger_free)
+                    self.stopping.set()
+                    break
+                low_disk = disk_free < self.cfg.min_free_bytes or ledger_state == "LOW"
                 if low_disk:
                     self.storage.raw_capture_enabled = False
                 elif (
@@ -3318,6 +3632,8 @@ class Collector:
         finally:
             self.stopping.set()
             heartbeat.cancel()
+            lag_task.cancel()
+            self.loop_lag.watchdog_stop.set()
             try:
                 await heartbeat
             except asyncio.CancelledError:
@@ -3344,7 +3660,8 @@ class Collector:
                     self.writer_pool,
                     lambda: self.storage.flush_parquet(reason="SHUTDOWN"),
                 )
-                await loop.run_in_executor(self.writer_pool, self.storage.integrity_check)
+                # No PRAGMA integrity_check here: on a multi-GB journal on the USB
+                # data volume two full scans held shutdown for well over an hour.
                 metrics = await loop.run_in_executor(self.writer_pool, self.storage.database_metrics)
             except Exception as exc:
                 storage_error = f"{type(exc).__name__}: {exc}"
