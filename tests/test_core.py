@@ -4160,8 +4160,11 @@ class EventLoopCpuDietTests(unittest.TestCase):
             deadline = time.monotonic() + 5
             path = Path(root) / "runtime" / "status.json"
             while time.monotonic() < deadline:
-                if path.exists() and json.loads(path.read_text())["queue_depth"] == 5:
-                    break
+                try:  # the writer may be mid-replace while we read (Windows): retry, do not error
+                    if path.exists() and json.loads(path.read_text())["queue_depth"] == 5:
+                        break
+                except (OSError, ValueError):
+                    pass
                 time.sleep(0.05)
             self.assertEqual(json.loads(path.read_text())["queue_depth"], 5)
 
