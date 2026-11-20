@@ -100,6 +100,9 @@ def _child_main(cfg: Settings, conn) -> None:
         if lock is None:
             send(("ready", False, "JOURNAL_PROCESS_ALREADY_RUNNING"))
             return
+        # Same reason as the worker: the append thread competes with the flush thread for the GIL and
+        # the default 5 ms hand-off made it wait; 0.5 ms keeps both moving.
+        sys.setswitchinterval(0.0005)
         store = Storage(cfg)
         # Parquet/manifest/prune I/O (seconds per flush on the USB volume) must not stall
         # appends: measured flush ~6 s vs ~0.2 s for everything else in an append.

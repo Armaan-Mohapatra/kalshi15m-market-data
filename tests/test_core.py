@@ -4232,3 +4232,29 @@ class EventLoopCpuDietTests(unittest.TestCase):
                 asyncio.run(collector.websocket_loop())
         self.assertIn("compression", seen)
         self.assertIsNone(seen["compression"])
+
+
+class RecentKeysWindowTests(unittest.TestCase):
+    def test_window_is_bounded_ordered_and_trims_in_constant_time(self):
+        from collections import OrderedDict
+
+        with TemporaryDirectory() as tmp:
+            store = Storage(Settings(home=Path(tmp), min_free_bytes=0))
+            store.open()
+            try:
+                store.RECENT_KEYS_MAX = 1000
+                self.assertIsInstance(store._recent_keys, OrderedDict)
+                for start in range(0, 6000, 500):
+                    store.append_batch([_trade(i) for i in range(start, start + 500)])
+                self.assertEqual(len(store._recent_keys), 1000)
+                kept = list(store._recent_keys)
+                self.assertEqual(kept[0], "trade-5000")   # oldest kept = 1000 newest
+                self.assertEqual(kept[-1], "trade-5999")
+                self.assertEqual(store.append_batch([_trade(5999), _trade(6000)]), 1)  # recent duplicate skipped
+            finally:
+                store.close()
+
+    def test_directory_size_reconcile_is_hourly_not_every_five_minutes(self):
+        with TemporaryDirectory() as tmp:
+            store = Storage(Settings(home=Path(tmp), min_free_bytes=0))
+            self.assertEqual(store.parquet_size_reconcile_interval_seconds, 3600.0)
