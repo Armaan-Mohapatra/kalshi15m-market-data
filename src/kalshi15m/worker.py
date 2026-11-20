@@ -195,6 +195,14 @@ class RuntimeStatus:
         self.cfg = cfg
         self.lock = threading.RLock()
         self.status_file_write_interval_seconds = 1.0
+        # The collector turns this on: the 700 KB status.json write + replace on the USB volume was
+        # ~15% of the event loop's busy time when done inline. Forced writes (state changes) stay
+        # synchronous so a transition is on disk before the caller continues.
+        self.async_file_writes = False
+        self._file_lock = threading.Lock()
+        self._write_wakeup = threading.Event()
+        self._pending_payload: str | None = None
+        self._file_writer: threading.Thread | None = None
         self.last_status_file_write_monotonic: float | None = None
         self.started_utc = utc_now()
         self.data: dict[str, Any] = {
@@ -367,6 +375,17 @@ class RuntimeStatus:
             self.data["heartbeat_utc"] = received
             self._write_locked()
 
+    def mark_quote(self, ticker: str, state: str, utc: str) -> None:
+        """Per-quote freshness bookkeeping, in place: the previous version copied three
+        ~1,000-entry dicts on every order-book message (~9% of the loop's busy time)."""
+        with self.lock:
+            data = self.data
+            data.setdefault("orderbook_quote_last_update_utc_by_ticker", {})[ticker] = utc
+            data.setdefault("orderbook_quote_freshness_by_ticker", {})[ticker] = state
+            data.setdefault("orderbook_quote_age_seconds_by_ticker", {})[ticker] = 0.0
+            data["heartbeat_utc"] = utc
+            self._write_locked()
+
     def mark_rest_poll(
         self,
         channel: str,
@@ -482,12 +501,39 @@ class RuntimeStatus:
         ):
             return
         self.last_status_file_write_monotonic = now
+        payload = json.dumps(self.data, indent=2)
+        if self.async_file_writes and not force:
+            self._pending_payload = payload  # latest wins
+            if self._file_writer is None:
+                self._file_writer = threading.Thread(
+                    target=self._file_writer_main, name="status-file-writer", daemon=True
+                )
+                self._file_writer.start()
+            self._write_wakeup.set()
+            return
+        self._write_payload(payload)
+
+    def _file_writer_main(self) -> None:
+        while True:
+            self._write_wakeup.wait()
+            self._write_wakeup.clear()
+            payload, self._pending_payload = self._pending_payload, None
+            if payload is not None:
+                try:
+                    self._write_payload(payload)
+                except Exception:
+                    LOG.warning("status.json background write failed", exc_info=True)
+
+    def _write_payload(self, payload: str) -> None:
+        with self._file_lock:
+            self._write_payload_locked(payload)
+
+    def _write_payload_locked(self, payload: str) -> None:
         self.cfg.runtime_dir.mkdir(parents=True, exist_ok=True)
         path = self.cfg.runtime_dir / "status.json"
         temporary = path.with_name(
             f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
         )
-        payload = json.dumps(self.data, indent=2)
         for attempt in range(STATUS_FILE_REPLACE_RETRIES):
             try:
                 temporary.write_text(payload, encoding="utf-8")
@@ -2716,6 +2762,9 @@ class Collector:
                     ping_interval=20,
                     ping_timeout=20,
                     max_size=2**20,
+                    # permessage-deflate decode was ~4% of the event loop's busy time; local
+                    # bandwidth is not the constraint, the single Python loop is.
+                    compression=None,
                 ) as ws:
                     self.ws_connection_id = uuid.uuid4().hex[:12]
                     connected_at = time.monotonic()
@@ -2865,6 +2914,7 @@ class Collector:
                 "last_message_utc": None,
             },
         )
+        previous_state = entry["state"]
         entry["last_seq"] = seq
         entry["last_message_utc"] = utc_now()
         if snapshot:
@@ -2874,7 +2924,17 @@ class Collector:
             entry["delta_count"] += 1
             entry["state"] = "VERIFIED_CONTIGUOUS"
             self.orderbook_sequence_last_verified_utc = entry["last_message_utc"]
-        self._publish_orderbook_sequence_state(connected=True)
+        # Rebuilding the aggregate and copying every subscription on every message was ~13% of the
+        # loop's busy time. Counters are exact in memory; the published copy may lag by 0.5 s,
+        # a state transition (snapshot, first delta, invalidation) publishes immediately.
+        now = time.monotonic()
+        if (
+            snapshot
+            or entry["state"] != previous_state
+            or now - getattr(self, "_sequence_published_monotonic", 0.0) >= 0.5
+        ):
+            self._sequence_published_monotonic = now
+            self._publish_orderbook_sequence_state(connected=True)
 
     def _record_orderbook_sequence_failure(self, sid: Any, reason: str) -> None:
         if isinstance(sid, int):
@@ -2895,15 +2955,7 @@ class Collector:
         self.status.update(orderbook_sequence_last_error=reason)
 
     def _mark_orderbook_quote(self, ticker: str, state: str = "FRESH") -> None:
-        updates = dict(self.status.data.get("orderbook_quote_last_update_utc_by_ticker", {}))
-        states = dict(self.status.data.get("orderbook_quote_freshness_by_ticker", {}))
-        updates[ticker] = utc_now()
-        states[ticker] = state
-        self.status.update(
-            orderbook_quote_last_update_utc_by_ticker=updates,
-            orderbook_quote_freshness_by_ticker=states,
-            orderbook_quote_age_seconds_by_ticker={**self.status.data.get("orderbook_quote_age_seconds_by_ticker", {}), ticker: 0.0},
-        )
+        self.status.mark_quote(ticker, state, utc_now())
 
     def _reset_websocket_subscriptions(self) -> None:
         self.subscription_sids.clear()
@@ -3247,7 +3299,10 @@ class Collector:
                     exchange_ts,
                     f"ws|{self.ws_connection_id}|{sid}|{seq:>012}" if sid is not None and seq is not None else None,
                 )
-            self.status.mark_channel(channel, exchange_ts)
+            marks = self.__dict__.setdefault("_channel_mark_monotonic", {})
+            if time.monotonic() - marks.get(channel, 0.0) >= 0.25:
+                marks[channel] = time.monotonic()
+                self.status.mark_channel(channel, exchange_ts)
             if kind == "trade":
                 self.status.update(trades_observed=self.status.data.get("trades_observed", 0) + 1)
             if kind in {"market_lifecycle_v2", "event_lifecycle", "market_lifecycle"}:
@@ -3299,6 +3354,7 @@ class Collector:
         loop = asyncio.get_running_loop()
         # Serve status during storage recovery so a supervisor sees RECOVERING
         # instead of an absent listener and never launches a second worker.
+        self.status.async_file_writes = True  # real worker only (unit tests build Collectors without this)
         self.status_http = status_server(self.status, self.cfg)
         self.status.update(
             service_state="RECOVERING",

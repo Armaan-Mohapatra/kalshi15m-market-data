@@ -4104,3 +4104,131 @@ class StallWatchdogAndCatalogScanTests(unittest.TestCase):
             self.assertEqual(discovery.series_catalog_changes(prior, fresh, candidates), (["ADD"], ["REMOVE"]))
             scan.assert_not_called()  # the caller's scan is reused
         self.assertEqual(discovery.series_catalog_changes(prior, fresh), (["ADD"], ["REMOVE"]))
+
+
+class EventLoopCpuDietTests(unittest.TestCase):
+    def test_cached_best_prices_match_a_brute_force_scan_over_random_books(self):
+        import random
+
+        rng = random.Random(7)
+        book = OrderBook()
+        book.snapshot({"yes_dollars_fp": [["0.40", "5"], ["0.35", "2"]], "no_dollars_fp": [["0.55", "3"]]})
+        for step in range(3000):
+            side = rng.choice(["yes", "no"])
+            levels = book.yes if side == "yes" else book.no
+            price = Decimal(rng.randrange(1, 99)) / 100
+            have = levels.get(price, Decimal(0))
+            delta = -have if (have and rng.random() < 0.45) else Decimal(rng.randrange(1, 5))
+            book.delta({"side": side, "price_dollars": str(price), "delta_fp": str(delta)})
+            if step % 500 == 0:  # a fresh snapshot resets everything
+                book.snapshot({"yes_dollars_fp": [[str(price), "1"]], "no_dollars_fp": []})
+            quotes = book.quotes()
+            best_yes, best_no = max(book.yes, default=None), max(book.no, default=None)
+            self.assertEqual(quotes["yes_bid"], str(best_yes) if best_yes is not None else None)
+            self.assertEqual(quotes["no_bid"], str(best_no) if best_no is not None else None)
+            self.assertEqual(quotes["yes_ask"], str(Decimal("1.0000") - best_no) if best_no is not None else None)
+            self.assertEqual(quotes["no_ask_size"], str(book.yes[best_yes]) if best_yes is not None else None)
+
+    def test_book_recovers_if_the_level_dicts_are_replaced_behind_its_back(self):
+        book = OrderBook()
+        book.snapshot({"yes_dollars_fp": [["0.40", "5"]], "no_dollars_fp": [["0.55", "3"]]})
+        book.yes = {Decimal("0.60"): Decimal("1")}  # someone assigned a new dict
+        self.assertEqual(book.quotes()["yes_bid"], "0.60")
+        book.no = {}
+        self.assertIsNone(book.quotes()["no_bid"])
+
+    def test_background_status_writes_do_not_block_updates_and_the_latest_wins(self):
+        import threading
+
+        with TemporaryDirectory() as root:
+            status = RuntimeStatus(Settings(home=Path(root)))
+            status.async_file_writes = True
+            status.status_file_write_interval_seconds = 0.0
+            gate = threading.Event()
+            original = status._write_payload_locked
+
+            def slow(payload):
+                gate.wait(5)
+                return original(payload)
+
+            status._write_payload_locked = slow
+            began = time.monotonic()
+            for value in range(1, 6):
+                status.update(queue_depth=value)  # the write thread is stuck; none of these may wait
+            self.assertLess(time.monotonic() - began, 1.0)
+            gate.set()
+            deadline = time.monotonic() + 5
+            path = Path(root) / "runtime" / "status.json"
+            while time.monotonic() < deadline:
+                if path.exists() and json.loads(path.read_text())["queue_depth"] == 5:
+                    break
+                time.sleep(0.05)
+            self.assertEqual(json.loads(path.read_text())["queue_depth"], 5)
+
+    def test_forced_status_writes_stay_synchronous_even_when_background_writes_are_on(self):
+        with TemporaryDirectory() as root:
+            status = RuntimeStatus(Settings(home=Path(root)))
+            status.async_file_writes = True
+            status.update(service_state="STOPPED")  # service_state forces a write
+            saved = json.loads((Path(root) / "runtime" / "status.json").read_text())
+            self.assertEqual(saved["service_state"], "STOPPED")  # on disk before update() returned
+
+    def test_mark_quote_updates_the_three_maps_in_place_like_the_copying_version(self):
+        with TemporaryDirectory() as root:
+            status = RuntimeStatus(Settings(home=Path(root)))
+            status.update(
+                orderbook_quote_last_update_utc_by_ticker={"OLD": "t0"},
+                orderbook_quote_freshness_by_ticker={"OLD": "STALE"},
+                orderbook_quote_age_seconds_by_ticker={"OLD": 9.0},
+            )
+            ages = status.data["orderbook_quote_age_seconds_by_ticker"]
+            status.mark_quote("NEW", "FRESH", "t1")
+            snap = status.snapshot()
+            self.assertEqual(snap["orderbook_quote_last_update_utc_by_ticker"], {"OLD": "t0", "NEW": "t1"})
+            self.assertEqual(snap["orderbook_quote_freshness_by_ticker"], {"OLD": "STALE", "NEW": "FRESH"})
+            self.assertEqual(snap["orderbook_quote_age_seconds_by_ticker"], {"OLD": 9.0, "NEW": 0.0})
+            self.assertIs(status.data["orderbook_quote_age_seconds_by_ticker"], ages)  # no per-message copy
+            self.assertEqual(snap["heartbeat_utc"], "t1")
+
+    def test_sequence_state_publishes_on_transitions_but_not_on_every_delta(self):
+        with TemporaryDirectory() as root:
+            collector = Collector(Settings(home=Path(root)))
+            published = []
+            real = collector._publish_orderbook_sequence_state
+            collector._publish_orderbook_sequence_state = lambda **kw: (published.append(1), real(**kw))[1]
+            collector._record_orderbook_sequence(5, 1, snapshot=True)    # snapshot: publishes at once
+            collector._record_orderbook_sequence(5, 2, snapshot=False)   # first delta: state changes
+            before = len(published)
+            for seq in range(3, 203):
+                collector._record_orderbook_sequence(5, seq, snapshot=False)  # steady state
+            self.assertLessEqual(len(published) - before, 1)  # at most one time-based refresh in a fast loop
+            self.assertEqual(collector.orderbook_sequence_by_sid[5]["delta_count"], 201)  # counters are exact
+            published_before_snapshot = len(published)
+            collector._record_orderbook_sequence(5, 203, snapshot=True)
+            self.assertEqual(len(published), published_before_snapshot + 1)
+
+    def test_websocket_is_opened_without_compression(self):
+        seen = {}
+
+        class FakeConnection:
+            async def __aenter__(self):
+                collector.stopping.set()
+                raise ConnectionError("stop after capturing the connect arguments")
+
+            async def __aexit__(self, *exc):
+                return False
+
+        with TemporaryDirectory() as root:
+            collector = Collector(Settings(home=Path(root)))
+
+            def fake_connect(_url, **kwargs):
+                seen.update(kwargs)
+                return FakeConnection()
+
+            with (
+                patch("kalshi15m.worker.ws_auth_headers", return_value={"k": "v"}),
+                patch("kalshi15m.worker.websockets.connect", side_effect=fake_connect),
+            ):
+                asyncio.run(collector.websocket_loop())
+        self.assertIn("compression", seen)
+        self.assertIsNone(seen["compression"])
