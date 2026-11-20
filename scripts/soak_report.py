@@ -169,6 +169,7 @@ def collect(home: Path, port: int = 8778, now: datetime | None = None) -> dict:
 
 def render(facts: dict, verdict: str, reasons: list[str]) -> str:
     lines = [f"# Soak report {facts['generated_utc']}", "", f"**{verdict}**" + ("".join(f"\n- {r}" for r in reasons)), "",
+             "**Scope: P8 process stability only. This does not certify P0 uninterrupted WebSocket data or profitable strategies.**", "",
              f"- worker PID {facts['worker_pid']} started {facts['started_utc']} (uptime {facts['uptime_seconds']/3600:.2f} h), "
              f"commit {facts['source_commit'][:7]} dirty={facts['source_dirty']}, mode {facts['mode']}",
              f"- exchange writes {facts['exchange_write_calls']}, orders {facts['orders_submitted_to_exchange']}, "
