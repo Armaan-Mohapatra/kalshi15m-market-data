@@ -58,3 +58,23 @@ class ResearchCycleTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HypothesisIntegrationTests(unittest.TestCase):
+    def test_the_cycle_reports_the_sealed_h1_experiment_and_a_failure_cannot_break_it(self):
+        with TemporaryDirectory() as tmp:
+            home = _home(tmp, ["0.5", "-0.25", "0.5", "-1.0", "0.5", "0.5"])
+            report = rc.cycle(home)
+            h1 = report["hypotheses"]["H1_inversion"]
+            self.assertIn("partitions", h1)  # no fills in this fixture: empty partitions, but present and sealed
+            self.assertTrue((home / "reports" / "oos_seal.json").exists())
+            self.assertEqual(h1["verdict"], "H1_INSUFFICIENT_DATA")
+        import hypothesis_inversion as hi
+        from unittest.mock import patch
+
+        with TemporaryDirectory() as tmp:
+            home = _home(tmp, ["0.5", "-0.25"])
+            with patch.object(hi, "evaluate", side_effect=RuntimeError("boom")):
+                report = rc.cycle(home)
+            self.assertEqual(report["result"], "PROCESSED")  # the cycle itself still completed
+            self.assertEqual(report["hypotheses"]["H1_inversion"]["verdict"], "ERROR")

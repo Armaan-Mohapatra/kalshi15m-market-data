@@ -55,6 +55,9 @@ class ScheduledScriptTests(unittest.TestCase):
             first = _isolated("research_cycle.py", "--home", str(home))
             self.assertEqual(first.returncode, 0, first.stderr)
             self.assertEqual(json.loads(first.stdout)["result"], "PROCESSED")
+            h1 = json.loads(first.stdout)["hypotheses"]["H1_inversion"]
+            self.assertNotEqual(h1["verdict"], "ERROR", h1)
+            self.assertIn("partitions", h1)
             second = _isolated("research_cycle.py", "--home", str(home))
             self.assertEqual(json.loads(second.stdout)["result"], "NO_NEW_FINALIZED_MARKETS")
 

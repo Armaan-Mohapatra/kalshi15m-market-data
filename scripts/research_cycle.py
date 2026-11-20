@@ -21,6 +21,7 @@ from pathlib import Path
 
 # Task Scheduler runs `python -I script.py` (isolated: no cwd, no PYTHONPATH).
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # sibling scripts (python -I drops the script dir)
 
 BOOTSTRAP = 2000
 
@@ -91,6 +92,12 @@ def cycle(home: Path, seed: int = 7) -> dict:
     report = {"completed_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "result": "PROCESSED",
               "new_settlements": len(fresh), "profiles": profiles, "partition": "FORWARD_PAPER_ONLY",
               "processed_keys": sorted(done | set(fresh))}
+    try:  # pre-registered experiment with sealed out-of-sample data; never allowed to break the cycle
+        from hypothesis_inversion import evaluate
+
+        report["hypotheses"] = {"H1_inversion": evaluate(Settings(home=home).ledger_path, home)}
+    except Exception as exc:
+        report["hypotheses"] = {"H1_inversion": {"verdict": "ERROR", "error": f"{type(exc).__name__}: {exc}"}}
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = checkpoint_path.with_suffix(".tmp")
     tmp.write_text(json.dumps(report), encoding="utf-8")  # a crash before replace re-processes safely
