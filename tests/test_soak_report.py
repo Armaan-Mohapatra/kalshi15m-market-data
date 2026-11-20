@@ -75,7 +75,8 @@ class JudgeTests(unittest.TestCase):
         import io
         from contextlib import redirect_stdout
 
-        with patch.object(sr, "collect", side_effect=OSError("status unreachable")):
+        with patch.object(sr.sys, "argv", ["soak_report.py"]), \
+             patch.object(sr, "collect", side_effect=OSError("status unreachable")):
             with redirect_stdout(io.StringIO()) as out:
                 code = sr.main()
         self.assertEqual(code, 2)
