@@ -112,6 +112,15 @@ class NotifyTests(unittest.TestCase):
             return type("R", (), {"returncode": self.code})()
 
     def test_only_new_critical_alerts_raise_a_toast_and_text_travels_in_the_environment(self):
+        import os
+        from unittest.mock import patch
+
+        # independent of the caller's environment: toasts must be enabled for this check
+        with patch.dict(os.environ):
+            os.environ.pop("PHOENIX_NO_TOAST", None)
+            self._check_toast_behaviour()
+
+    def _check_toast_behaviour(self):
         run = self._Run()
         self.assertTrue(pr.notify(["WARNING writer queue at 12000", "CRITICAL archive integrity UNKNOWN"], run=run))
         self.assertEqual(len(run.calls), 1)
