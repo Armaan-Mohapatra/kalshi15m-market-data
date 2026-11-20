@@ -71,6 +71,8 @@ def export(ledger: Path, ticker: str, out: Path) -> dict:
             raise ValueError(
                 f"refusing partial book feed: {counts['skipped_unparsable']} corrupt source event(s)"
             )
+        if counts["snapshot"] == 0:
+            raise ValueError("refusing book feed without a verified WebSocket snapshot")
         os.replace(partial, out)
         partial = None
         return counts
