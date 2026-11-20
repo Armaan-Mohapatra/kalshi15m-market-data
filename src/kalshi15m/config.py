@@ -81,6 +81,10 @@ class Settings:
     # are deleted from the SQLite journal so it stops growing (owner-approved
     # 2026-11-19 for P8). 0 = never prune (default).
     journal_retention_seconds: int = int(float(os.environ.get("KALSHI15M_JOURNAL_RETENTION_HOURS", "0")) * 3600)
+    # WebSocket permessage-deflate: "deflate" (the library default) or "none". "none" was tried as a CPU saving
+    # (decode was ~4% of loop time) but order-book snapshot bursts get several times larger on the wire and
+    # reconnects doubled (62 -> 132/hour), so the default stays "deflate".
+    ws_compression: str = os.environ.get("KALSHI15M_WS_COMPRESSION", "deflate").strip().lower()
     ledger_min_free_bytes: int = 5 * 1024**3
     ledger_critical_free_bytes: int = 1 * 1024**3
     # Durability of market-event batch commits (owner-approved 2026-11-19: the USB

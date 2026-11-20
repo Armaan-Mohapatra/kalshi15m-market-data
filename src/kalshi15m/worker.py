@@ -2762,9 +2762,9 @@ class Collector:
                     ping_interval=20,
                     ping_timeout=20,
                     max_size=2**20,
-                    # permessage-deflate decode was ~4% of the event loop's busy time; local
-                    # bandwidth is not the constraint, the single Python loop is.
-                    compression=None,
+                    # Disabling permessage-deflate saved ~4% loop CPU but doubled reconnects (bigger snapshot
+                    # bursts): keep it on unless KALSHI15M_WS_COMPRESSION=none.
+                    compression=None if self.cfg.ws_compression == "none" else "deflate",
                 ) as ws:
                     self.ws_connection_id = uuid.uuid4().hex[:12]
                     connected_at = time.monotonic()

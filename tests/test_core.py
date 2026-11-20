@@ -4207,31 +4207,34 @@ class EventLoopCpuDietTests(unittest.TestCase):
             collector._record_orderbook_sequence(5, 203, snapshot=True)
             self.assertEqual(len(published), published_before_snapshot + 1)
 
-    def test_websocket_is_opened_without_compression(self):
-        seen = {}
+    def test_websocket_compression_defaults_to_deflate_and_can_be_disabled(self):
+        def connect_args(**settings):
+            seen = {}
 
-        class FakeConnection:
-            async def __aenter__(self):
-                collector.stopping.set()
-                raise ConnectionError("stop after capturing the connect arguments")
+            class FakeConnection:
+                async def __aenter__(self):
+                    collector.stopping.set()
+                    raise ConnectionError("stop after capturing the connect arguments")
 
-            async def __aexit__(self, *exc):
-                return False
+                async def __aexit__(self, *exc):
+                    return False
 
-        with TemporaryDirectory() as root:
-            collector = Collector(Settings(home=Path(root)))
+            with TemporaryDirectory() as root:
+                collector = Collector(Settings(home=Path(root), **settings))
 
-            def fake_connect(_url, **kwargs):
-                seen.update(kwargs)
-                return FakeConnection()
+                def fake_connect(_url, **kwargs):
+                    seen.update(kwargs)
+                    return FakeConnection()
 
-            with (
-                patch("kalshi15m.worker.ws_auth_headers", return_value={"k": "v"}),
-                patch("kalshi15m.worker.websockets.connect", side_effect=fake_connect),
-            ):
-                asyncio.run(collector.websocket_loop())
-        self.assertIn("compression", seen)
-        self.assertIsNone(seen["compression"])
+                with (
+                    patch("kalshi15m.worker.ws_auth_headers", return_value={"k": "v"}),
+                    patch("kalshi15m.worker.websockets.connect", side_effect=fake_connect),
+                ):
+                    asyncio.run(collector.websocket_loop())
+            return seen
+
+        self.assertEqual(connect_args()["compression"], "deflate")  # measured: "none" doubled reconnects
+        self.assertIsNone(connect_args(ws_compression="none")["compression"])
 
 
 class RecentKeysWindowTests(unittest.TestCase):
