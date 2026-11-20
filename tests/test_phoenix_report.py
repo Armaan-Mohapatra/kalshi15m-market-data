@@ -55,10 +55,11 @@ class PhoenixReportTests(unittest.TestCase):
 
 class AlertTests(unittest.TestCase):
     def _report(self, **over):
-        base = {"status_source": "status_api", "persisted_event_age_s": 10,
-                "status": {"mode": "PAPER_ONLY", "exchange_write_calls": 0, "orders_submitted_to_exchange": 0,
-                           "queue_depth": 100, "ledger_volume_state": "OK",
-                           "archive_integrity_state": "VERIFIED_COMPLETE"},
+        base = {"status_source": "status_api", "persisted_event_age_s": 10, "heartbeat_age_s": 2,
+                "status": {"service_state": "RUNNING", "mode": "PAPER_ONLY", "exchange_write_calls": 0,
+                           "orders_submitted_to_exchange": 0, "queue_depth": 100, "ledger_volume_state": "OK",
+                           "archive_integrity_state": "VERIFIED_COMPLETE", "journal_process_alive": True,
+                           "parquet_dropped_rows": 0, "events_dropped": 0},
                 "ledger": {"decisions": {"P": {"missing_reason": 0}}},
                 "settlement_reconciliation": {"settlements": 3, "counts": {"MATCH": 3}}}
         base.update(over)
@@ -66,6 +67,33 @@ class AlertTests(unittest.TestCase):
 
     def test_healthy_report_has_no_alerts(self):
         self.assertEqual(pr.alerts(self._report()), [])
+
+    def test_status_endpoint_alive_but_worker_heartbeat_stale_is_critical(self):
+        faults = pr.alerts(self._report(heartbeat_age_s=610))
+        self.assertTrue(any("heartbeat" in f and f.startswith("CRITICAL") for f in faults))
+
+    def test_missing_safety_telemetry_is_not_mistaken_for_healthy(self):
+        r = self._report()
+        r["status"] = {"service_state": "RUNNING", "mode": "PAPER_ONLY"}
+        faults = pr.alerts(r)
+        self.assertTrue(any("missing worker safety telemetry" in f for f in faults))
+        self.assertTrue(any("journal process" in f for f in faults))
+
+    def test_reporting_archive_loss_and_unreadable_ledger_is_critical(self):
+        r = self._report()
+        r["status"] = dict(r["status"], parquet_dropped_rows=8, events_dropped=2)
+        r["ledger"] = {"error": "OperationalError"}
+        faults = pr.alerts(r)
+        self.assertTrue(any("dropped market rows" in f for f in faults))
+        self.assertTrue(any("ledger audit unavailable" in f for f in faults))
+
+    def test_blocked_websocket_and_unknown_archive_integrity_are_critical(self):
+        r = self._report()
+        r["status"] = dict(r["status"], websocket_state="BLOCKED_NO_CREDENTIALS",
+                            archive_integrity_state="NOT_RUN")
+        faults = pr.alerts(r)
+        self.assertTrue(any("WebSocket blocked" in f for f in faults))
+        self.assertTrue(any("archive integrity NOT_RUN" in f for f in faults))
 
     def test_stale_or_never_run_hourly_jobs_alarm_even_if_task_result_would_be_zero(self):
         fresh = {"settlement_reconcile": 600.0, "research_cycle": 1200.0}
