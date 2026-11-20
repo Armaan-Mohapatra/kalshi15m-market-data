@@ -204,6 +204,96 @@ def render(report: dict) -> str:
             + "".join(parts))
 
 
+RESOURCE_COLUMNS = (
+    "utc", "worker_pid", "worker_rss_mb", "journal_pid", "journal_rss_mb", "free_ram_mb",
+    "free_c_gb", "free_e_gb", "queue_depth", "persisted_lag_s",
+)
+
+
+def process_rss_mb(pid: int | None) -> float | None:
+    """Working set of a process in MB (Windows psapi through ctypes; psutil is not installed)."""
+    if not pid or sys.platform != "win32":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    class Counters(ctypes.Structure):
+        _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t)]
+
+    kernel32, psapi = ctypes.windll.kernel32, ctypes.windll.psapi
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    handle = kernel32.OpenProcess(0x1000 | 0x0010, False, int(pid))  # QUERY_LIMITED_INFORMATION | VM_READ
+    if not handle:
+        return None
+    try:
+        counters = Counters()
+        counters.cb = ctypes.sizeof(counters)
+        if not psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+            return None
+        return round(counters.WorkingSetSize / 1048576, 1)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def free_ram_mb() -> float | None:
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    class MemoryStatus(ctypes.Structure):
+        _fields_ = [("dwLength", wintypes.DWORD), ("dwMemoryLoad", wintypes.DWORD),
+                    ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+    status = MemoryStatus()
+    status.dwLength = ctypes.sizeof(status)
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        return None
+    return round(status.ullAvailPhys / 1048576, 0)
+
+
+def resource_row(report: dict, home: Path) -> dict:
+    """One resource sample for the soak report: memory, disk and persistence lag over time."""
+    import shutil
+
+    s = report.get("status") or {}
+
+    def free_gb(path: str) -> float | None:
+        try:
+            return round(shutil.disk_usage(path).free / 1e9, 1)
+        except OSError:
+            return None
+
+    return {
+        "utc": report.get("generated_utc"), "worker_pid": s.get("pid"),
+        "worker_rss_mb": process_rss_mb(s.get("pid")), "journal_pid": s.get("journal_process_pid"),
+        "journal_rss_mb": process_rss_mb(s.get("journal_process_pid")), "free_ram_mb": free_ram_mb(),
+        "free_c_gb": free_gb("C:\\"), "free_e_gb": free_gb(str(home.anchor or home)),
+        "queue_depth": s.get("queue_depth"), "persisted_lag_s": report.get("persisted_event_age_s"),
+    }
+
+
+def append_resource_log(out: Path, row: dict) -> None:
+    """Append-only CSV (header written once); best effort, never breaks the report."""
+    try:
+        path = out / "resource_log.csv"
+        new = not path.exists()
+        with path.open("a", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=RESOURCE_COLUMNS)
+            if new:
+                writer.writeheader()
+            writer.writerow({k: row.get(k) for k in RESOURCE_COLUMNS})
+    except OSError:
+        pass
+
+
 TOAST_SCRIPT = (
     "[void][Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime];"
     "$t=[Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent('ToastText02');"
@@ -257,6 +347,7 @@ def main() -> int:
         for a_ in sorted(before - now):
             log.write(f"{report['generated_utc']} CLEARED {a_}\n")
     notify(sorted(now - before))
+    append_resource_log(out, resource_row(report, home))
     for name, text in (("report.json", json.dumps(report, indent=1)), ("dashboard.html", render(report))):
         tmp = out / (name + ".tmp")
         tmp.write_text(text, encoding="utf-8")

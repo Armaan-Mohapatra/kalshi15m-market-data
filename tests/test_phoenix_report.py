@@ -140,5 +140,36 @@ class NotifyTests(unittest.TestCase):
         self.assertFalse(pr.notify(["CRITICAL x"], run=self._Run(code=1)))
 
 
+class ResourceLogTests(unittest.TestCase):
+    def test_process_memory_is_read_for_a_live_pid_and_none_for_a_dead_one(self):
+        import os
+        import sys
+
+        if sys.platform != "win32":
+            self.skipTest("psapi is Windows only")
+        mine = pr.process_rss_mb(os.getpid())
+        self.assertIsNotNone(mine)
+        self.assertGreater(mine, 10.0)  # a running Python interpreter is well over 10 MB
+        self.assertIsNone(pr.process_rss_mb(None))
+        self.assertIsNone(pr.process_rss_mb(0))
+        self.assertIsNone(pr.process_rss_mb(4_194_000))  # no such process
+
+    def test_each_run_appends_one_row_and_the_header_is_written_once(self):
+        with TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            report = {"generated_utc": "t1", "status": {"pid": None, "queue_depth": 7}, "persisted_event_age_s": 2.5}
+            row = pr.resource_row(report, out)
+            self.assertEqual((row["queue_depth"], row["persisted_lag_s"], row["worker_rss_mb"]), (7, 2.5, None))
+            pr.append_resource_log(out, row)
+            pr.append_resource_log(out, dict(row, utc="t2"))
+            lines = (out / "resource_log.csv").read_text(encoding="utf-8").strip().splitlines()
+            self.assertEqual(len(lines), 3)  # header + 2 rows
+            self.assertTrue(lines[0].startswith("utc,worker_pid,worker_rss_mb"))
+            self.assertEqual([l.split(",")[0] for l in lines[1:]], ["t1", "t2"])
+
+    def test_a_logging_failure_never_breaks_the_report(self):
+        pr.append_resource_log(Path("Z:/no/such/folder/for/this/test"), {"utc": "t"})  # swallowed
+
+
 if __name__ == "__main__":
     unittest.main()
