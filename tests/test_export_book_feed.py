@@ -59,7 +59,20 @@ class ExportBookFeedTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "refusing partial book feed"):
                 ex.export(ledger, "KXT15M-X", output)
             self.assertEqual(output.read_text(encoding="utf-8"), "old valid report")
-            self.assertEqual(list(Path(tmp).glob("*.partial")), [])
+            self.assertEqual(list(Path(tmp).glob(".*.partial")), [])
+
+    def test_source_with_no_snapshot_never_publishes_empty_or_orphan_feed(self):
+        with TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "l.sqlite3"
+            db = sqlite3.connect(ledger)
+            db.execute("create table market_events (dedupe_key text primary key, received_utc text, exchange_ts text, "
+                       "channel text, kind text, market_ticker text, raw_json text, payload_sha256 text)")
+            db.commit()
+            db.close()
+            output = Path(tmp) / "feed.ndjson"
+            with self.assertRaisesRegex(ValueError, "without a verified WebSocket snapshot"):
+                ex.export(ledger, "KXT15M-X", output)
+            self.assertFalse(output.exists())
 
     def test_export_does_not_require_materializing_all_rows(self):
         # Streamed read remains compatible with a simple one-snapshot ledger.
