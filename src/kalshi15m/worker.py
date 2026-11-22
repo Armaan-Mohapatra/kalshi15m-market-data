@@ -3217,7 +3217,20 @@ class Collector:
                 self._record_orderbook_sequence(sid, seq, snapshot=True)
                 if str(ticker) in self.open_tickers:
                     book = self.books.setdefault(str(ticker), OrderBook())
-                    book.snapshot(payload)
+                    try:
+                        book.snapshot(payload)
+                    except ValueError as exc:
+                        self._invalidate_subscription_books(sid)
+                        book.invalidate()
+                        reason = f"invalid orderbook snapshot for {ticker}: {exc}"
+                        self._record_orderbook_sequence_failure(sid, reason)
+                        self.status.update(
+                            sequence_gap_count=self.status.data.get("sequence_gap_count", 0) + 1,
+                            websocket_state="RESYNC_REQUIRED",
+                            last_error=reason,
+                        )
+                        await ws.close(code=1011, reason="invalid snapshot; reconnect for fresh snapshots")
+                        return
                     self.book_received_monotonic[str(ticker)] = time.monotonic()
                     self._mark_orderbook_quote(str(ticker))
                     await self.emit(

@@ -22,17 +22,22 @@ class OrderBook:
     def _levels(values: list[Any]) -> dict[Decimal, Decimal]:
         result: dict[Decimal, Decimal] = {}
         for item in values or []:
+            # A malformed level must never be dropped silently: that would publish a
+            # "synchronized" book with understated depth and wrong derived asks.
             if not isinstance(item, (tuple, list)) or len(item) < 2:
-                continue
+                raise ValueError("malformed orderbook snapshot level")
             try:
                 price, size = Decimal(str(item[0])), Decimal(str(item[1]))
-            except InvalidOperation:
-                continue
+            except InvalidOperation as exc:
+                raise ValueError("unparseable orderbook snapshot level") from exc
+            if not (price.is_finite() and size.is_finite()):
+                raise ValueError("non-finite orderbook snapshot level")
             if price > 0 and size > 0:
                 result[price] = size
         return result
 
     def snapshot(self, msg: dict[str, Any]) -> None:
+        self.synchronized = False  # stays unsynchronized unless the whole snapshot parses
         nested = msg.get("orderbook_fp") or msg.get("orderbook")
         book = nested if isinstance(nested, dict) else msg
         self.yes = self._levels(
@@ -50,6 +55,9 @@ class OrderBook:
         self.synchronized = False
 
     def delta(self, msg: dict[str, Any]) -> None:
+        if not self.synchronized:
+            # An invalidated or never-snapshotted book can only be revived by a fresh snapshot.
+            raise ValueError("delta on an unsynchronized orderbook")
         side = str(msg.get("side", "")).lower()
         levels = self.yes if side == "yes" else self.no if side == "no" else None
         if levels is None:

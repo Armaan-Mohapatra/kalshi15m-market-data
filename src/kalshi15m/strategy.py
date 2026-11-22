@@ -99,7 +99,10 @@ def evaluate_market(
         and isinstance(orderbook.get("orderbook_fp"), dict)
     )
     if book_valid:
-        book.snapshot(orderbook)
+        try:
+            book.snapshot(orderbook)
+        except ValueError:
+            book_valid = False  # malformed snapshot: fail closed, never eligible
     quotes = book.quotes() if book_valid else {}
     yes_ask = decimal(quotes.get("yes_ask"))
     no_ask = decimal(quotes.get("no_ask"))
