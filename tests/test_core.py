@@ -2254,7 +2254,7 @@ class StorageTests(unittest.TestCase):
 
     def test_unclean_start_recovers_missing_parquet_rows_from_sqlite(self):
         with TemporaryDirectory() as temporary:
-            cfg = Settings(home=Path(temporary))
+            cfg = Settings(home=Path(temporary), min_free_bytes=0)
             store = Storage(cfg)
             store.open()
             events = [
@@ -2452,7 +2452,7 @@ class StorageTests(unittest.TestCase):
                     "from pathlib import Path",
                     "from kalshi15m.config import Settings",
                     "from kalshi15m.storage import Storage",
-                    "cfg = Settings(home=Path(sys.argv[1]))",
+                    "cfg = Settings(home=Path(sys.argv[1]), min_free_bytes=0)",
                     "cfg.runtime_dir.mkdir(parents=True, exist_ok=True)",
                     "(cfg.runtime_dir / 'status.json').write_text(",
                     "    json.dumps({'service_state': 'RUNNING'}), encoding='utf-8'",
@@ -2483,7 +2483,7 @@ class StorageTests(unittest.TestCase):
             )
             self.assertEqual(crashed.returncode, 93, crashed.stderr)
 
-            recovered = Storage(Settings(home=home))
+            recovered = Storage(Settings(home=home, min_free_bytes=0))
             recovered.open()
 
             self.assertEqual(recovered.parquet_recovery_state, "RECOVERED_MISSING_ROWS")
@@ -2502,7 +2502,7 @@ class StorageTests(unittest.TestCase):
 
     def test_unclean_start_recovers_conflicting_event_generation_variant(self):
         with TemporaryDirectory() as temporary:
-            cfg = Settings(home=Path(temporary))
+            cfg = Settings(home=Path(temporary), min_free_bytes=0)
             canonical_payload = {"trade_id": "canonical"}
             canonical_raw = json.dumps(canonical_payload, sort_keys=True, separators=(",", ":"))
             canonical_hash = hashlib.sha256(canonical_raw.encode("utf-8")).hexdigest()
