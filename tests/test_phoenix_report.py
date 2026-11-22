@@ -116,9 +116,19 @@ class NotifyTests(unittest.TestCase):
         from unittest.mock import patch
 
         # independent of the caller's environment: toasts must be enabled for this check
-        with patch.dict(os.environ):
+        with patch.dict(os.environ), patch.object(pr.sys, "platform", "win32"):
             os.environ.pop("PHOENIX_NO_TOAST", None)
             self._check_toast_behaviour()
+
+    def test_non_windows_hosts_never_spawn_powershell(self):
+        import os
+        from unittest.mock import patch
+
+        run = self._Run()
+        with patch.dict(os.environ), patch.object(pr.sys, "platform", "darwin"):
+            os.environ.pop("PHOENIX_NO_TOAST", None)
+            self.assertFalse(pr.notify(["CRITICAL archive integrity UNKNOWN"], run=run))
+        self.assertEqual(run.calls, [])
 
     def _check_toast_behaviour(self):
         run = self._Run()
