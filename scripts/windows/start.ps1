@@ -40,9 +40,17 @@ try {
     throw 'Another standalone worker start attempt is already in progress.'
 }
 try {
-if (-not (Test-Path $venvPython)) { py -3.14 -m venv (Join-Path $root '.venv') }
-if ($InstallDependencies) { & $venvPython -m pip install -r (Join-Path $root 'requirements.txt') }
-if (-not (Test-Path $venvPython)) { throw 'Project venv is unavailable. Run start.ps1 -InstallDependencies.' }
+if (-not (Test-Path $venvPython)) {
+    if (-not $InstallDependencies) { throw 'Project venv is unavailable; prepare the isolated Python 3.12 environment before starting.' }
+    py -3.12 -m venv (Join-Path $root '.venv')
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $venvPython)) { throw 'Python 3.12 venv creation failed.' }
+}
+if ($InstallDependencies) {
+    & $venvPython -m pip install -r (Join-Path $root 'requirements-lock.txt')
+    if ($LASTEXITCODE -ne 0) { throw 'Pinned collector dependency installation failed.' }
+}
+& $venvPython -c "import sys; assert sys.version_info[:2] == (3, 12), 'Python 3.12 required for this candidate'; import websockets, cryptography, pyarrow, duckdb; assert cryptography.__version__ == '50.0.0', 'collector dependency pin mismatch'"
+if ($LASTEXITCODE -ne 0) { throw 'Collector interpreter or pinned dependency preflight failed; refusing to start.' }
 $pidPath = Join-Path $homePath 'runtime\worker.pid.json'
 if (Test-Path $pidPath) {
     $existing = Get-Content $pidPath -Raw | ConvertFrom-Json
