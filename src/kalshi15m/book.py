@@ -21,7 +21,9 @@ class OrderBook:
     @staticmethod
     def _levels(values: list[Any]) -> dict[Decimal, Decimal]:
         result: dict[Decimal, Decimal] = {}
-        for item in values or []:
+        if not isinstance(values, list):
+            raise ValueError("orderbook snapshot levels must be a list")
+        for item in values:
             # A malformed level must never be dropped silently: that would publish a
             # "synchronized" book with understated depth and wrong derived asks.
             if not isinstance(item, (tuple, list)) or len(item) < 2:
@@ -32,20 +34,33 @@ class OrderBook:
                 raise ValueError("unparseable orderbook snapshot level") from exc
             if not (price.is_finite() and size.is_finite()):
                 raise ValueError("non-finite orderbook snapshot level")
-            if price > 0 and size > 0:
+            if not (Decimal(0) < price <= Decimal(1)) or size < 0:
+                raise ValueError("out-of-range orderbook snapshot level")
+            if price in result:
+                raise ValueError("duplicate orderbook snapshot price")
+            if size > 0:
                 result[price] = size
         return result
 
     def snapshot(self, msg: dict[str, Any]) -> None:
         self.synchronized = False  # stays unsynchronized unless the whole snapshot parses
-        nested = msg.get("orderbook_fp") or msg.get("orderbook")
-        book = nested if isinstance(nested, dict) else msg
-        self.yes = self._levels(
-            book.get("yes_dollars_fp") or book.get("yes_dollars") or book.get("yes") or []
-        )
-        self.no = self._levels(
-            book.get("no_dollars_fp") or book.get("no_dollars") or book.get("no") or []
-        )
+        book = msg
+        for key in ("orderbook_fp", "orderbook"):
+            if key in msg:
+                book = msg[key]
+                if not isinstance(book, dict):
+                    raise ValueError("malformed orderbook snapshot envelope")
+                break
+
+        def side_levels(side: str) -> dict[Decimal, Decimal]:
+            for key in (f"{side}_dollars_fp", f"{side}_dollars", side):
+                if key in book:
+                    return self._levels(book[key])
+            return {}
+
+        # Parse both sides before replacing either; preserve the old invalidated book on failure.
+        yes, no = side_levels("yes"), side_levels("no")
+        self.yes, self.no = yes, no
         self._best_yes = max(self.yes, default=None)
         self._best_no = max(self.no, default=None)
         self.synchronized = True
@@ -58,6 +73,8 @@ class OrderBook:
         if not self.synchronized:
             # An invalidated or never-snapshotted book can only be revived by a fresh snapshot.
             raise ValueError("delta on an unsynchronized orderbook")
+        # A malformed delta invalidates the entire lineage until a new snapshot.
+        self.synchronized = False
         side = str(msg.get("side", "")).lower()
         levels = self.yes if side == "yes" else self.no if side == "no" else None
         if levels is None:
@@ -67,8 +84,15 @@ class OrderBook:
             delta = Decimal(str(msg.get("delta_fp", msg.get("delta"))))
         except InvalidOperation as exc:
             raise ValueError("invalid price or delta") from exc
-        size = levels.get(price, Decimal(0)) + delta
-        if size < 0:
+        if not (price.is_finite() and delta.is_finite()):
+            raise ValueError("non-finite orderbook price or delta")
+        if not Decimal(0) < price <= Decimal(1):
+            raise ValueError("out-of-range orderbook delta price")
+        try:
+            size = levels.get(price, Decimal(0)) + delta
+        except ArithmeticError as exc:
+            raise ValueError("invalid resulting orderbook quantity") from exc
+        if not size.is_finite() or size < 0:
             raise ValueError("negative orderbook quantity")
         is_yes = levels is self.yes
         best = self._best_yes if is_yes else self._best_no
