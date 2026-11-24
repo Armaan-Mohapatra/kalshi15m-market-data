@@ -103,6 +103,9 @@ def evaluate_market(
             book.snapshot(orderbook)
         except ValueError:
             book_valid = False  # malformed snapshot: fail closed, never eligible
+        best_yes, best_no = book._best()
+        if book_valid and best_yes is not None and best_no is not None and best_yes + best_no >= 1:
+            book_valid = False  # crossed or locked bids cannot rest on the venue: corrupt book
     quotes = book.quotes() if book_valid else {}
     yes_ask = decimal(quotes.get("yes_ask"))
     no_ask = decimal(quotes.get("no_ask"))

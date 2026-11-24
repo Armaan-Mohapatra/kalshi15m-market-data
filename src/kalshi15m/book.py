@@ -21,6 +21,7 @@ class OrderBook:
     @staticmethod
     def _levels(values: list[Any]) -> dict[Decimal, Decimal]:
         result: dict[Decimal, Decimal] = {}
+        seen: set[Decimal] = set()
         if not isinstance(values, list):
             raise ValueError("orderbook snapshot levels must be a list")
         for item in values:
@@ -36,8 +37,9 @@ class OrderBook:
                 raise ValueError("non-finite orderbook snapshot level")
             if not (Decimal(0) < price <= Decimal(1)) or size < 0:
                 raise ValueError("out-of-range orderbook snapshot level")
-            if price in result:
+            if price in seen:  # zero-size repeats too: an ambiguous level list is not a book
                 raise ValueError("duplicate orderbook snapshot price")
+            seen.add(price)
             if size > 0:
                 result[price] = size
         return result

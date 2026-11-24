@@ -771,6 +771,15 @@ class FrozenStrategyTests(unittest.TestCase):
         self.assertFalse(decision["eligible"])
         self.assertEqual(decision["rejection_reason"], "SKIP_AMBIGUOUS")
 
+    def test_crossed_or_locked_book_is_never_eligible(self):
+        for yes_bid, no_bid in (("0.30", "0.70"), ("0.30", "0.75")):
+            with self.subTest(yes_bid=yes_bid, no_bid=no_bid):
+                book = {**self.orderbook, "orderbook_fp": {
+                    "yes_dollars_fp": [[yes_bid, "3.00"]], "no_dollars_fp": [[no_bid, "3.00"]]}}
+                decision = self.evaluate(orderbook=book)
+                self.assertFalse(decision["eligible"])
+                self.assertEqual(decision["rejection_reason"], "ORDERBOOK_INVALID_OR_TICKER_MISMATCH")
+
     def test_stale_book_and_non_btc_scope_fail_closed(self):
         stale = self.evaluate(received=self.now - timedelta(seconds=6))
         other_asset = self.evaluate(market={**self.market, "ticker": "KXETH15M-SAMPLE"})
